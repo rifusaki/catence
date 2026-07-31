@@ -1,0 +1,61 @@
+{
+  "name": "catence",
+  "version": "0.1.0",
+  "description": "Local MCP access to normalized Garmin, Intervals.icu, and targeted Strava fitness data.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "catence": "./dist/interfaces/mcp/main.js",
+    "catence-data": "./dist/interfaces/cli/main.js"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "README.md",
+    "config.example.json",
+    "docs",
+    "pyproject.toml",
+    "uv.lock",
+    "python/__init__.py",
+    "python/catence/providers/garmin/*.py",
+    "python/catence/providers/strava/*.py",
+    "python/catence/__init__.py",
+    "python/catence/providers/__init__.py"
+  ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "fitness",
+    "garmin",
+    "intervals-icu",
+    "strava",
+    "triathlon",
+    "duckdb"
+  ],
+  "scripts": {
+    "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\" && tsc -p tsconfig.build.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "catence-data": "tsx src/interfaces/cli/main.ts",
+    "mcp": "tsx src/interfaces/mcp/main.ts",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check && npm test"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "^1.4.4-r.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "commander": "^14.0.0",
+    "dotenv": "^17.2.2",
+    "intervals-icu": "^2.2.0",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+from datetime import date, timedelta
+from pathlib import Path
+import hashlib
+import json
+from typing import Any, Callable, Mapping
+
+from .registry import GARMIN_READ_METHODS, assert_read_only_registry
+from .staging import StagingWriter
+from .streams import SAMPLE_COLUMNS, activity_details_to_samples, fit_archive_to_samples, write_parquet
+
+
+def as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {"value": value}
+
+
+def as_items(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [as_dict(item) for item in value]
+    if isinstance(value, dict):
+        for key in ("activityList", "items", "data", "meals", "foodLogEntries"):
+            if isinstance(value.get(key), list):
+                return [as_dict(item) for item in value[key]]
+        return [value]
+    return []
+
+
+def remote_id(payload: dict[str, Any], fallback: str) -> str:
+    for key in ("activityId", "workoutId", "scheduleId", "id", "calendarDate", "date", "uuid"):
+        if payload.get(key) is not None:
+            return str(payload[key])
+    return fallback
+
+
+class GarminStagingWorker:
+    """Extract Garmin data through the explicit read-only registry into JSONL/Parquet staging."""
+
+    def __init__(self, api: Any, writer: StagingWriter, data_dir: Path, known_activity_hashes: Mapping[str, str] | None = None) -> None:
+        self.api = api
+        self.writer = writer
+        self.data_dir = data_dir
+        self.known_activity_hashes = dict(known_activity_hashes or {})
+
+    def sync(self, daily_from_date: date, activity_from_date: date, to_date: date | None = None) -> None:
+        assert_read_only_registry()
+        end = to_date or date.today()
+        self._singletons()
+        self._daily(daily_from_date, end)
+        self._range(daily_from_date, end)
+        self._activities(activity_from_date, end)
+        self._collections()
+
+    def _capture(self, endpoint: str, action: Callable[[], Any], remote_id_value: str | None = None, scope: dict[str, Any] | None = None) -> tuple[Any | None, str | None]:
+        try:
+            payload = action()
+            raw_hash = self.writer.archive_json(endpoint, remote_id_value, payload, scope)
+            return payload, raw_hash
+        except Exception as error:  # Provider availability is intentionally isolated per operation.
+            self.writer.error(endpoint, str(error), remote_id_value)
+            return None, None
+
+    def _entity(self, endpoint: str, entity_type: str, payload: Any, raw_hash: str | None, occurred_on: str | None = None, parent_remote_id: str | None = None) -> None:
+        for index, item in enumerate(as_items(payload)):
+            item_id = remote_id(item, f"{endpoint}:{index}")
+            self.writer.source_entity(entity_type, item_id, item, raw_hash, parent_remote_id, occurred_on or str(item.get("calendarDate") or item.get("date") or "") or None)
+
+    def _singletons(self) -> None:
+        calls = {
+            "user_profile": ("get_user_profile", "profile"),
+            "userprofile_settings": ("get_userprofile_settings", "profile_setting"),
+            "devices": ("get_devices", "device"),
+            "device_last_used": ("get_device_last_used", "device"),
+            "device_alarms": ("get_device_alarms", "device_alarm"),
+            "lactate_threshold": ("get_lactate_threshold", "lactate_threshold"),
+            "heart_rate_zones": ("get_heart_rate_zones", "activity_zone"),
+            "power_zones": ("get_power_zones", "activity_zone"),
+            "cycling_ftp": ("get_cycling_ftp", "training_metric"),
+            "personal_record": ("get_personal_record", "personal_record"),
+            "earned_badges": ("get_earned_badges", "badge"),
+            "available_badges": ("get_available_badges", "badge"),
+            "in_progress_badges": ("get_in_progress_badges", "badge"),
+            "training_plans": ("get_training_plans", "training_plan"),
+            "pregnancy_summary": ("get_pregnancy_summary", "pregnancy_summary"),
+            "golf_user_stats": ("get_golf_user_stats", "golf_user_stat"),
+            "golf_club_stats": ("get_golf_club_stats", "golf_club_stat"),
+        }
+        for endpoint, (method, entity_type) in calls.items():
+            payload, raw_hash = self._capture(endpoint, lambda method=method: getattr(self.api, method)())
+            if payload is not None:
+                self._entity(endpoint, entity_type, payload, raw_hash)
+
+    def _daily(self, from_date: date, to_date: date) -> None:
+        calls = {
+            "stats": ("get_stats", "daily_health"), "user_summary": ("get_user_summary", "daily_health"),
+            "steps": ("get_steps_data", "daily_health"), "heart_rates": ("get_heart_rates", "daily_health"),
+            "sleep": ("get_sleep_data", "daily_health"), "stress": ("get_stress_data", "daily_health"),
+            "all_day_stress": ("get_all_day_stress", "daily_health"), "body_battery_events": ("get_body_battery_events", "daily_health"),
+            "respiration": ("get_respiration_data", "daily_health"), "spo2": ("get_spo2_data", "daily_health"),
+            "hrv": ("get_hrv_data", "daily_health"), "training_readiness": ("get_training_readiness", "daily_health"),
+            "morning_training_readiness": ("get_morning_training_readiness", "daily_health"), "training_status": ("get_training_status", "training_status"),
+            "fitness_age": ("get_fitnessage_data", "fitness_age"), "max_metrics": ("get_max_metrics", "max_metric"),
+            "hydration": ("get_hydration_data", "nutrition_log"), "menstrual": ("get_menstrual_data_for_date", "menstrual"),
+            "nutrition_food_log": ("get_nutrition_daily_food_log", "nutrition_log"), "nutrition_meals": ("get_nutrition_daily_meals", "nutrition_log"),
+            "nutrition_settings": ("get_nutrition_daily_settings", "nutrition_setting"),
+        }
+        current = from_date
+        while current <= to_date:
+            day = current.isoformat()
+            for endpoint, (method, entity_type) in calls.items():
+                payload, raw_hash = self._capture(endpoint, lambda method=method, day=day: getattr(self.api, method)(day), day, {"date": day})
+                if payload is not None:
+                    self._entity(endpoint, entity_type, payload, raw_hash, day)
+            current += timedelta(days=1)
+
+    def _range(self, from_date: date, to_date: date) -> None:
+        start, end = from_date.isoformat(), to_date.isoformat()
+        calls = {
+            "daily_steps": ("get_daily_steps", "daily_health"), "body_battery": ("get_body_battery", "daily_health"),
+            "blood_pressure": ("get_blood_pressure", "blood_pressure"), "weigh_ins": ("get_weigh_ins", "body_composition"),
+            "progress_summary": ("get_progress_summary_between_dates", "progress_summary"), "menstrual_calendar": ("get_menstrual_calendar_data", "menstrual"),
+        }
+        for endpoint, (method, entity_type) in calls.items():
+            payload, raw_hash = self._capture(endpoint, lambda method=method: getattr(self.api, method)(start, end), None, {"from": start, "to": end})
+            if payload is not None:
+                self._entity(endpoint, entity_type, payload, raw_hash)
+
+    def _activities(self, from_date: date, to_date: date) -> None:
+        start, end = from_date.isoformat(), to_date.isoformat()
+        payload, raw_hash = self._capture("activities", lambda: self.api.get_activities_by_date(start, end), None, {"from": start, "to": end})
+        if payload is None:
+            return
+        self._entity("activities", "activity", payload, raw_hash)
+        for summary in as_items(payload):
+            activity_id = remote_id(summary, "unknown")
+            summary_hash = hashlib.sha256(json.dumps(summary, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+            details_fetched = self.known_activity_hashes.get(activity_id) != summary_hash
+            if details_fetched:
+                self._activity_details(activity_id, summary)
+            self.writer.activity_sync_state(activity_id, summary_hash, details_fetched)
+
+    def _activity_details(self, activity_id: str, summary: dict[str, Any]) -> None:
+        calls = {
+            "activity": ("get_activity", "activity_detail"), "activity_details": ("get_activity_details", "activity_detail"),
+            "activity_splits": ("get_activity_splits", "activity_interval"), "activity_typed_splits": ("get_activity_typed_splits", "activity_interval"),
+            "activity_split_summaries": ("get_activity_split_summaries", "activity_interval"), "activity_weather": ("get_activity_weather", "activity_weather"),
+            "activity_hr_zones": ("get_activity_hr_in_timezones", "activity_zone"), "activity_power_zones": ("get_activity_power_in_timezones", "activity_zone"),
+            "activity_exercise_sets": ("get_activity_exercise_sets", "activity_exercise_set"), "activity_gear": ("get_activity_gear", "activity_gear"),
+        }
+        details: dict[str, Any] | None = None
+        for endpoint, (method, entity_type) in calls.items():
+            payload, raw_hash = self._capture(endpoint, lambda method=method: getattr(self.api, method)(activity_id), activity_id)
+            if payload is not None:
+                self._entity(endpoint, entity_type, payload, raw_hash, parent_remote_id=activity_id)
+                if endpoint == "activity_details" and isinstance(payload, dict):
+                    details = payload
+        self._activity_files(activity_id, summary, details)
+
+    def _activity_files(self, activity_id: str, summary: dict[str, Any], details: dict[str, Any] | None) -> None:
+        try:
+            from garminconnect import Garmin
+            formats = {
+                "activity_original": Garmin.ActivityDownloadFormat.ORIGINAL,
+                "activity_tcx": Garmin.ActivityDownloadFormat.TCX,
+                "activity_gpx": Garmin.ActivityDownloadFormat.GPX,
+                "activity_kml": Garmin.ActivityDownloadFormat.KML,
+                "activity_csv": Garmin.ActivityDownloadFormat.CSV,
+            }
+        except ImportError as error:
+            self.writer.error("activity_files", str(error), activity_id, False)
+            return
+        original_path: Path | None = None
+        for endpoint, format_value in formats.items():
+            try:
+                contents = self.api.download_activity(activity_id, format_value)
+                digest = self.writer.archive_bytes(endpoint, activity_id, contents, "zip" if endpoint == "activity_original" else endpoint.rsplit("_", 1)[1])
+                if endpoint == "activity_original":
+                    original_path = self.data_dir / "raw" / "garmin" / endpoint / activity_id / f"{digest}.zip"
+            except Exception as error:
+                self.writer.error(endpoint, str(error), activity_id)
+        samples = activity_details_to_samples(f"garmin:{activity_id}", details or {})
+        if not samples and original_path and original_path.exists():
+            samples = fit_archive_to_samples(f"garmin:{activity_id}", original_path)
+        if samples:
+            start_date = str(summary.get("startTimeLocal") or summary.get("startTimeGMT") or date.today().isoformat())
+            destination, digest, row_count = write_parquet(self.data_dir, activity_id, start_date, samples)
+            self.writer.emit({
+                "kind": "stream_manifest", "provider": "garmin", "activityRemoteId": activity_id,
+                "relativePath": str(destination.relative_to(self.data_dir)), "contentHash": digest, "rowCount": row_count,
+                "startAt": samples[0].get("timestamp_utc"), "endAt": samples[-1].get("timestamp_utc"),
+                "columns": SAMPLE_COLUMNS, "rawObjectHash": None,
+            })
+
+    def _collections(self) -> None:
+        calls = {
+            "workouts": ("get_workouts", (), "workout"), "scheduled_workouts": ("get_scheduled_workouts", (), "scheduled_workout"),
+            "goals": ("get_goals", (), "goal"), "golf_summary": ("get_golf_summary", (), "golf_scorecard"),
+        }
+        for endpoint, (method, arguments, entity_type) in calls.items():
+            payload, raw_hash = self._capture(endpoint, lambda method=method, arguments=arguments: getattr(self.api, method)(*arguments))
+            if payload is not None:
+                self._entity(endpoint, entity_type, payload, raw_hash)

@@ -1,0 +1,156 @@
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import type { CatencePaths } from '../../contracts/runtime.js';
+import type { QueryValues, ReadDataStore } from '../../contracts/storage.js';
+import { sqlString } from './sql.js';
+import { DATASET_CATALOG, getDataset, type DatasetDefinition } from './catalog.js';
+
+export class ReadOnlyRepository {
+  constructor(readonly database: ReadDataStore, readonly paths: CatencePaths) {}
+
+  async close(): Promise<void> {
+    await this.database.close();
+  }
+
+  async rows<T extends Record<string, unknown>>(sql: string, values?: QueryValues): Promise<T[]> {
+    return this.database.rows<T>(sql, values);
+  }
+
+  async datasetRelation(datasetName: string): Promise<string> {
+    const dataset = getDataset(datasetName);
+    if (!dataset.samplesOnly) return dataset.relation!;
+    return this.activitySampleRelation();
+  }
+
+  async activitySampleRelation(): Promise<string> {
+    const manifests = await this.rows<{ relative_path: string }>(`
+      SELECT relative_path
+      FROM stream_manifest
+      QUALIFY row_number() OVER (PARTITION BY provider, activity_source_id ORDER BY content_hash DESC) = 1
+    `);
+    const hasReadableRegisteredStream = manifests.some((manifest) => {
+      const candidate = path.resolve(this.paths.root, manifest.relative_path);
+      const expectedRoot = `${path.resolve(this.paths.lake)}${path.sep}`;
+      return candidate.startsWith(expectedRoot) && candidate.endsWith('.parquet') && existsSync(candidate);
+    });
+    if (hasReadableRegisteredStream) {
+      // A UNION ALL branch for every stream reaches DuckDB's expression-depth
+      // limit around 1,000 activities. The glob is internal and rooted at the
+      // configured lake; the manifest join remains the authoritative allowlist
+      // and supplies stable provider/content-hash provenance.
+      const lakeGlob = path.join(this.paths.lake, '**', '*.parquet');
+      return `
+        SELECT manifest.provider AS provider,
+          manifest.content_hash AS content_hash,
+          sample.activity_source_id,
+          try_cast(sample.timestamp_utc AS TIMESTAMPTZ) AS timestamp_utc,
+          try_cast(sample.elapsed_s AS DOUBLE) AS elapsed_s,
+          try_cast(sample.distance_m AS DOUBLE) AS distance_m,
+          try_cast(sample.latitude AS DOUBLE) AS latitude,
+          try_cast(sample.longitude AS DOUBLE) AS longitude,
+          try_cast(sample.altitude_m AS DOUBLE) AS altitude_m,
+          try_cast(sample.heart_rate_bpm AS DOUBLE) AS heart_rate_bpm,
+          try_cast(sample.power_w AS DOUBLE) AS power_w,
+          try_cast(sample.cadence_rpm AS DOUBLE) AS cadence_rpm,
+          try_cast(sample.speed_mps AS DOUBLE) AS speed_mps,
+          try_cast(sample.temperature_c AS DOUBLE) AS temperature_c,
+          try_cast(sample.grade_pct AS DOUBLE) AS grade_pct,
+          try_cast(sample.extras_json AS JSON) AS extras_json
+        FROM read_parquet(${sqlString(lakeGlob)}, union_by_name = true) AS sample
+        JOIN (
+          SELECT provider, activity_source_id, content_hash
+          FROM stream_manifest
+          QUALIFY row_number() OVER (PARTITION BY provider, activity_source_id ORDER BY content_hash DESC) = 1
+        ) AS manifest USING (activity_source_id)
+      `;
+    }
+    return `SELECT
+      CAST(NULL AS VARCHAR) AS provider,
+      CAST(NULL AS VARCHAR) AS content_hash,
+      CAST(NULL AS VARCHAR) AS activity_source_id,
+      CAST(NULL AS TIMESTAMPTZ) AS timestamp_utc,
+      CAST(NULL AS DOUBLE) AS elapsed_s,
+      CAST(NULL AS DOUBLE) AS distance_m,
+      CAST(NULL AS DOUBLE) AS latitude,
+      CAST(NULL AS DOUBLE) AS longitude,
+      CAST(NULL AS DOUBLE) AS altitude_m,
+      CAST(NULL AS DOUBLE) AS heart_rate_bpm,
+      CAST(NULL AS DOUBLE) AS power_w,
+      CAST(NULL AS DOUBLE) AS cadence_rpm,
+      CAST(NULL AS DOUBLE) AS speed_mps,
+      CAST(NULL AS DOUBLE) AS temperature_c,
+      CAST(NULL AS DOUBLE) AS grade_pct,
+      CAST(NULL AS JSON) AS extras_json
+      WHERE FALSE`;
+  }
+
+  async status(): Promise<Record<string, unknown>> {
+    const [runs, counts, errors, streamCoverage, indexState, cursors] = await Promise.all([
+      this.rows(`SELECT run_id, provider, cast(from_date AS VARCHAR) AS from_date, cast(started_at AS VARCHAR) AS started_at, cast(completed_at AS VARCHAR) AS completed_at, status, error_count FROM sync_runs ORDER BY started_at DESC LIMIT 20`),
+      this.rows(`SELECT
+        (SELECT count(*)::INTEGER FROM activities) AS activities,
+        (SELECT count(*)::INTEGER FROM activity_sources) AS activity_sources,
+        (SELECT count(*)::INTEGER FROM daily_metrics) AS daily_metrics,
+        (SELECT count(*)::INTEGER FROM nutrition_items) AS nutrition_items,
+        (SELECT count(*)::INTEGER FROM source_entities) AS source_entities,
+        (SELECT count(*)::INTEGER FROM retrieval_documents) AS retrieval_documents`),
+      this.rows(`SELECT count(*)::INTEGER AS unresolved FROM normalization_errors WHERE resolved_at IS NULL`),
+      this.rows(`SELECT count(*)::INTEGER AS streams, coalesce(sum(row_count), 0)::BIGINT AS sample_rows, min(start_at) AS starts_at, max(end_at) AS ends_at FROM stream_manifest`),
+      this.rows(`SELECT status, mode, source_watermark, cast(built_at AS VARCHAR) AS built_at FROM retrieval_index_state WHERE index_name = 'context'`),
+      this.rows(`SELECT provider, cursor_name, cast(covered_through_date AS VARCHAR) AS covered_through_date, cast(latest_source_date AS VARCHAR) AS latest_source_date, lookback_days, cast(last_completed_at AS VARCHAR) AS last_completed_at, status FROM sync_cursors ORDER BY provider, cursor_name`),
+    ]);
+    return {
+      syncRuns: runs,
+      entityCounts: counts[0] ?? {},
+      unresolvedExtractionErrors: errors[0]?.unresolved ?? 0,
+      streams: streamCoverage[0] ?? { streams: 0, sample_rows: 0 },
+      retrievalIndex: indexState[0] ?? { status: 'stale', mode: 'keyword' },
+      incrementalCursors: cursors,
+    };
+  }
+
+  async coverage(): Promise<Record<string, unknown>> {
+    const rows = await this.rows(`
+      SELECT 'activities' AS dataset, min(cast(started_at_utc AS DATE)) AS start_date, max(cast(started_at_utc AS DATE)) AS end_date, count(*)::INTEGER AS row_count FROM activities
+      UNION ALL SELECT 'daily_metrics', min(metric_date), max(metric_date), count(*)::INTEGER FROM daily_metrics
+      UNION ALL SELECT 'nutrition_days', min(nutrition_date), max(nutrition_date), count(*)::INTEGER FROM nutrition_days
+      UNION ALL SELECT 'source_entities', min(occurred_on), max(occurred_on), count(*)::INTEGER FROM source_entities
+    `);
+    return { coverage: rows, providers: await this.rows(`SELECT provider, count(*)::INTEGER AS activity_sources FROM activity_sources GROUP BY provider ORDER BY provider`) };
+  }
+
+  async activity(activityId: string): Promise<Record<string, unknown> | null> {
+    const activity = await this.rows<Record<string, unknown>>(`SELECT * FROM activities WHERE activity_id = $activityId`, { activityId });
+    if (!activity[0]) return null;
+    const [sources, summaries, intervals] = await Promise.all([
+      this.rows(`SELECT * FROM activity_sources WHERE activity_id = $activityId ORDER BY provider`, { activityId }),
+      this.rows(`SELECT * FROM activity_summary_facts WHERE activity_id = $activityId ORDER BY provider`, { activityId }),
+      this.rows(`SELECT * FROM activity_interval_facts WHERE activity_id = $activityId ORDER BY provider, start_s`, { activityId }),
+    ]);
+    return { activity: activity[0], sources, summaries, intervals };
+  }
+
+  async summary(startDate: string, endDate: string): Promise<Record<string, unknown>> {
+    const [training, health, nutrition] = await Promise.all([
+      this.rows(`SELECT cast(started_at_utc AS DATE) AS date, count(*)::INTEGER AS activities, sum(distance_m) AS distance_m, sum(moving_s) AS moving_s, sum(training_load) AS training_load FROM canonical_activity_training WHERE cast(started_at_utc AS DATE) BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) GROUP BY 1 ORDER BY 1`, { startDate, endDate }),
+      this.rows(`SELECT * FROM daily_health WHERE metric_date BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) ORDER BY metric_date, provider`, { startDate, endDate }),
+      this.rows(`SELECT * FROM nutrition_days WHERE nutrition_date BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) ORDER BY nutrition_date, provider`, { startDate, endDate }),
+    ]);
+    return { training, health, nutrition };
+  }
+
+  catalog(): DatasetDefinition[] {
+    return Object.values(DATASET_CATALOG);
+  }
+}
+
+/** Converts DuckDB's Date/BigInt values into MCP-safe JSON values. */
+export function jsonSafe<T>(value: T): T {
+  if (typeof value === 'bigint') return String(value) as T;
+  if (value instanceof Date) return value.toISOString() as T;
+  if (Array.isArray(value)) return value.map((item) => jsonSafe(item)) as T;
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, jsonSafe(item)])) as T;
+  }
+  return value;
+}

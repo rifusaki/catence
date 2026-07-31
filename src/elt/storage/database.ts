@@ -1,0 +1,272 @@
+import { DuckDBInstance, type DuckDBConnection, type DuckDBValue } from '@duckdb/node-api';
+import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { ReadOnlyRepository } from '../../core/query/repository.js';
+import type { CatencePaths } from '../../contracts/runtime.js';
+import type { QueryBindings, WriteDataStore } from '../../contracts/storage.js';
+import type { Provider } from '../../contracts/staging.js';
+import { migrations } from './migrations.js';
+import { json } from './sql.js';
+
+export class CatenceDatabase implements WriteDataStore {
+  private constructor(private readonly connection: DuckDBConnection) {}
+
+  static async open(paths: CatencePaths): Promise<CatenceDatabase> {
+    const instance = await DuckDBInstance.create(paths.database);
+    const connection = await instance.connect();
+    const database = new CatenceDatabase(connection);
+    await database.migrate();
+    return database;
+  }
+
+  async close(): Promise<void> {
+    this.connection.closeSync();
+  }
+
+  async migrate(): Promise<void> {
+    await this.connection.run('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name VARCHAR NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())');
+    const rows = await this.rows<{ version: number }>('SELECT version FROM schema_migrations');
+    const applied = new Set(rows.map((row) => Number(row.version)));
+    for (const migration of migrations) {
+      if (applied.has(migration.version)) continue;
+      await this.connection.run('BEGIN TRANSACTION');
+      try {
+        await this.connection.run(migration.sql);
+        await this.connection.run('INSERT INTO schema_migrations (version, name) VALUES ($version, $name)', { version: migration.version, name: migration.name });
+        await this.connection.run('COMMIT');
+      } catch (error) {
+        await this.connection.run('ROLLBACK');
+        throw error;
+      }
+    }
+  }
+
+  async run(sql: string, values?: QueryBindings): Promise<void> {
+    await this.connection.run(sql, values as DuckDBValue[] | Record<string, DuckDBValue> | undefined);
+  }
+
+  async rows<T extends Record<string, unknown>>(sql: string, values?: QueryBindings): Promise<T[]> {
+    const result = await this.connection.runAndReadAll(sql, values as DuckDBValue[] | Record<string, DuckDBValue> | undefined);
+    return result.getRowObjectsJS() as T[];
+  }
+
+  async tableNames(query: string): Promise<string[]> {
+    return [...this.connection.getTableNames(query, true)];
+  }
+
+  interrupt(): void {
+    this.connection.interrupt();
+  }
+
+  async beginRun(provider: Provider, fromDate: string, runId = randomUUID()): Promise<string> {
+    await this.run(
+      'INSERT INTO sync_runs (run_id, provider, from_date, started_at, status, parser_version) VALUES ($runId, $provider, $fromDate, now(), \'running\', 1)',
+      { runId, provider, fromDate },
+    );
+    return runId;
+  }
+
+  async finishRun(runId: string): Promise<void> {
+    await this.run(`UPDATE sync_runs SET status = CASE WHEN error_count > 0 THEN 'completed_with_errors' ELSE 'completed' END, completed_at = now() WHERE run_id = $runId`, { runId });
+    await this.run("UPDATE retrieval_index_state SET status = 'stale' WHERE index_name = 'context'");
+  }
+
+  async addError(runId: string, provider: Provider, endpoint: string, remoteId: string | null, message: string, retryable: boolean): Promise<void> {
+    await this.run(
+      `INSERT INTO normalization_errors (error_id, run_id, provider, endpoint, remote_id, message, retryable)
+       VALUES ($errorId, $runId, $provider, $endpoint, $remoteId, $message, $retryable)`,
+      { errorId: randomUUID(), runId, provider, endpoint, remoteId, message, retryable },
+    );
+    await this.run('UPDATE sync_runs SET error_count = error_count + 1 WHERE run_id = $runId', { runId });
+  }
+
+  async status(): Promise<Record<string, unknown>> {
+    const [runs, errors, rawObjects, activities, streams, cursors] = await Promise.all([
+      this.rows('SELECT status, count(*)::INTEGER AS count FROM sync_runs GROUP BY status'),
+      this.rows('SELECT count(*)::INTEGER AS count FROM normalization_errors WHERE resolved_at IS NULL'),
+      this.rows('SELECT count(*)::INTEGER AS count FROM raw_objects'),
+      this.rows('SELECT count(*)::INTEGER AS count FROM activities'),
+      this.rows('SELECT count(*)::INTEGER AS count FROM stream_manifest'),
+      this.rows<{ provider: string; cursor_name: string; covered_through_date: string; latest_source_date: string | null; lookback_days: number; last_successful_run_id: string | null; last_completed_at: string; status: string }>('SELECT provider, cursor_name, cast(covered_through_date AS VARCHAR) AS covered_through_date, cast(latest_source_date AS VARCHAR) AS latest_source_date, lookback_days, last_successful_run_id, cast(last_completed_at AS VARCHAR) AS last_completed_at, status FROM sync_cursors ORDER BY provider, cursor_name'),
+    ]);
+    return {
+      runs, unresolvedErrors: errors[0]?.count ?? 0, rawObjects: rawObjects[0]?.count ?? 0, activities: activities[0]?.count ?? 0, streams: streams[0]?.count ?? 0,
+      cursors: cursors.map((cursor) => ({ ...cursor, next_from_date: subtractDays(cursor.covered_through_date, Number(cursor.lookback_days)) })),
+    };
+  }
+
+  async getRun(runId: string): Promise<{ provider: Provider; from_date: string } | null> {
+    const rows = await this.rows<{ provider: Provider; from_date: string }>(
+      'SELECT provider, cast(from_date AS VARCHAR) AS from_date FROM sync_runs WHERE run_id = $runId',
+      { runId },
+    );
+    return rows[0] ?? null;
+  }
+
+  async insertSourceAccount(provider: Provider, remoteAccountId: string, displayName: string | null, payload: unknown): Promise<void> {
+    await this.run(
+      `INSERT OR REPLACE INTO source_accounts VALUES ($provider, $remoteAccountId, $displayName, now(), $payload)`,
+      { provider, remoteAccountId, displayName, payload: json(payload) },
+    );
+  }
+
+  async resolveIncrementalWindow(provider: Provider, cursorName: 'daily' | 'activities', toDate: string, initialFromDate: string, lookbackDays: number): Promise<{ fromDate: string; toDate: string; source: 'cursor' | 'bootstrap' | 'initial' }> {
+    const cursor = await this.rows<{ covered_through_date: string }>(
+      `SELECT cast(covered_through_date AS VARCHAR) AS covered_through_date
+       FROM sync_cursors WHERE provider = $provider AND cursor_name = $cursorName`,
+      { provider, cursorName },
+    );
+    if (cursor[0]?.covered_through_date) {
+      return { fromDate: subtractDays(cursor[0].covered_through_date, lookbackDays), toDate, source: 'cursor' };
+    }
+    const latestSourceDate = await this.latestSourceDate(provider, cursorName);
+    if (latestSourceDate) {
+      await this.upsertCursor(provider, cursorName, toDate, latestSourceDate, lookbackDays, null, 'bootstrap', { initializedFrom: 'normalized_source_dates' });
+      return { fromDate: subtractDays(latestSourceDate, lookbackDays), toDate, source: 'bootstrap' };
+    }
+    return { fromDate: initialFromDate, toDate, source: 'initial' };
+  }
+
+  async advanceIncrementalCursor(provider: Provider, cursorName: 'daily' | 'activities', runId: string, coveredThroughDate: string, lookbackDays: number): Promise<void> {
+    const latestSourceDate = await this.latestSourceDate(provider, cursorName);
+    const run = await this.rows<{ error_count: number }>('SELECT error_count FROM sync_runs WHERE run_id = $runId', { runId });
+    const status = Number(run[0]?.error_count ?? 0) > 0 ? 'completed_with_errors' : 'completed';
+    await this.upsertCursor(provider, cursorName, coveredThroughDate, latestSourceDate, lookbackDays, runId, status, { reconciliation: 'overlap_window' });
+  }
+
+  async activityNeedsDetailSync(provider: Provider, remoteActivityId: string, summaryHash: string): Promise<boolean> {
+    const rows = await this.rows<{ summary_hash: string }>(
+      'SELECT summary_hash FROM activity_sync_state WHERE provider = $provider AND remote_activity_id = $remoteActivityId',
+      { provider, remoteActivityId },
+    );
+    return rows[0]?.summary_hash !== summaryHash;
+  }
+
+  async recordActivitySyncState(provider: Provider, remoteActivityId: string, summaryHash: string, runId: string, detailsFetched: boolean): Promise<void> {
+    await this.run(
+      `INSERT INTO activity_sync_state (provider, remote_activity_id, summary_hash, last_seen_run_id, last_detail_sync_at, details_status)
+       VALUES ($provider, $remoteActivityId, $summaryHash, $runId, CASE WHEN $detailsFetched THEN now() ELSE NULL END, CASE WHEN $detailsFetched THEN 'attempted' ELSE 'unchanged' END)
+       ON CONFLICT (provider, remote_activity_id) DO UPDATE SET
+         summary_hash = excluded.summary_hash,
+         last_seen_run_id = excluded.last_seen_run_id,
+         last_seen_at = now(),
+         last_detail_sync_at = CASE WHEN $detailsFetched THEN now() ELSE activity_sync_state.last_detail_sync_at END,
+         details_status = CASE WHEN $detailsFetched THEN 'attempted' ELSE activity_sync_state.details_status END`,
+      { provider, remoteActivityId, summaryHash, runId, detailsFetched },
+    );
+  }
+
+  async knownActivitySummaryHashes(provider: Provider): Promise<Record<string, string>> {
+    const rows = await this.rows<{ remote_activity_id: string; summary_hash: string }>(
+      'SELECT remote_activity_id, summary_hash FROM activity_sync_state WHERE provider = $provider',
+      { provider },
+    );
+    return Object.fromEntries(rows.map((row) => [row.remote_activity_id, row.summary_hash]));
+  }
+
+  private async latestSourceDate(provider: Provider, cursorName: 'daily' | 'activities'): Promise<string | null> {
+    const observations = cursorName === 'daily'
+      ? `SELECT max(metric_date) AS observed_date FROM daily_metrics WHERE provider = $provider
+         UNION ALL SELECT max(nutrition_date) FROM nutrition_days WHERE provider = $provider
+         UNION ALL SELECT max(occurred_on) FROM source_entities WHERE provider = $provider AND entity_type IN ('wellness', 'daily_health', 'nutrition_day', 'nutrition_log')`
+      : `SELECT max(cast(started_at_utc AS DATE)) AS observed_date FROM activities activity
+           JOIN activity_sources source USING (activity_id) WHERE source.provider = $provider
+         UNION ALL SELECT max(occurred_on) FROM source_entities WHERE provider = $provider AND entity_type = 'activity'`;
+    const rows = await this.rows<{ latest_source_date: string | Date | null }>(`
+      SELECT max(observed_date) AS latest_source_date FROM (${observations})
+    `, { provider });
+    return toIsoDate(rows[0]?.latest_source_date ?? null);
+  }
+
+  private async upsertCursor(provider: Provider, cursorName: 'daily' | 'activities', coveredThroughDate: string, latestSourceDate: string | null, lookbackDays: number, runId: string | null, status: string, detail: Record<string, unknown>): Promise<void> {
+    await this.run(
+      `INSERT INTO sync_cursors (provider, cursor_name, covered_through_date, latest_source_date, lookback_days, last_successful_run_id, last_completed_at, status, detail_json)
+       VALUES ($provider, $cursorName, $coveredThroughDate, $latestSourceDate, $lookbackDays, $runId, now(), $status, $detail)
+       ON CONFLICT (provider, cursor_name) DO UPDATE SET
+         covered_through_date = excluded.covered_through_date,
+         latest_source_date = excluded.latest_source_date,
+         lookback_days = excluded.lookback_days,
+         last_successful_run_id = excluded.last_successful_run_id,
+         last_completed_at = excluded.last_completed_at,
+         status = excluded.status,
+         detail_json = excluded.detail_json`,
+      { provider, cursorName, coveredThroughDate, latestSourceDate, lookbackDays, runId, status, detail: json(detail) },
+    );
+  }
+}
+
+function toIsoDate(value: string | Date | null): string | null {
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) return value.slice(0, 10);
+  return null;
+}
+
+function subtractDays(date: string, days: number): string {
+  const timestamp = Date.parse(`${date}T00:00:00Z`);
+  return new Date(timestamp - days * 86_400_000).toISOString().slice(0, 10);
+}
+
+/**
+ * A deliberately small read-only facade for the MCP/query process.  It never
+ * applies migrations or exposes a mutating method, so an MCP process cannot
+ * turn a question into a DuckDB write.
+ */
+export class ReadOnlyCatenceDatabase {
+  private constructor(private readonly connection: DuckDBConnection) {}
+
+  static async open(paths: CatencePaths): Promise<ReadOnlyCatenceDatabase> {
+    if (!existsSync(paths.database)) {
+      throw new ReadOnlyDatabaseError('data_unavailable', 'No Catence database exists yet. Complete a sync before starting MCP.');
+    }
+    try {
+      const instance = await DuckDBInstance.create(paths.database, { access_mode: 'READ_ONLY' });
+      const connection = await instance.connect();
+      const database = new ReadOnlyCatenceDatabase(connection);
+      const migration = await database.rows<{ version: number }>('SELECT max(version) AS version FROM schema_migrations');
+      const currentVersion = Number(migration[0]?.version ?? 0);
+      const requiredVersion = Math.max(...migrations.map((item) => item.version));
+      if (currentVersion < requiredVersion) {
+        await database.close();
+        throw new ReadOnlyDatabaseError(
+          'data_unavailable',
+          `Database schema is at version ${currentVersion}; version ${requiredVersion} is required. Run a sync or build-retrieval-index once.`,
+        );
+      }
+      return database;
+    } catch (error) {
+      if (error instanceof ReadOnlyDatabaseError) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      const code = /lock|busy|conflict|read.?only|another process/i.test(message) ? 'data_sync_in_progress' : 'data_unavailable';
+      throw new ReadOnlyDatabaseError(code, `Read-only data snapshot is unavailable: ${message}`);
+    }
+  }
+
+  async close(): Promise<void> {
+    this.connection.closeSync();
+  }
+
+  async rows<T extends Record<string, unknown>>(sql: string, values?: QueryBindings): Promise<T[]> {
+    const result = await this.connection.runAndReadAll(sql, values as DuckDBValue[] | Record<string, DuckDBValue> | undefined);
+    return result.getRowObjectsJS() as T[];
+  }
+
+  async tableNames(query: string): Promise<string[]> {
+    return [...this.connection.getTableNames(query, true)];
+  }
+
+  interrupt(): void {
+    this.connection.interrupt();
+  }
+}
+
+/** Compose core read services with the DuckDB-backed, read-only adapter. */
+export async function openReadOnlyRepository(paths: CatencePaths): Promise<ReadOnlyRepository> {
+  return new ReadOnlyRepository(await ReadOnlyCatenceDatabase.open(paths), paths);
+}
+
+export class ReadOnlyDatabaseError extends Error {
+  constructor(readonly code: 'data_sync_in_progress' | 'data_unavailable', message: string) {
+    super(message);
+    this.name = 'ReadOnlyDatabaseError';
+  }
+}

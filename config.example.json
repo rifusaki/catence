@@ -1,0 +1,24 @@
+{
+  "mcp": {
+    "rateLimits": {
+      "server": { "requests": 240, "windowSeconds": 60 },
+      "tools": {
+        "*": { "requests": 60, "windowSeconds": 60 },
+        "hydrate_strava_activity": { "requests": 6, "windowSeconds": 60 },
+        "hydrate_strava_segment_history": { "requests": 4, "windowSeconds": 60 }
+      },
+      "resources": {
+        "*": { "requests": 120, "windowSeconds": 60 }
+      }
+    }
+  },
+  "providers": {
+    "strava": {
+      "budget": {
+        "maxConcurrentRequests": 1,
+        "readRequestsPer15Minutes": 80,
+        "readRequestsPerDay": 800
+      }
+    }
+  }
+}

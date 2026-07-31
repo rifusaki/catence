@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+.env
+.catence/
+.venv/
+.uv-cache/
+.npm-cache/
+.pytest_cache/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.DS_Store
+# CocoIndex Code (ccc)
+/.cocoindex_code/
