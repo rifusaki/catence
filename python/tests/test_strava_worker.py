@@ -24,14 +24,16 @@ def test_secret_is_owner_only_and_never_enters_staging(tmp_path: Path) -> None:
     assert "client_secret" not in contents
 
 
-def test_matcher_requires_the_safe_time_sport_duration_and_distance_window() -> None:
-    candidate = {"id": 1, "start_date": "2026-02-01T10:01:00Z", "sport_type": "Ride", "distance": 40_100, "moving_time": 7_180}
+def test_matcher_uses_elapsed_time_and_normalized_sport_families() -> None:
+    candidate = {"id": 1, "start_date": "2026-02-01T10:01:00Z", "sport_type": "Ride", "distance": 40_100, "elapsed_time": 7_180}
     matched, evidence = matches_activity(candidate, "2026-02-01T10:00:00Z", "cycling", 40_000, 7_200)
     assert matched is True
     assert evidence["startDeltaSeconds"] == 60
     virtual = {**candidate, "sport_type": "VirtualRide"}
-    matched_virtual, _ = matches_activity(virtual, "2026-02-01T10:00:00Z", "Ride", 40_000, 7_200)
-    assert matched_virtual is False
+    matched_virtual, _ = matches_activity(virtual, "2026-02-01T10:00:00Z", "road_biking", 40_000, 7_200)
+    assert matched_virtual is True
+    strength = {**candidate, "sport_type": "WeightTraining", "distance": 0, "elapsed_time": 3_600}
+    assert matches_activity(strength, "2026-02-01T10:00:00Z", "strength_training", 0, 3_600)[0] is True
     outside, _ = matches_activity({**candidate, "start_date": "2026-02-01T10:01:31Z"}, "2026-02-01T10:00:00Z", "Ride", 40_000, 7_200)
     assert outside is False
 
@@ -82,7 +84,7 @@ def test_activity_hydration_uses_the_provider_supplied_strava_id_directly(tmp_pa
                 return {"id": 23408388054, "gear_id": "bike-1", "segment_efforts": []}
             return {"id": "bike-1", "name": "Road bike"}
 
-    result = stage_activity(Reader(), writer, Namespace(activity_id="intervals:i162943791", strava_activity_id="23408388054", strava_match_method="source_strava_id", started_at=None, sport=None, distance_m=None, moving_s=None))
+    result = stage_activity(Reader(), writer, Namespace(activity_id="intervals:i162943791", strava_activity_id="23408388054", strava_match_method="source_strava_id", started_at=None, sport=None, distance_m=None, elapsed_s=None))
 
     assert result["status"] == "completed"
     assert result["matchEvidence"] == {"method": "source_strava_id", "stravaActivityId": "23408388054"}
@@ -102,10 +104,10 @@ def test_activity_hydration_falls_back_to_timestamp_matching_after_a_missing_str
             if path == "/activities/22995929424":
                 raise StravaConnectionError("Not Found: Record Not Found: []")
             if endpoint == "activity_candidates":
-                return [{"id": 18635626846, "start_date": "2026-05-24T12:24:15Z", "sport_type": "Ride", "distance": 7_000, "moving_time": 670}]
+                return [{"id": 18635626846, "start_date": "2026-05-24T12:24:15Z", "sport_type": "Ride", "distance": 7_000, "elapsed_time": 670}]
             return {"id": 18635626846, "segment_efforts": []}
 
-    result = stage_activity(Reader(), writer, Namespace(activity_id="intervals:i151098464", strava_activity_id="22995929424", strava_match_method="linked_strava_source", started_at="2026-05-24T12:24:15Z", sport="Ride", distance_m=7_000, moving_s=670))
+    result = stage_activity(Reader(), writer, Namespace(activity_id="intervals:i151098464", strava_activity_id="22995929424", strava_match_method="linked_strava_source", started_at="2026-05-24T12:24:15Z", sport="Ride", distance_m=7_000, elapsed_s=670))
 
     assert result["status"] == "completed"
     assert result["stravaActivityId"] == "18635626846"
@@ -121,7 +123,7 @@ def test_source_strava_id_does_not_fall_back_to_a_different_activity(tmp_path: P
         def get(self, _endpoint: str, _path: str, **_params: object) -> object:
             raise StravaConnectionError("Not Found: Record Not Found: []")
 
-    result = stage_activity(Reader(), writer, Namespace(activity_id="intervals:i151098464", strava_activity_id="18635626894", strava_match_method="source_strava_id", started_at="2026-05-24T13:00:57Z", sport="Ride", distance_m=21_064, moving_s=2_170))
+    result = stage_activity(Reader(), writer, Namespace(activity_id="intervals:i151098464", strava_activity_id="18635626894", strava_match_method="source_strava_id", started_at="2026-05-24T13:00:57Z", sport="Ride", distance_m=21_064, elapsed_s=2_170))
 
     assert result["status"] == "not_found"
     assert result["stravaActivityId"] == "18635626894"
@@ -137,7 +139,7 @@ def test_activity_hydration_reports_a_search_window_when_strava_returns_no_candi
             assert endpoint == "activity_candidates"
             return []
 
-    result = stage_activity(Reader(), writer, Namespace(activity_id="garmin:1", strava_activity_id=None, strava_match_method=None, started_at="2026-05-24T13:00:57Z", sport="Ride", distance_m=21_064, moving_s=2_170))
+    result = stage_activity(Reader(), writer, Namespace(activity_id="garmin:1", strava_activity_id=None, strava_match_method=None, started_at="2026-05-24T13:00:57Z", sport="Ride", distance_m=21_064, elapsed_s=2_170))
 
     assert result["status"] == "not_found"
     assert result["candidateCount"] == 0

@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--started-at")
     parser.add_argument("--sport")
     parser.add_argument("--distance-m", type=float)
-    parser.add_argument("--moving-s", type=float)
+    parser.add_argument("--elapsed-s", type=float)
     parser.add_argument("--segment-id")
     parser.add_argument("--start-page", type=int, default=1)
     parser.add_argument("--refresh", action="store_true")
@@ -93,12 +93,16 @@ def sport_family(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = "".join(character for character in value.lower() if character.isalpha())
-    if "ride" in normalized or "cycl" in normalized:
+    if "ride" in normalized or "cycl" in normalized or "bik" in normalized:
         return "ride"
     if "run" in normalized:
         return "run"
     if "swim" in normalized:
         return "swim"
+    if "walk" in normalized:
+        return "walk"
+    if "strength" in normalized or "weight" in normalized:
+        return "strength"
     return normalized or None
 
 
@@ -111,11 +115,11 @@ def is_not_found(error: Exception) -> bool:
     return "404" in message or "not found" in message or "record not found" in message
 
 
-def matches_activity(candidate: dict[str, Any], started_at: str, sport: str | None, distance_m: float | None, moving_s: float | None) -> tuple[bool, dict[str, Any]]:
+def matches_activity(candidate: dict[str, Any], started_at: str, sport: str | None, distance_m: float | None, elapsed_s: float | None) -> tuple[bool, dict[str, Any]]:
     candidate_start = timestamp(candidate.get("start_date"))
     requested_start = timestamp(started_at)
     candidate_distance = candidate.get("distance")
-    candidate_moving = candidate.get("moving_time")
+    candidate_elapsed = candidate.get("elapsed_time")
     requested_sport = sport_family(sport)
     candidate_sport = sport_family(candidate.get("sport_type") or candidate.get("type"))
     evidence: dict[str, Any] = {
@@ -124,31 +128,29 @@ def matches_activity(candidate: dict[str, Any], started_at: str, sport: str | No
         "candidateVirtualOrIndoor": is_virtual_or_indoor(candidate.get("sport_type") or candidate.get("type")),
         "rejectionReasons": [],
     }
-    if requested_start is None or candidate_start is None or not isinstance(candidate_distance, (int, float)) or not isinstance(candidate_moving, (int, float)):
+    if requested_start is None or candidate_start is None or not isinstance(candidate_distance, (int, float)) or not isinstance(candidate_elapsed, (int, float)):
         evidence["rejectionReasons"] = ["candidate_missing_required_fields"]
         return False, evidence
-    if distance_m is None or moving_s is None:
+    if distance_m is None or elapsed_s is None:
         evidence["rejectionReasons"] = ["catence_activity_missing_required_fields"]
         return False, evidence
     start_delta = abs(requested_start - candidate_start)
-    duration_delta = abs(moving_s - float(candidate_moving))
+    duration_delta = abs(elapsed_s - float(candidate_elapsed))
     distance_delta = abs(distance_m - float(candidate_distance))
-    duration_limit = max(120.0, moving_s * 0.05)
+    duration_limit = max(120.0, elapsed_s * 0.05)
     distance_limit = max(200.0, distance_m * 0.025)
     evidence.update({
-        "startDeltaSeconds": start_delta, "durationDeltaSeconds": duration_delta,
-        "distanceDeltaMeters": distance_delta, "durationLimitSeconds": duration_limit,
+        "startDeltaSeconds": start_delta, "elapsedDurationDeltaSeconds": duration_delta,
+        "distanceDeltaMeters": distance_delta, "elapsedDurationLimitSeconds": duration_limit,
         "distanceLimitMeters": distance_limit,
     })
     reasons: list[str] = []
     if candidate_sport != requested_sport:
         reasons.append("sport_family_mismatch")
-    if is_virtual_or_indoor(candidate.get("sport_type") or candidate.get("type")) != is_virtual_or_indoor(sport):
-        reasons.append("virtual_or_indoor_mismatch")
     if start_delta > 90:
         reasons.append("start_time_outside_90_second_window")
     if duration_delta > duration_limit:
-        reasons.append("moving_duration_outside_tolerance")
+        reasons.append("elapsed_duration_outside_tolerance")
     if distance_delta > distance_limit:
         reasons.append("distance_outside_tolerance")
     evidence["rejectionReasons"] = reasons
@@ -278,8 +280,8 @@ def stage_activity(reader: StravaReader, writer: StravaStagingWriter, args: argp
             if not is_not_found(error):
                 raise
             direct_lookup_unavailable = True
-    if not args.started_at or not args.sport or args.distance_m is None or args.moving_s is None:
-        raise StravaConnectionError("Activity hydration requires a start time, sport, distance, and moving duration from the Catence activity.")
+    if not args.started_at or not args.sport or args.distance_m is None or args.elapsed_s is None:
+        raise StravaConnectionError("Activity hydration requires a start time, sport, distance, and elapsed duration from the Catence activity.")
     start = timestamp(args.started_at)
     if start is None:
         raise StravaConnectionError("The Catence activity has an invalid start time and cannot be matched to Strava.")
@@ -292,7 +294,7 @@ def stage_activity(reader: StravaReader, writer: StravaStagingWriter, args: argp
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
-        accepted, evidence = matches_activity(candidate, args.started_at, args.sport, args.distance_m, args.moving_s)
+        accepted, evidence = matches_activity(candidate, args.started_at, args.sport, args.distance_m, args.elapsed_s)
         if accepted:
             qualified.append((candidate, evidence))
         else:
@@ -308,7 +310,7 @@ def stage_activity(reader: StravaReader, writer: StravaStagingWriter, args: argp
                 "A private, deleted, or differently timestamped Strava activity cannot be matched from this result.",
             ]
         elif not qualified:
-            likely_reasons = ["Strava returned activities, but none met Catence's safe sport, indoor/virtual, time, duration, and distance tolerances."]
+            likely_reasons = ["Strava returned activities, but none met Catence's safe sport, time, elapsed-duration, and distance tolerances."]
         else:
             likely_reasons = ["More than one Strava activity met the safe matching tolerances; Catence will not choose one automatically."]
         return {
