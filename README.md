@@ -56,11 +56,12 @@ npm run catence-data -- sync --provider strava
 npm run catence-data -- sync --provider all
 npm run catence-data -- retry --run <run-id>
 npm run catence-data -- backfill --from 2020-01-01
+npm run catence-data -- backfill --provider garmin --from 2026-07-01 --refresh
 npm run catence-data -- build-retrieval-index
 npm run mcp
 ```
 
-All provider calls are protected by a read-only endpoint allowlist. A sync continues after individual extraction failures and records them for `retry`.
+All provider calls are protected by a read-only endpoint allowlist. Garmin supplies canonical activity and health data; Intervals syncs only its activity-summary analysis values, not duplicate health, files, streams, or unrelated account data. A sync continues after individual extraction failures and records them for `retry`.
 
 The first ordinary sync uses the historical fallback only when no normalized
 coverage exists. After that, `sync` is incremental: Garmin daily facts use a
@@ -68,7 +69,12 @@ three-day overlap, activities use a fourteen-day overlap, and unchanged
 activities do not re-download their detail endpoints, original files, or
 streams. `--from` and `backfill` are explicit ranges and do not move the
 incremental cursor. `catence-data status` reports each provider cursor and its next
-effective start date.
+effective start date. `backfill --provider garmin --from YYYY-MM-DD --refresh`
+re-fetches every Garmin activity's detail, files, and streams in the selected
+range and upserts the resulting facts through today. It also fetches Garmin's
+historical cycling FTP setting range, retaining each daily setting separately
+from activity-level FTP and the current-only setting. It preserves archived raw
+artifacts and does not delete data merely absent from a later provider payload.
 
 Build the retrieval index after a completed sync. It contains compact, derived
 activity/plan/nutrition context only—not GPS tracks, sample streams, raw JSON,
@@ -76,7 +82,7 @@ or original files. A later sync marks it stale again.
 
 ## MCP
 
-`npm run mcp` launches a local stdio server from this checkout. The package entry point is `catence --data-dir /absolute/path/to/catence-data`. Ordinary analytical tools and resources open `catence.duckdb` with DuckDB `READ_ONLY` mode for each request. The only MCP writes are `hydrate_strava_activity` and `hydrate_strava_segment_history`; they take the shared data-directory write lock, call only the Strava GET allowlist, archive before normalization, commit, and release the lock. If any writer owns the lock, the enrichment call returns retryable `data_sync_in_progress`; ordinary reads remain read-only snapshots.
+`npm run mcp` launches a local stdio server from this checkout. The package entry point is `catence --data-dir /absolute/path/to/catence-data`. Ordinary analytical tools and resources open `catence.duckdb` with DuckDB `READ_ONLY` mode for each request. The only MCP writes are `hydrate_strava_activity`, serial `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history`; they take the shared data-directory write lock, call only the Strava GET allowlist, archive before normalization, commit, and release the lock. If any writer owns the lock, the enrichment call returns retryable `data_sync_in_progress`; ordinary reads remain read-only snapshots.
 
 For development from this repository, invoke it with an explicit data path:
 
@@ -86,10 +92,12 @@ npm run mcp -- --data-dir /absolute/path/to/catence-data
 
 For an npm-installed agent, use the `npx` configuration in [agent installation](docs/agent-installation.md) instead. Do not put Intervals, Garmin, or Strava credentials in an MCP client configuration: those are needed by the management process only.
 
-The ordinary tool set is analytical; the only mutation-capable additions are `hydrate_strava_activity` and `hydrate_strava_segment_history`:
+The ordinary tool set is analytical; the only mutation-capable additions are `hydrate_strava_activity`, serial `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history`:
 
 - `catence_status` and `describe_data` expose coverage, provenance, units, and catalog constraints.
+- `describe_dataset` is the compact schema browser for one cataloged dataset, avoiding exploratory SQL just to find field names.
 - `read_series`, `aggregate_data`, `analyze_series`, and `fit_series_model` cover bounded time-series work. `read_series` automatically aggregates dense streams and returns a deterministic cursor for later pages.
+- `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, `latest_cycling_activities`, and `cycling_progress_report` expose source-aware fitness projections without JSON-path or array-index SQL.
 - `search_context` finds generated context and points to the authoritative follow-up tool.
 - `query_read_only_data` is the escape hatch for novel questions. It permits one parameterized `SELECT`/`WITH … SELECT` against cataloged views only, with a 500-row, 512 KB, and four-second limit. It rejects comments, multiple statements, mutations/DDL, extension commands, `COPY`/`ATTACH`, and filesystem table functions.
 
@@ -144,7 +152,7 @@ For local, let's go with
 (knead-garmin) rifusaki@rifuAir catence % npm run catence-data -- auth strava --code [code]
 ```
 
-`sync --provider strava` refreshes only the current athlete bike and shoe records. An MCP agent can then use `hydrate_strava_activity` for one existing Catence activity/source ID. Catence searches a narrow time window, applies the audited matcher, and persists the matched activity detail, assigned gear, segment efforts, and embedded segment facts. `hydrate_strava_segment_history` accepts one persisted segment ID and retrieves only that segment detail plus the authenticated athlete historic efforts. Completed enrichment is cached unless `refresh` is set. A throttle or interruption returns saved `partial` state with its continuation page, so the next request resumes rather than discarding existing rows.
+`sync --provider strava` refreshes only the current athlete bike and shoe records. An MCP agent can then use `hydrate_strava_activity` for one existing Catence activity/source ID, or `hydrate_recent_strava_activities` for an explicit list or bounded date/sport window. The batch tool processes writes serially and reports every match, miss, ambiguity, and skip. Catence retrieves an already-linked Strava source, or an explicitly Strava-qualified ID, directly; otherwise it searches a narrow time window and applies the audited matcher. A direct lookup that is no longer available falls back to that safe matcher. Unmatched results include the search window, returned/qualified candidate counts, rejection reasons, and practical next checks. It then persists the activity detail, assigned gear, segment efforts, and embedded segment facts. `hydrate_strava_segment_history` accepts one persisted segment ID and retrieves only that segment detail plus the authenticated athlete historic efforts. Completed enrichment is cached unless `refresh` is set. A throttle or interruption returns saved `partial` state with its continuation page, so the next request resumes rather than discarding existing rows.
 
 Segment facts include name, length, grades, climb category, elevation, privacy, hazard, and raw `starred` state. Strava public segment data does not expose verification, so Catence always reports it as unavailable and never guesses missing power, speed, or verification data.
 

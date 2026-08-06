@@ -39,7 +39,7 @@ contract remain intact; they are an ELT component and never write DuckDB.
 
 ### 1. Data fetching
 
-Garmin Connect and Intervals.icu provide the complete local record. Strava is a deliberately sparse, targeted source for current gear and selected activity segment enrichment.
+Garmin Connect provides the complete local record. Intervals.icu contributes only its separately named activity-analysis values (for example training load, RPE, feel, and weighted power). Strava is a deliberately sparse, targeted source for current gear and selected activity segment enrichment.
 
 For Garmin, we will use [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) as it is the most mature and widely used library for this purpose. On the Intervals.icu side, the best option available right now is [node-intervals-icue](https://github.com/paladini/node-intervals-icu).
 
@@ -90,9 +90,11 @@ commands; there is no scheduler or provider mutation in this phase.
 Normalized tables preserve provenance rather than force an early merge:
 
 - Activities remain provider-specific through `activity_sources`. Provider external IDs are strong links; an auto-link is allowed only for one sport-compatible candidate within 90 seconds and tight duration/distance tolerances, while ambiguity and virtual/indoor conflicts remain unlinked. Garmin is the canonical original activity detail source. Intervals training load, RPE, feel, and related calculations remain separately named analysis fields; Strava is never canonical.
-- Daily health and nutrition retain provider/source values. Nutrition includes
-  daily macro/hydration totals and individual food/meal items, in addition to
-  the complete archived payload.
+- Daily health observations retain provider/source values in `daily_metrics`,
+  while the default `daily_health` projection selects Garmin for every date
+  where Garmin has health facts (another provider is a whole-day fallback).
+  Nutrition includes daily macro/hydration totals and individual food/meal
+  items, in addition to the complete archived payload.
 - Plans, workouts, events, routes, gear, devices, goals, achievements,
   messages, and provider-specific data are represented as normalized source and
   domain entities with stable query views and `extension_json` for fields the
@@ -107,7 +109,7 @@ and notes rather than raw activity streams or source dumps.
 
 ### 3. Queries, tools and methods
 
-The MCP process is a separate stdio consumer. Ordinary tools and resources open DuckDB `READ_ONLY` snapshots. The only write capabilities are the explicit `hydrate_strava_activity` and `hydrate_strava_segment_history` tools: both acquire the shared data-directory lock, call only the Strava GET allowlist, archive responses before normalization, commit, and release the lock. If another writer owns it, the result is retryable `data_sync_in_progress`.
+The MCP process is a separate stdio consumer. Ordinary tools and resources open DuckDB `READ_ONLY` snapshots. The only write capabilities are the explicit `hydrate_strava_activity`, serial `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history` tools: each acquires the shared data-directory lock, calls only the Strava GET allowlist, archives responses before normalization, commits, and releases the lock. If another writer owns it, the result is retryable `data_sync_in_progress`.
 
 The query layer has four shared pieces:
 
@@ -140,7 +142,7 @@ question safely, then request a narrower/raw series only when it is useful.
 
 The server currently exposes `catence_status`, `describe_data`, `read_series`,
 `aggregate_data`, `analyze_series`, `fit_series_model`,
-`query_read_only_data`, `search_context`, `hydrate_strava_activity`, and `hydrate_strava_segment_history`, plus resources for status,
+`query_read_only_data`, `search_context`, `hydrate_strava_activity`, `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history`, plus resources for status,
 catalog, a single activity, and a date-range summary.
 
 `catence-data build-retrieval-index` explicitly generates `retrieval_documents` and
@@ -166,7 +168,7 @@ read-only boundary.
 
 The public npm distribution is named `catence`. It exports two commands:
 `catence`, the direct stdio-only server, and `catence-data`, the management CLI. Both accept an explicit
-data directory; the server never initializes or runs a general sync. Ordinary queries never write, while the two declared Strava hydration tools use the shared locked writer path.
+data directory; the server never initializes or runs a general sync. Ordinary queries never write, while the declared Strava hydration tools use the shared locked writer path.
 This makes one local data snapshot usable by multiple agents without relying on
 their current working directory or sharing provider credentials.
 

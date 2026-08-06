@@ -7,7 +7,7 @@ MCP endpoints that should replace repeated ad-hoc SQL. It is deliberately
 source-aware: an agent must not turn plausible Garmin/Intervals coincidences
 into asserted facts.
 
-> The only mutation exception is targeted Strava activity or segment-history hydration. It acquires the shared data-directory lock, calls only the Strava GET allowlist, archives responses before normalization, and returns a retryable busy result if another writer owns the lock.
+> The only mutation exception is targeted Strava activity, serial activity-batch, or segment-history hydration. It acquires the shared data-directory lock, calls only the Strava GET allowlist, archives responses before normalization, and returns a retryable busy result if another writer owns the lock.
 
 ## Non-negotiable rules
 
@@ -47,7 +47,7 @@ rather than embedding their own DuckDB connection or SQL guard.
 the summary metrics plus `activity_id`, `activity_source_id`, `provider`,
 `remote_activity_id`, source artifact hash, activity timestamps, sport, and
 name. `canonical_activity_training` contains one selected interpretation per
-logical activity (Intervals is preferred when linked); it is useful for
+logical activity (Garmin is preferred when linked); it is useful for
 comparison but must not hide provider detail.
 
 `activity_interval_facts` contains structured chunks:
@@ -110,6 +110,14 @@ differs from the activity summary, report both values and the difference.
 
 These endpoints are drafts, not registered tools yet. Add them incrementally
 only after their shared service methods and fixture tests exist.
+
+## Implemented fitness and hydration endpoints
+
+- `describe_dataset(dataset)` returns one cataloged schema and its coverage.
+- `get_ftp_history`, `get_vo2max_history`, and `power_curve_trend` read normalized, source-aware fitness facts. They do not scrape JSON payloads or rely on curve-array positions.
+- `latest_cycling_activities` returns Garmin source records to avoid silently double-counting linked Intervals summaries; optional multisport parents are explicitly flagged.
+- `cycling_progress_report` composes the preceding read-only outputs with monthly canonical volume/load. It is descriptive, not a physiological model.
+- `hydrate_recent_strava_activities` accepts an explicit list or a bounded date/sport window and awaits each write in sequence. Its unmatched output includes the exact Strava search window and safe-match rejection diagnostics.
 
 ### `list_recent_activities`
 

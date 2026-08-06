@@ -7,6 +7,7 @@ import { writeParquetSamples, type ActivitySample } from '../src/elt/streams.js'
 import { openReadOnlyRepository } from '../src/elt/storage/database.js';
 import { buildRetrievalIndex, searchContext } from '../src/core/retrieval/index.js';
 import { AnalyticsService } from '../src/core/query/analytics.js';
+import { FitnessService } from '../src/core/query/fitness.js';
 import { queryReadOnlyData } from '../src/core/query/sql-guard.js';
 import { temporaryDatabase } from './helpers.js';
 
@@ -24,6 +25,24 @@ async function fixture() {
     kind: 'source_entity', schemaVersion: 1, provider: 'intervals', entityType: 'activity', remoteId: 'ride-1', parentRemoteId: null, occurredOn: '2026-01-08', sourceUpdatedAt: null, rawObjectHash: null,
     payload: { id: 'ride-1', start_date: '2026-01-08T10:00:00Z', type: 'Ride', name: 'Tempo ride', distance: 40_000, moving_time: 6_000, icu_training_load: 85, average_heartrate: 145 }, extension: {},
   });
+  await importRecord(setup.database, runId, {
+    kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity', remoteId: 'garmin-ride-1', parentRemoteId: null, occurredOn: '2026-01-07', sourceUpdatedAt: null, rawObjectHash: 'garmin-raw',
+    payload: { activityId: 'garmin-ride-1', startTimeGMT: '2026-01-07T10:00:00Z', activityType: 'road_biking', activityName: 'Road ride', distance: 42_000, duration: 6_300, maxFtp: 250 }, extension: {},
+  });
+  await importRecord(setup.database, runId, {
+    kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'functional_threshold_power', remoteId: 'cycling:2026-01-08', parentRemoteId: null, occurredOn: '2026-01-08', sourceUpdatedAt: null, rawObjectHash: 'ftp-raw',
+    payload: { sport: 'CYCLING', calendarDate: '2026-01-08', functionalThresholdPower: 255 }, extension: {},
+  });
+  await importRecord(setup.database, runId, {
+    kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'max_metric', remoteId: 'max-1', parentRemoteId: null, occurredOn: '2026-01-08', sourceUpdatedAt: null, rawObjectHash: 'max-raw',
+    payload: { cycling: { calendarDate: '2026-01-08', vo2MaxPreciseValue: 55.2 } }, extension: {},
+  });
+  for (const [durationSeconds, bestPowerWatts] of [[5, 600], [300, 280], [1_200, 240]] as const) {
+    await importRecord(setup.database, runId, {
+      kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity_power_best', remoteId: `power-${durationSeconds}`, parentRemoteId: 'garmin-ride-1', occurredOn: '2026-01-07', sourceUpdatedAt: null, rawObjectHash: `power-${durationSeconds}`,
+      payload: { durationSeconds, bestPowerWatts }, extension: {},
+    });
+  }
   const samples: ActivitySample[] = Array.from({ length: 1_001 }, (_, index) => ({
     activity_source_id: 'intervals:ride-1', timestamp_utc: new Date(Date.parse('2026-01-08T10:00:00Z') + index * 1_000).toISOString(), elapsed_s: index, distance_m: index * 10,
     latitude: null, longitude: null, altitude_m: null, heart_rate_bpm: 130 + (index % 10), power_w: 180 + (index % 40), cadence_rpm: null, speed_mps: null, temperature_c: null, grade_pct: null, extras_json: '{}',
@@ -60,11 +79,21 @@ describe('read-only retrieval and analytics', () => {
       expect((model.data as { rSquared: number }).rSquared).toBeCloseTo(1);
       const aggregate = await analytics.aggregate({ dataset: 'nutrition_days', metrics: [{ column: 'carbohydrates_g', operation: 'sum', as: 'carbs' }] });
       expect((aggregate.data as Array<{ carbs: number }>)[0]?.carbs).toBe(350);
+      const temporalAggregate = await analytics.aggregate({ dataset: 'training_metrics', dimensions: ['metric_name'], metrics: [{ column: 'observed_at', operation: 'min', as: 'first_observed' }, { column: 'observed_at', operation: 'max', as: 'last_observed' }] });
+      expect(temporalAggregate.data).toEqual(expect.arrayContaining([expect.objectContaining({ metric_name: 'cycling_ftp_w' })]));
       const downsampled = await analytics.readSeries({ dataset: 'activity_samples', metrics: ['power_w'], filters: [{ column: 'activity_source_id', op: 'eq', value: 'intervals:ride-1' }], resolution: 'auto' });
       expect((downsampled.query as { resolution: string }).resolution).toBe('1m');
       expect(downsampled.data).toHaveLength(17);
       const sql = await queryReadOnlyData(repository, { sql: 'SELECT metric_date, hrv_ms FROM daily_health ORDER BY metric_date' });
       expect(sql.data).toHaveLength(8);
+      const aliasedSql = await queryReadOnlyData(repository, { sql: 'SELECT a.activity_id, source.activity_source_id FROM activities AS a JOIN activity_sources AS source ON a.activity_id = source.activity_id ORDER BY source.activity_source_id' });
+      expect(aliasedSql.data).toEqual(expect.arrayContaining([expect.objectContaining({ activity_source_id: 'garmin:garmin-ride-1' })]));
+      const fitness = new FitnessService(repository);
+      expect((await fitness.ftpHistory()).data).toEqual(expect.objectContaining({ preferredSeries: expect.arrayContaining([expect.objectContaining({ value_number: 255 })]) }));
+      expect(await fitness.vo2MaxHistory()).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ value_number: 55.2 })]) }));
+      expect(await fitness.powerCurveTrend({ durations: [5, 300] })).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ durationLabel: '5 s' })]) }));
+      expect(await fitness.latestCyclingActivities()).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ activity_source_id: 'garmin:garmin-ride-1' })]) }));
+      expect(await fitness.cyclingProgressReport()).toEqual(expect.objectContaining({ data: expect.objectContaining({ monthlyVolume: expect.any(Array) }) }));
       await expect(queryReadOnlyData(repository, { sql: 'DELETE FROM daily_health' })).rejects.toThrow('Only a single SELECT');
       const context = await searchContext(repository, { query: 'oats banana' });
       expect(context.data).toEqual(expect.arrayContaining([expect.objectContaining({ entity_type: 'nutrition_item', recommendedFollowUpTool: 'aggregate_data' })]));
@@ -94,10 +123,13 @@ describe('read-only retrieval and analytics', () => {
     await client.connect(clientTransport);
     try {
       const tools = await client.listTools();
-      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['catence_status', 'read_series', 'query_read_only_data', 'search_context']));
+      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['catence_status', 'describe_dataset', 'read_series', 'query_read_only_data', 'search_context', 'get_ftp_history', 'get_vo2max_history', 'power_curve_trend', 'latest_cycling_activities', 'cycling_progress_report', 'hydrate_recent_strava_activities']));
       const result = await client.callTool({ name: 'read_series', arguments: { dataset: 'daily_health', metrics: ['hrv_ms'], startDate: '2026-01-01', endDate: '2026-01-08', resolution: 'day' } });
       const payload = JSON.parse(((result as { content: Array<{ text: string }> }).content[0]).text) as { data: unknown[] };
       expect(payload.data).toHaveLength(8);
+      const ftpResult = await client.callTool({ name: 'get_ftp_history', arguments: { sport: 'cycling' } });
+      const ftpPayload = JSON.parse(((ftpResult as { content: Array<{ text: string }> }).content[0]).text) as { data: { preferredSeries: unknown[] } };
+      expect(ftpPayload.data.preferredSeries).toHaveLength(1);
       const resource = await client.readResource({ uri: 'catence://summary/2026-01-01/2026-01-08' });
       expect(resource.contents[0]?.mimeType).toBe('application/json');
     } finally {

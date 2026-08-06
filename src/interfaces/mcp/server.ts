@@ -7,7 +7,8 @@ import { hydrateStravaActivity, hydrateStravaSegmentHistory, StravaEnrichmentErr
 import { openReadOnlyRepository, ReadOnlyDatabaseError } from '../../elt/storage/database.js';
 import { searchContext } from '../../core/retrieval/index.js';
 import { AnalyticsService, type DataFilter } from '../../core/query/analytics.js';
-import { QueryValidationError } from '../../core/query/catalog.js';
+import { getDataset, QueryValidationError } from '../../core/query/catalog.js';
+import { FitnessService } from '../../core/query/fitness.js';
 import { jsonSafe, ReadOnlyRepository } from '../../core/query/repository.js';
 import { queryReadOnlyData } from '../../core/query/sql-guard.js';
 
@@ -48,6 +49,13 @@ function errorResult(error: unknown): ToolResult {
             ? { code: 'invalid_request', message: error.message }
             : { code: 'data_unavailable', message: error instanceof Error ? error.message : String(error) };
   return { ...textResult({ data: null, provenance: {}, query: {}, caveats: [classified.message], error: classified }), isError: true };
+}
+
+function hydrationFailure(error: unknown): { code: string; message: string; retryable?: boolean; retryAfterSeconds?: number | null } {
+  if (error instanceof DataWriteBusyError) return { code: 'data_sync_in_progress', message: error.message, retryable: true };
+  if (error instanceof StravaRateLimitError) return { code: 'rate_limited', message: error.message, retryable: true, retryAfterSeconds: error.retryAfterSeconds ?? null };
+  if (error instanceof StravaEnrichmentError) return { code: 'strava_connection_error', message: error.message };
+  return { code: 'data_unavailable', message: error instanceof Error ? error.message : String(error) };
 }
 
 async function useRepository<T>(paths: CatencePaths, fn: (repository: ReadOnlyRepository) => Promise<T>): Promise<T> {
@@ -100,6 +108,19 @@ export function createCatenceMcpServer(paths = resolvePaths()): McpServer {
     provenance: { catalog: 'Catence catalog, restricted to analytical views' }, query: {}, caveats: ['activity_samples is available only through read_series or aggregate_data and only reads registered Parquet stream manifests.'],
   }))));
 
+  server.registerTool('describe_dataset', {
+    title: 'Describe one Catence dataset',
+    description: 'Read a compact schema, permitted filters/groupings, provenance fields, and coverage for one cataloged dataset. Read-only.',
+    inputSchema: { dataset: z.string().min(1) },
+  }, tool('describe_dataset', async (input) => useRepository(paths, async (repository) => {
+    const dataset = getDataset(input.dataset);
+    const coverage = (await repository.coverage()).coverage as Array<Record<string, unknown>>;
+    return {
+      data: { dataset, coverage: coverage.find((item) => item.dataset === dataset.name) ?? null },
+      provenance: { catalog: 'Catence catalog', database: 'read-only DuckDB snapshot' }, query: input, caveats: [],
+    };
+  })));
+
   server.registerTool('read_series', {
     title: 'Read a bounded time series', description: 'Read cataloged numeric series with deterministic cursor pagination and automatic stream downsampling.', inputSchema: seriesInput,
   }, tool('read_series', async (input) => useRepository(paths, (repository) => new AnalyticsService(repository).readSeries({ ...input, filters: input.filters as DataFilter[] | undefined }))));
@@ -123,6 +144,36 @@ export function createCatenceMcpServer(paths = resolvePaths()): McpServer {
     inputSchema: { ...seriesInput, model: z.enum(['ols_linear', 'theil_sen_linear', 'polynomial_2', 'polynomial_3']), xMetric: z.string().min(1).optional(), yMetric: z.string().min(1).optional() },
   }, tool('fit_series_model', async (input) => useRepository(paths, (repository) => new AnalyticsService(repository).fitSeriesModel({ ...input, filters: input.filters as DataFilter[] | undefined }))));
 
+  server.registerTool('get_ftp_history', {
+    title: 'Get dated FTP history',
+    description: 'Return normalized cycling FTP settings and activity-summary observations with source-aware preferred daily values. Read-only.',
+    inputSchema: { sport: z.string().min(1).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional(), sourcePreference: z.enum(['settings', 'settings_then_activity', 'all']).optional() },
+  }, tool('get_ftp_history', async (input) => useRepository(paths, (repository) => new FitnessService(repository).ftpHistory(input))));
+
+  server.registerTool('get_vo2max_history', {
+    title: 'Get sport-specific VO₂max history',
+    description: 'Return normalized Garmin VO₂max observations for exactly one sport; generic and cycling values remain separate. Read-only.',
+    inputSchema: { sport: z.string().min(1).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional() },
+  }, tool('get_vo2max_history', async (input) => useRepository(paths, (repository) => new FitnessService(repository).vo2MaxHistory(input))));
+
+  server.registerTool('power_curve_trend', {
+    title: 'Read labelled power-curve trends',
+    description: 'Return monthly bests for selected power durations, including the supporting activity and source type. Read-only.',
+    inputSchema: { sport: z.string().min(1).optional(), durations: z.array(z.number().int().min(1).max(86_400)).min(1).max(12).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional(), sourceQuality: z.enum(['all', 'garmin_fit_derived']).optional() },
+  }, tool('power_curve_trend', async (input) => useRepository(paths, (repository) => new FitnessService(repository).powerCurveTrend(input))));
+
+  server.registerTool('latest_cycling_activities', {
+    title: 'List latest cycling activities',
+    description: 'List Garmin cycling source records without duplicate Intervals summaries, optionally flagging multisport parent records. Read-only.',
+    inputSchema: { startDate: z.string().date().optional(), endDate: z.string().date().optional(), includeMultisport: z.boolean().optional(), limit: z.number().int().min(1).max(100).optional() },
+  }, tool('latest_cycling_activities', async (input) => useRepository(paths, (repository) => new FitnessService(repository).latestCyclingActivities(input))));
+
+  server.registerTool('cycling_progress_report', {
+    title: 'Build a cycling progress report',
+    description: 'Combine source-aware FTP and VO₂max histories with monthly canonical volume/load and labelled power-curve trends. Read-only and descriptive.',
+    inputSchema: { startDate: z.string().date().optional(), endDate: z.string().date().optional() },
+  }, tool('cycling_progress_report', async (input) => useRepository(paths, (repository) => new FitnessService(repository).cyclingProgressReport(input))));
+
   server.registerTool('query_read_only_data', {
     title: 'Query cataloged read-only data', description: 'Advanced fallback: one parameterized SELECT or WITH … SELECT over cataloged views only. Filesystem access, extensions, DDL, and mutation are rejected.',
     inputSchema: { sql: z.string().min(1).max(20_000), values: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).refine((value) => Object.keys(value).length <= 100, 'At most 100 bind values are allowed.').optional() },
@@ -140,6 +191,73 @@ export function createCatenceMcpServer(paths = resolvePaths()): McpServer {
   }, tool('hydrate_strava_activity', async (input) => {
     const data = await hydrateStravaActivity(paths, input.activityId, input.refresh ?? false);
     return { data, coverage: await useRepository(paths, (repository) => repository.coverage()), provenance: { provider: 'strava', operation: 'activity_detail', archivedBeforeNormalization: true }, caveats: ['Segment verification is unavailable from Strava public segment data and is never inferred.'] };
+  }));
+
+  server.registerTool('hydrate_recent_strava_activities', {
+    title: 'Hydrate several recent Strava activities',
+    description: 'Write-only targeted batch enrichment. Select an explicit list or a bounded date/sport window; Catence hydrates one activity at a time and reports every outcome.',
+    inputSchema: z.object({
+      activityIds: z.array(z.string().min(1)).min(1).max(20).optional(),
+      startDate: z.string().date().optional(), endDate: z.string().date().optional(), sports: z.array(z.string().min(1)).min(1).max(12).optional(),
+      limit: z.number().int().min(1).max(20).optional(), refresh: z.boolean().optional(),
+    }).refine((value) => Boolean(value.activityIds?.length) || Boolean(value.startDate && value.endDate), 'Provide activityIds or both startDate and endDate.'),
+  }, tool('hydrate_recent_strava_activities', async (input) => {
+    const activityIds = input.activityIds
+      ? [...new Set(input.activityIds)]
+      : await useRepository(paths, async (repository) => {
+        const values: Record<string, unknown> = {
+          startDate: input.startDate!, endDate: `${input.endDate!}T23:59:59.999Z`, limit: input.limit ?? 20,
+        };
+        const clauses = [
+          "source.provider = 'garmin'",
+          'activity.started_at_utc >= cast($startDate AS TIMESTAMPTZ)',
+          'activity.started_at_utc <= cast($endDate AS TIMESTAMPTZ)',
+        ];
+        if (input.sports?.length) {
+          const placeholders = input.sports.map((sport, index) => {
+            const key = `sport${index}`;
+            values[key] = sport;
+            return `lower($${key})`;
+          });
+          clauses.push(`lower(activity.sport) IN (${placeholders.join(', ')})`);
+        }
+        const rows = await repository.rows<{ activity_source_id: string }>(`
+          SELECT source.activity_source_id
+          FROM activity_sources AS source JOIN activities AS activity USING (activity_id)
+          WHERE ${clauses.join(' AND ')}
+          ORDER BY activity.started_at_utc DESC, source.activity_source_id ASC
+          LIMIT $limit
+        `, values);
+        return rows.map((row) => row.activity_source_id);
+      });
+    const outcomes: Array<Record<string, unknown>> = [];
+    let haltedBy: string | null = null;
+    for (const activityId of activityIds) {
+      if (haltedBy) {
+        outcomes.push({ activityId, status: 'skipped', reason: haltedBy });
+        continue;
+      }
+      try {
+        const result = await hydrateStravaActivity(paths, activityId, input.refresh ?? false);
+        const status = typeof result.status === 'string' ? result.status : 'completed';
+        outcomes.push({ activityId, status, result });
+      } catch (error) {
+        const failure = hydrationFailure(error);
+        outcomes.push({ activityId, status: 'failed', error: failure });
+        if (failure.code === 'rate_limited' || failure.code === 'data_sync_in_progress') haltedBy = failure.message;
+      }
+    }
+    const summary = outcomes.reduce<Record<string, number>>((counts, outcome) => {
+      const status = String(outcome.status);
+      counts[status] = (counts[status] ?? 0) + 1;
+      return counts;
+    }, {});
+    return {
+      data: { activityIds, outcomes, summary },
+      provenance: { provider: 'strava', operation: 'serial_activity_hydration', archivedBeforeNormalization: true },
+      query: { ...input, activityIds },
+      caveats: ['Each write is intentionally awaited before the next one, preventing data-directory lock contention.', 'not_found and ambiguous results include match diagnostics when Strava supplied them.'],
+    };
   }));
 
   server.registerTool('hydrate_strava_segment_history', {

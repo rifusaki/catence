@@ -14,7 +14,11 @@ function safeSql(sql: string): string {
 }
 
 function normalizeRelation(name: string): string {
-  return name.replaceAll('"', '').split('.').at(-1)!.toLowerCase();
+  // DuckDB's getTableNames() preserves aliases (for example, "activities AS
+  // a"), while the catalog intentionally contains only relation names.
+  // Discard that syntactic alias before doing the allow-list comparison.
+  const relation = name.trim().replace(/\s+(?:as\s+)?(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$/i, '');
+  return relation.replaceAll('"', '').split('.').at(-1)!.toLowerCase();
 }
 
 export async function queryReadOnlyData(repository: ReadOnlyRepository, request: { sql: string; values?: Record<string, string | number | boolean | null> }): Promise<Record<string, unknown>> {

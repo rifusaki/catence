@@ -1,6 +1,6 @@
 # Install Catence for local coding agents
 
-`catence` is a local stdio MCP server. Ordinary tools serve an existing DuckDB/Parquet snapshot read-only. The only write capabilities are explicit, synchronous Strava activity and segment-history hydration tools; they use the shared data-directory lock and the stored local Strava connection, never credentials supplied by the MCP client.
+`catence` is a local stdio MCP server. Ordinary tools serve an existing DuckDB/Parquet snapshot read-only. The only write capabilities are explicit, synchronous Strava activity, serial activity-batch, and segment-history hydration tools; they use the shared data-directory lock and the stored local Strava connection, never credentials supplied by the MCP client.
 
 ## 1. Prepare one local data directory
 
@@ -22,7 +22,7 @@ npx --yes --package=catence catence-data --data-dir /absolute/path/to/catence-da
 `sync --provider intervals` needs the Intervals environment variables. Garmin
 imports additionally require Python 3.12+ and `uv`; the npm package includes
 the worker source and keeps the `uv` environment in
-`<data-dir>/python-venv`. Ordinary server reads do not need those credentials or Python. The two Strava hydration tools require the local Strava connection and Python worker, but still receive no secrets through the MCP client.
+`<data-dir>/python-venv`. Ordinary server reads do not need those credentials or Python. The Strava hydration tools require the local Strava connection and Python worker, but still receive no secrets through the MCP client.
 
 For a repeatable local executable instead of an on-demand `npx` download:
 
@@ -198,7 +198,7 @@ and [preview/validation loop](https://microsoft.github.io/apm/producer/preview-a
 
 ## Open WebUI-style hosting: deliberately a later layer
 
-This MVP is local-only and stdio-only. That remains the right boundary for private fitness data: ordinary MCP calls open a read-only DuckDB snapshot, while two declared Strava hydration tools use the locked local writer path. It is not currently an HTTP service and should not be exposed
+This MVP is local-only and stdio-only. That remains the right boundary for private fitness data: ordinary MCP calls open a read-only DuckDB snapshot, while declared Strava hydration tools use the locked local writer path. It is not currently an HTTP service and should not be exposed
 with a reverse proxy or a public tunnel.
 
 When a web host is needed, add a separate Streamable HTTP adapter around the

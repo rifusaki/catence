@@ -110,6 +110,10 @@ function isNumeric(column: CatalogColumn): boolean {
   return column.metric === true;
 }
 
+function isTemporal(column: CatalogColumn): boolean {
+  return /(?:^|\s)(?:DATE|TIME|TIMESTAMP)/i.test(column.type);
+}
+
 function timestampExpression(dataset: DatasetDefinition): string {
   if (!dataset.dateColumn) throw new QueryValidationError(`${dataset.name} has no time axis.`);
   return quoteIdentifier(dataset.dateColumn);
@@ -218,7 +222,11 @@ export class AnalyticsService {
     }
     for (const [index, metric] of request.metrics.entries()) {
       const column = getColumn(dataset, metric.column);
-      if (metric.operation !== 'count' && !isNumeric(column)) throw new QueryValidationError(`${metric.column} is not numeric.`);
+      // A timestamp has no meaningful sum/mean/percentile, but its extrema are
+      // both safe and useful (for example, first/last observation dates).
+      if (metric.operation !== 'count' && !isNumeric(column) && !((metric.operation === 'min' || metric.operation === 'max') && isTemporal(column))) {
+        throw new QueryValidationError(`${metric.column} is not numeric; only min and max support temporal columns.`);
+      }
       const outputName = metric.as ?? `${metric.operation}_${metric.column}`;
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(outputName)) throw new QueryValidationError('Aggregation aliases must be simple identifiers.');
       if (metric.operation === 'percentile') {
