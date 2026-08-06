@@ -4,7 +4,7 @@ import type { CatenceDatabase } from '../../storage/database.js';
 import type { CatencePaths } from '../../../contracts/runtime.js';
 import { stableJsonHash, storeArtifact, storeJsonArtifact } from '../../storage/artifacts.js';
 import { importRecord, queueWorkItem, completeWorkItem, failWorkItem } from '../importer.js';
-import { intervalsActivityReadEndpoints, intervalsReadRegistry, assertReadOnlyRegistry } from './registry.js';
+import { intervalsActivityReadEndpoints, intervalsSecondaryReadRegistry, assertReadOnlyRegistry } from './registry.js';
 import { intervalsStreamsToSamples, writeParquetSamples } from '../../streams.js';
 import type { SourceEntity } from '../../../contracts/staging.js';
 
@@ -67,20 +67,20 @@ export class IntervalsExtractor {
     const resolvedAthleteId = typeof athletePayload.id === 'string' ? athletePayload.id : this.athleteId;
     await this.database.insertSourceAccount('intervals', resolvedAthleteId, typeof athletePayload.name === 'string' ? athletePayload.name : null, athletePayload);
 
-    for (const endpoint of intervalsReadRegistry) {
+    for (const endpoint of intervalsSecondaryReadRegistry) {
       if (endpoint.name === 'athlete') continue;
       const fromDate = endpoint.name === 'activities' ? activityFromDate : dailyFromDate;
       const payload = await this.capture(runId, endpoint.name, null, { fromDate, toDate }, async () => this.getCollection(endpoint.name, resolvedAthleteId, fromDate, toDate));
       if (payload === undefined) continue;
       await this.importEntities(endpoint.entityType, endpoint.name, payload, null, runId);
-      await this.captureCollectionChildren(runId, endpoint.name, payload, resolvedAthleteId);
       if (endpoint.name === 'activities') {
         for (const activity of asItems(payload)) {
           const activityId = idOf(activity, randomUUID());
           const summaryHash = stableJsonHash(activity);
-          const needsDetails = await this.database.activityNeedsDetailSync('intervals', activityId, summaryHash);
-          if (needsDetails) await this.captureActivity(runId, activityId, activity);
-          await this.database.recordActivitySyncState('intervals', activityId, summaryHash, runId, needsDetails);
+          // The activity-list payload already contains the Intervals-only
+          // training calculations. Garmin remains the source of record for
+          // detail, files, streams, and structured activity data.
+          await this.database.recordActivitySyncState('intervals', activityId, summaryHash, runId, false);
         }
       }
     }

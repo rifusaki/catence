@@ -111,6 +111,27 @@ export async function buildRetrievalIndex(database: WriteDataStore): Promise<{ d
     const weekDate = dateText(week.week);
     if (weekDate) documents.push({ entityType: 'weekly_training_summary', entityId: weekDate, occurredOn: weekDate, text: words(`Week beginning ${weekDate}`, `${week.activities} activities`, week.moving_s ? `${Math.round(Number(week.moving_s) / 60)} minutes training` : null, week.training_load ? `training load ${week.training_load}` : null), metadata: {} });
   }
+  const trainingMetrics = await database.rows<Record<string, unknown>>(`
+    SELECT observation_id, provider, metric_name, sport, device_id, cast(observed_at AS VARCHAR) AS observed_at,
+      value_number, value_text, unit, source_type
+    FROM training_metric_observations
+  `);
+  for (const metric of trainingMetrics) {
+    const value = metric.value_number !== null && metric.value_number !== undefined
+      ? `${metric.value_number}${metric.unit ? ` ${metric.unit}` : ''}`
+      : short(metric.value_text);
+    const text = words(
+      String(metric.metric_name).replaceAll('_', ' '),
+      value ? `value ${value}` : null,
+      metric.sport ? `sport ${metric.sport}` : null,
+      metric.device_id ? `device ${metric.device_id}` : null,
+      metric.source_type ? `source ${metric.source_type}` : null,
+    );
+    if (text) documents.push({
+      entityType: 'training_metric', entityId: String(metric.observation_id), provider: String(metric.provider),
+      occurredOn: dateText(metric.observed_at), text, metadata: { metricName: metric.metric_name, sport: metric.sport, deviceId: metric.device_id },
+    });
+  }
   const deduplicated = new Map(documents.map((document) => [documentId(document), document]));
   const watermarkRows = await database.rows<{ watermark: string | null }>('SELECT max(cast(fetched_at AS VARCHAR)) AS watermark FROM raw_objects');
   const watermark = watermarkRows[0]?.watermark ?? null;
@@ -201,6 +222,6 @@ export async function searchContext(repository: ReadOnlyRepository, request: { q
 function recommendedTool(entityType: string): string {
   if (entityType.startsWith('activity')) return 'read_series';
   if (entityType.startsWith('nutrition')) return 'aggregate_data';
-  if (entityType === 'weekly_training_summary') return 'aggregate_data';
+  if (entityType === 'weekly_training_summary' || entityType === 'training_metric') return 'aggregate_data';
   return 'query_read_only_data';
 }

@@ -9,18 +9,32 @@ import { migrations } from './migrations.js';
 import { json } from './sql.js';
 
 export class CatenceDatabase implements WriteDataStore {
-  private constructor(private readonly connection: DuckDBConnection) {}
+  private closed = false;
+
+  private constructor(
+    private readonly instance: DuckDBInstance,
+    private readonly connection: DuckDBConnection,
+  ) {}
 
   static async open(paths: CatencePaths): Promise<CatenceDatabase> {
     const instance = await DuckDBInstance.create(paths.database);
     const connection = await instance.connect();
-    const database = new CatenceDatabase(connection);
+    const database = new CatenceDatabase(instance, connection);
     await database.migrate();
     return database;
   }
 
   async close(): Promise<void> {
-    this.connection.closeSync();
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      // A connection must be disconnected before its owning instance. Keeping
+      // the instance alive for the full database lifetime also prevents the
+      // native binding from releasing it during an in-flight connection close.
+      this.connection.closeSync();
+    } finally {
+      this.instance.closeSync();
+    }
   }
 
   async migrate(): Promise<void> {
@@ -38,6 +52,13 @@ export class CatenceDatabase implements WriteDataStore {
         await this.connection.run('ROLLBACK');
         throw error;
       }
+    }
+    // Some DuckDB builds abort while committing an index rebuild in the same
+    // transaction as an ALTER on its populated table. These statements are
+    // idempotent and retried on every open, so a process interruption after a
+    // migration commit cannot leave the database permanently under-indexed.
+    for (const migration of migrations) {
+      if (migration.postCommitSql) await this.connection.run(migration.postCommitSql);
     }
   }
 
@@ -81,14 +102,14 @@ export class CatenceDatabase implements WriteDataStore {
   }
 
   async status(): Promise<Record<string, unknown>> {
-    const [runs, errors, rawObjects, activities, streams, cursors] = await Promise.all([
-      this.rows('SELECT status, count(*)::INTEGER AS count FROM sync_runs GROUP BY status'),
-      this.rows('SELECT count(*)::INTEGER AS count FROM normalization_errors WHERE resolved_at IS NULL'),
-      this.rows('SELECT count(*)::INTEGER AS count FROM raw_objects'),
-      this.rows('SELECT count(*)::INTEGER AS count FROM activities'),
-      this.rows('SELECT count(*)::INTEGER AS count FROM stream_manifest'),
-      this.rows<{ provider: string; cursor_name: string; covered_through_date: string; latest_source_date: string | null; lookback_days: number; last_successful_run_id: string | null; last_completed_at: string; status: string }>('SELECT provider, cursor_name, cast(covered_through_date AS VARCHAR) AS covered_through_date, cast(latest_source_date AS VARCHAR) AS latest_source_date, lookback_days, last_successful_run_id, cast(last_completed_at AS VARCHAR) AS last_completed_at, status FROM sync_cursors ORDER BY provider, cursor_name'),
-    ]);
+    // @duckdb/node-api owns native statement state on the connection. Keep
+    // status reads sequential instead of issuing several native calls at once.
+    const runs = await this.rows('SELECT status, count(*)::INTEGER AS count FROM sync_runs GROUP BY status');
+    const errors = await this.rows('SELECT count(*)::INTEGER AS count FROM normalization_errors WHERE resolved_at IS NULL');
+    const rawObjects = await this.rows('SELECT count(*)::INTEGER AS count FROM raw_objects');
+    const activities = await this.rows('SELECT count(*)::INTEGER AS count FROM activities');
+    const streams = await this.rows('SELECT count(*)::INTEGER AS count FROM stream_manifest');
+    const cursors = await this.rows<{ provider: string; cursor_name: string; covered_through_date: string; latest_source_date: string | null; lookback_days: number; last_successful_run_id: string | null; last_completed_at: string; status: string }>('SELECT provider, cursor_name, cast(covered_through_date AS VARCHAR) AS covered_through_date, cast(latest_source_date AS VARCHAR) AS latest_source_date, lookback_days, last_successful_run_id, cast(last_completed_at AS VARCHAR) AS last_completed_at, status FROM sync_cursors ORDER BY provider, cursor_name');
     return {
       runs, unresolvedErrors: errors[0]?.count ?? 0, rawObjects: rawObjects[0]?.count ?? 0, activities: activities[0]?.count ?? 0, streams: streams[0]?.count ?? 0,
       cursors: cursors.map((cursor) => ({ ...cursor, next_from_date: subtractDays(cursor.covered_through_date, Number(cursor.lookback_days)) })),
@@ -212,7 +233,12 @@ function subtractDays(date: string, days: number): string {
  * turn a question into a DuckDB write.
  */
 export class ReadOnlyCatenceDatabase {
-  private constructor(private readonly connection: DuckDBConnection) {}
+  private closed = false;
+
+  private constructor(
+    private readonly instance: DuckDBInstance,
+    private readonly connection: DuckDBConnection,
+  ) {}
 
   static async open(paths: CatencePaths): Promise<ReadOnlyCatenceDatabase> {
     if (!existsSync(paths.database)) {
@@ -221,7 +247,7 @@ export class ReadOnlyCatenceDatabase {
     try {
       const instance = await DuckDBInstance.create(paths.database, { access_mode: 'READ_ONLY' });
       const connection = await instance.connect();
-      const database = new ReadOnlyCatenceDatabase(connection);
+      const database = new ReadOnlyCatenceDatabase(instance, connection);
       const migration = await database.rows<{ version: number }>('SELECT max(version) AS version FROM schema_migrations');
       const currentVersion = Number(migration[0]?.version ?? 0);
       const requiredVersion = Math.max(...migrations.map((item) => item.version));
@@ -242,7 +268,13 @@ export class ReadOnlyCatenceDatabase {
   }
 
   async close(): Promise<void> {
-    this.connection.closeSync();
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      this.connection.closeSync();
+    } finally {
+      this.instance.closeSync();
+    }
   }
 
   async rows<T extends Record<string, unknown>>(sql: string, values?: QueryBindings): Promise<T[]> {

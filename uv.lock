@@ -47,7 +47,7 @@ dev = [
 requires-dist = [
     { name = "duckdb", specifier = ">=1.4.0" },
     { name = "fitdecode", specifier = ">=0.10.0" },
-    { name = "garminconnect", specifier = ">=0.2.37" },
+    { name = "garminconnect", editable = "../python-garminconnect" },
     { name = "polars", specifier = ">=1.0.0" },
     { name = "pyarrow", specifier = ">=18.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
@@ -318,17 +318,42 @@ wheels = [
 
 [[package]]
 name = "garminconnect"
-version = "0.3.7"
-source = { registry = "https://pypi.org/simple" }
+version = "0.3.8"
+source = { editable = "../python-garminconnect" }
 dependencies = [
     { name = "curl-cffi" },
     { name = "requests" },
     { name = "ua-generator" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/30/c5/bc236e1704e53980939ccff20c0802f288acff34e848e5bfc71e6a95a8b6/garminconnect-0.3.7.tar.gz", hash = "sha256:1c40ab3e0b07ab70510dad455d1924636bd02070f0664945e398400424e948c7", size = 90955, upload-time = "2026-07-26T06:29:18.655Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/8e/16/c531e66e176570d0088be0cb7db30d9886ac0cdd9187872d00a4243625c4/garminconnect-0.3.7-py3-none-any.whl", hash = "sha256:a44137b663e08d7979ca1d497f444c6ca7a09197f991199c62aab124777b5983", size = 85155, upload-time = "2026-07-26T06:29:17.255Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "bandit", extras = ["toml"], marker = "extra == 'security'" },
+    { name = "black", extras = ["jupyter"], marker = "extra == 'linting'" },
+    { name = "codespell", marker = "extra == 'linting'" },
+    { name = "coverage", marker = "extra == 'testing'" },
+    { name = "curl-cffi", specifier = ">=0.15.0" },
+    { name = "ipdb", marker = "extra == 'dev'" },
+    { name = "ipykernel", marker = "extra == 'dev'" },
+    { name = "ipython", marker = "extra == 'dev'" },
+    { name = "isort", marker = "extra == 'linting'" },
+    { name = "matplotlib", marker = "extra == 'dev'" },
+    { name = "mypy", marker = "extra == 'linting'" },
+    { name = "pandas", marker = "extra == 'dev'" },
+    { name = "pip-audit", marker = "extra == 'security'" },
+    { name = "pre-commit", marker = "extra == 'linting'" },
+    { name = "pydantic", marker = "extra == 'typed'", specifier = ">=2.4.0" },
+    { name = "pydantic", marker = "extra == 'workout'", specifier = ">=2.4.0" },
+    { name = "pytest", marker = "extra == 'testing'" },
+    { name = "pytest-vcr", marker = "extra == 'testing'", specifier = ">=1.0.2" },
+    { name = "readchar", marker = "extra == 'example'" },
+    { name = "requests", specifier = ">=2.33.0" },
+    { name = "ruff", marker = "extra == 'linting'" },
+    { name = "types-requests", marker = "extra == 'linting'" },
+    { name = "ua-generator", specifier = ">=1.0" },
+    { name = "vcrpy", marker = "extra == 'testing'", specifier = ">=7.0.0" },
 ]
+provides-extras = ["dev", "workout", "typed", "security", "linting", "testing", "example"]
 
 [[package]]
 name = "idna"

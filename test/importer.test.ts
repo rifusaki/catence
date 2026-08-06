@@ -3,6 +3,149 @@ import { importRecord } from '../src/elt/ingestion/importer.js';
 import { temporaryDatabase } from './helpers.js';
 
 describe('normalization importer', () => {
+  it('retains Garmin cycling FTP observations from activity summaries and the direct setting', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('garmin', '2026-02-01');
+    try {
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity', remoteId: 'g1', parentRemoteId: null,
+        occurredOn: '2026-02-01', sourceUpdatedAt: null, rawObjectHash: 'activity-raw', extension: {},
+        payload: { activityId: 'g1', startTimeGMT: '2026-02-01T10:00:00Z', activityType: 'indoor_cycling', distance: 40_000, duration: 7_200, maxFtp: 252 },
+      });
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'training_metric', remoteId: '2026-02-02T09:00:00.0', parentRemoteId: null,
+        occurredOn: '2026-02-02', sourceUpdatedAt: null, rawObjectHash: 'setting-raw', extension: {},
+        payload: { sport: 'CYCLING', calendarDate: '2026-02-02T09:00:00.0', functionalThresholdPower: 255 },
+      });
+      const observations = await database.rows<{ source_type: string; source_remote_id: string; value_number: number; activity_source_id: string | null }>(`
+        SELECT source_type, source_remote_id, value_number, activity_source_id
+        FROM training_metric_observations
+        WHERE metric_name = 'cycling_ftp_w'
+        ORDER BY source_type
+      `);
+      expect(observations).toEqual([
+        { source_type: 'activity_summary', source_remote_id: 'g1', value_number: 252, activity_source_id: 'garmin:g1' },
+        { source_type: 'cycling_ftp', source_remote_id: '2026-02-02T09:00:00.0', value_number: 255, activity_source_id: null },
+      ]);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('upserts Garmin cycling FTP history by its observed date', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('garmin', '2025-06-01');
+    try {
+      const record = {
+        kind: 'source_entity' as const, schemaVersion: 1 as const, provider: 'garmin' as const,
+        entityType: 'functional_threshold_power', remoteId: 'cycling:2025-06-01', parentRemoteId: null,
+        occurredOn: '2025-06-01', sourceUpdatedAt: null, rawObjectHash: 'history-raw', extension: {},
+      };
+      await importRecord(database, runId, {
+        ...record,
+        payload: { series: 'cycling', sport: 'CYCLING', until: '2025-06-01T23:59:59.999', value: 250, functionalThresholdPower: 250, calendarDate: '2025-06-01' },
+      });
+      await importRecord(database, runId, {
+        ...record, rawObjectHash: 'history-refresh',
+        payload: { series: 'cycling', sport: 'CYCLING', until: '2025-06-01T23:59:59.999', value: 255, functionalThresholdPower: 255, calendarDate: '2025-06-01' },
+      });
+      const observations = await database.rows<{ observation_id: string; source_type: string; source_remote_id: string; observed_on: string; value_number: number; raw_object_hash: string }>(`
+        SELECT observation_id, source_type, source_remote_id,
+          CAST(observed_at AT TIME ZONE 'UTC' AS DATE)::VARCHAR AS observed_on,
+          value_number, raw_object_hash
+        FROM training_metric_observations
+        WHERE source_type = 'cycling_ftp_history'
+      `);
+      expect(observations).toEqual([{
+        observation_id: 'garmin:cycling_ftp:history:cycling:2025-06-01', source_type: 'cycling_ftp_history',
+        source_remote_id: 'cycling:2025-06-01', observed_on: '2025-06-01', value_number: 255, raw_object_hash: 'history-refresh',
+      }]);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('keeps historical generic and cycling VO2 max observations queryable by date', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('garmin', '2025-06-01');
+    try {
+      const record = {
+        kind: 'source_entity' as const, schemaVersion: 1 as const, provider: 'garmin' as const, entityType: 'max_metric',
+        parentRemoteId: null, sourceUpdatedAt: null, rawObjectHash: 'max-raw', extension: {},
+      };
+      await importRecord(database, runId, {
+        ...record, remoteId: 'max_metrics:2025-06-01', occurredOn: '2025-06-01',
+        payload: { generic: { calendarDate: '2025-06-01', vo2MaxPreciseValue: 51.2 }, cycling: { calendarDate: '2025-06-01', vo2MaxValue: 54 } },
+      });
+      await importRecord(database, runId, {
+        ...record, remoteId: 'max_metrics:2025-06-02', occurredOn: '2025-06-02', rawObjectHash: 'max-raw-2',
+        payload: { generic: { calendarDate: '2025-06-02', vo2MaxPreciseValue: 51.7 } },
+      });
+      const rows = await database.rows<{ sport: string; observed_on: string; value_number: number }>(`
+        SELECT sport, CAST(observed_at AT TIME ZONE 'UTC' AS DATE)::VARCHAR AS observed_on, value_number
+        FROM training_metric_observations WHERE metric_name = 'vo2_max_ml_kg_min' ORDER BY observed_on, sport
+      `);
+      expect(rows).toEqual([
+        { sport: 'cycling', observed_on: '2025-06-01', value_number: 54 },
+        { sport: 'generic', observed_on: '2025-06-01', value_number: 51.2 },
+        { sport: 'generic', observed_on: '2025-06-02', value_number: 51.7 },
+      ]);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('normalizes epoch-millisecond Garmin training-status timestamps', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('garmin', '2025-06-01');
+    try {
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'training_status', remoteId: 'training-status:1',
+        parentRemoteId: null, occurredOn: '2025-06-01', sourceUpdatedAt: null, rawObjectHash: 'training-status-raw', extension: {},
+        payload: {
+          mostRecentTrainingStatus: { latestTrainingStatusData: { '3445722598': { timestamp: 1_748_736_000_000, fitnessTrendSport: 'CYCLING', trainingStatus: 'PRODUCTIVE' } } },
+        },
+      });
+      expect(await database.rows<{ observed_ms: bigint; value_text: string }>(`
+        SELECT epoch_ms(observed_at) AS observed_ms, value_text
+        FROM training_metric_observations
+        WHERE metric_name = 'training_status_training_status'
+      `)).toEqual([{ observed_ms: 1_748_736_000_000n, value_text: 'PRODUCTIVE' }]);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('normalizes detailed Garmin wellness facts without dropping their session payload', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('garmin', '2025-06-01');
+    try {
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'daily_health', remoteId: 'sleep:2025-06-01:0',
+        parentRemoteId: null, occurredOn: '2025-06-01', sourceUpdatedAt: null, rawObjectHash: 'sleep-raw', extension: {},
+        payload: {
+          calendarDate: '2025-06-01', heartRateValues: [[1_748_736_000_000, 48]],
+          hrvSummary: { lastNightAvg: 42, status: 'BALANCED' },
+          // Garmin sleep payloads use epoch milliseconds for these fields.
+          dailySleepDTO: { id: 44, sleepStartTimestampGMT: 1_748_736_000_000, sleepEndTimestampGMT: 1_748_761_200_000, deepSleepSeconds: 7200, napTimeSeconds: 1200 },
+        },
+      });
+      const [metrics, samples, sessions] = await Promise.all([
+        database.rows<{ metric_name: string; value_number: number | null; value_text: string | null }>("SELECT metric_name, value_number, value_text FROM daily_metrics WHERE metric_name IN ('hrv_ms', 'sleep_deep_seconds', 'nap_seconds', 'hrv_status') ORDER BY metric_name"),
+        database.rows<{ metric_name: string; value_number: number }>('SELECT metric_name, value_number FROM wellness_samples'),
+        database.rows<{ session_type: string; start_ms: bigint; end_ms: bigint; payload_json: unknown }>('SELECT session_type, epoch_ms(started_at) AS start_ms, epoch_ms(ended_at) AS end_ms, payload_json FROM health_sessions'),
+      ]);
+      expect(metrics).toContainEqual({ metric_name: 'hrv_ms', value_number: 42, value_text: null });
+      expect(metrics).toContainEqual({ metric_name: 'sleep_deep_seconds', value_number: 7200, value_text: null });
+      expect(metrics).toContainEqual({ metric_name: 'nap_seconds', value_number: 1200, value_text: null });
+      expect(metrics).toContainEqual({ metric_name: 'hrv_status', value_number: null, value_text: 'BALANCED' });
+      expect(samples).toEqual([{ metric_name: 'heart_rate_bpm', value_number: 48 }]);
+      expect(sessions[0]).toMatchObject({ session_type: 'sleep', start_ms: 1_748_736_000_000n, end_ms: 1_748_761_200_000n });
+    } finally {
+      await database.close();
+    }
+  });
+
   it('links only matching external IDs and keeps provider facts', async () => {
     const { database } = await temporaryDatabase();
     const runId = await database.beginRun('intervals', '2025-07-29');
@@ -34,11 +177,17 @@ describe('normalization importer', () => {
     try {
       const base = { kind: 'source_entity' as const, schemaVersion: 1 as const, provider: 'garmin' as const, remoteId: '2025-07-30', parentRemoteId: null, occurredOn: '2025-07-30', sourceUpdatedAt: null, rawObjectHash: null, extension: {} };
       await importRecord(database, runId, { ...base, entityType: 'daily_health', payload: { calendarDate: '2025-07-30', restingHeartRate: 48, sleepTimeSeconds: 27000, totalSteps: 12000 } });
+      await importRecord(database, runId, {
+        ...base, provider: 'intervals', entityType: 'wellness', remoteId: 'intervals-2025-07-30',
+        payload: { date: '2025-07-30', restingHR: 41, sleepSecs: 28800, steps: 14000 },
+      });
       await importRecord(database, runId, { ...base, entityType: 'nutrition_log', payload: { calendarDate: '2025-07-30', totalCalories: 2400, totalCarbs: 315, totalProtein: 130, totalFat: 72, foodItems: [{ id: 'food-1', foodName: 'Oats', quantity: 100, calories: 380, carbs: 65, protein: 13, fat: 7 }] } });
-      const health = await database.rows<{ resting_hr_bpm: number; sleep_seconds: number; steps: number }>('SELECT resting_hr_bpm, sleep_seconds, steps FROM daily_health');
+      const health = await database.rows<{ provider: string; resting_hr_bpm: number; sleep_seconds: number; steps: number }>('SELECT provider, resting_hr_bpm, sleep_seconds, steps FROM daily_health');
+      const healthSources = await database.rows<{ provider: string; resting_hr_bpm: number }>("SELECT provider, value_number AS resting_hr_bpm FROM daily_metrics WHERE metric_name = 'resting_hr_bpm' ORDER BY provider");
       const nutrition = await database.rows<{ energy_kcal: number; carbohydrates_g: number }>('SELECT energy_kcal, carbohydrates_g FROM nutrition_days');
       const items = await database.rows<{ food_name: string; energy_kcal: number; payload_json: unknown }>('SELECT food_name, energy_kcal, payload_json FROM nutrition_items');
-      expect(health[0]).toMatchObject({ resting_hr_bpm: 48, sleep_seconds: 27000, steps: 12000 });
+      expect(health).toEqual([{ provider: 'garmin', resting_hr_bpm: 48, sleep_seconds: 27000, steps: 12000 }]);
+      expect(healthSources).toEqual([{ provider: 'garmin', resting_hr_bpm: 48 }, { provider: 'intervals', resting_hr_bpm: 41 }]);
       expect(nutrition[0]).toMatchObject({ energy_kcal: 2400, carbohydrates_g: 315 });
       expect(items[0]).toMatchObject({ food_name: 'Oats', energy_kcal: 380 });
       expect(JSON.parse(String(items[0]?.payload_json))).toMatchObject({ foodName: 'Oats' });

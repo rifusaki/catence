@@ -1,4 +1,14 @@
-export type Migration = { version: number; name: string; sql: string };
+export type Migration = {
+  version: number;
+  name: string;
+  sql: string;
+  /**
+   * Idempotent statements that must run after the migration transaction
+   * commits. This is reserved for engine operations that cannot safely be
+   * combined with a populated-table rewrite on all supported DuckDB builds.
+   */
+  postCommitSql?: string;
+};
 
 export const migrations: Migration[] = [
   {

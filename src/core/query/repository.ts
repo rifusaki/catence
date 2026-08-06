@@ -55,6 +55,21 @@ export class ReadOnlyRepository {
           try_cast(sample.speed_mps AS DOUBLE) AS speed_mps,
           try_cast(sample.temperature_c AS DOUBLE) AS temperature_c,
           try_cast(sample.grade_pct AS DOUBLE) AS grade_pct,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.leftRightBalance'), json_extract_string(sample.extras_json, '$.left_right_balance')) AS DOUBLE) AS left_right_balance_pct,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.leftTorqueEffectiveness'), json_extract_string(sample.extras_json, '$.left_torque_effectiveness')) AS DOUBLE) AS left_torque_effectiveness_pct,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.rightTorqueEffectiveness'), json_extract_string(sample.extras_json, '$.right_torque_effectiveness')) AS DOUBLE) AS right_torque_effectiveness_pct,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.leftPedalSmoothness'), json_extract_string(sample.extras_json, '$.left_pedal_smoothness')) AS DOUBLE) AS left_pedal_smoothness_pct,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.rightPedalSmoothness'), json_extract_string(sample.extras_json, '$.right_pedal_smoothness')) AS DOUBLE) AS right_pedal_smoothness_pct,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.leftPowerPhase[0]'), json_extract_string(sample.extras_json, '$.left_power_phase[0]')) AS DOUBLE) AS left_power_phase_start_deg,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.leftPowerPhase[1]'), json_extract_string(sample.extras_json, '$.left_power_phase[1]')) AS DOUBLE) AS left_power_phase_end_deg,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.rightPowerPhase[0]'), json_extract_string(sample.extras_json, '$.right_power_phase[0]')) AS DOUBLE) AS right_power_phase_start_deg,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.rightPowerPhase[1]'), json_extract_string(sample.extras_json, '$.right_power_phase[1]')) AS DOUBLE) AS right_power_phase_end_deg,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.leftPowerPhasePeak[0]'), json_extract_string(sample.extras_json, '$.left_power_phase_peak[0]')) AS DOUBLE) AS left_power_phase_peak_start_deg,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.leftPowerPhasePeak[1]'), json_extract_string(sample.extras_json, '$.left_power_phase_peak[1]')) AS DOUBLE) AS left_power_phase_peak_end_deg,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.rightPowerPhasePeak[0]'), json_extract_string(sample.extras_json, '$.right_power_phase_peak[0]')) AS DOUBLE) AS right_power_phase_peak_start_deg,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.rightPowerPhasePeak[1]'), json_extract_string(sample.extras_json, '$.right_power_phase_peak[1]')) AS DOUBLE) AS right_power_phase_peak_end_deg,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.leftPlatformCenterOffset'), json_extract_string(sample.extras_json, '$.left_pco')) AS DOUBLE) AS left_platform_center_offset_mm,
+          try_cast(coalesce(json_extract_string(sample.extras_json, '$.rightPlatformCenterOffset'), json_extract_string(sample.extras_json, '$.right_pco')) AS DOUBLE) AS right_platform_center_offset_mm,
           try_cast(sample.extras_json AS JSON) AS extras_json
         FROM read_parquet(${sqlString(lakeGlob)}, union_by_name = true) AS sample
         JOIN (
@@ -80,6 +95,21 @@ export class ReadOnlyRepository {
       CAST(NULL AS DOUBLE) AS speed_mps,
       CAST(NULL AS DOUBLE) AS temperature_c,
       CAST(NULL AS DOUBLE) AS grade_pct,
+      CAST(NULL AS DOUBLE) AS left_right_balance_pct,
+      CAST(NULL AS DOUBLE) AS left_torque_effectiveness_pct,
+      CAST(NULL AS DOUBLE) AS right_torque_effectiveness_pct,
+      CAST(NULL AS DOUBLE) AS left_pedal_smoothness_pct,
+      CAST(NULL AS DOUBLE) AS right_pedal_smoothness_pct,
+      CAST(NULL AS DOUBLE) AS left_power_phase_start_deg,
+      CAST(NULL AS DOUBLE) AS left_power_phase_end_deg,
+      CAST(NULL AS DOUBLE) AS right_power_phase_start_deg,
+      CAST(NULL AS DOUBLE) AS right_power_phase_end_deg,
+      CAST(NULL AS DOUBLE) AS left_power_phase_peak_start_deg,
+      CAST(NULL AS DOUBLE) AS left_power_phase_peak_end_deg,
+      CAST(NULL AS DOUBLE) AS right_power_phase_peak_start_deg,
+      CAST(NULL AS DOUBLE) AS right_power_phase_peak_end_deg,
+      CAST(NULL AS DOUBLE) AS left_platform_center_offset_mm,
+      CAST(NULL AS DOUBLE) AS right_platform_center_offset_mm,
       CAST(NULL AS JSON) AS extras_json
       WHERE FALSE`;
   }
@@ -123,9 +153,9 @@ export class ReadOnlyRepository {
     const activity = await this.rows<Record<string, unknown>>(`SELECT * FROM activities WHERE activity_id = $activityId`, { activityId });
     if (!activity[0]) return null;
     const [sources, summaries, intervals] = await Promise.all([
-      this.rows(`SELECT * FROM activity_sources WHERE activity_id = $activityId ORDER BY provider`, { activityId }),
-      this.rows(`SELECT * FROM activity_summary_facts WHERE activity_id = $activityId ORDER BY provider`, { activityId }),
-      this.rows(`SELECT * FROM activity_interval_facts WHERE activity_id = $activityId ORDER BY provider, start_s`, { activityId }),
+      this.rows(`SELECT * FROM activity_sources WHERE activity_id = $activityId ORDER BY CASE provider WHEN 'garmin' THEN 0 WHEN 'intervals' THEN 1 ELSE 2 END, provider`, { activityId }),
+      this.rows(`SELECT * FROM activity_summary_facts WHERE activity_id = $activityId ORDER BY CASE provider WHEN 'garmin' THEN 0 WHEN 'intervals' THEN 1 ELSE 2 END, provider`, { activityId }),
+      this.rows(`SELECT * FROM activity_interval_facts WHERE activity_id = $activityId ORDER BY CASE provider WHEN 'garmin' THEN 0 WHEN 'intervals' THEN 1 ELSE 2 END, provider, start_s`, { activityId }),
     ]);
     return { activity: activity[0], sources, summaries, intervals };
   }

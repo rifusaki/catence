@@ -22,6 +22,13 @@ export const intervalsReadRegistry = registry('intervals', [
   ['chats', 'collection', 'chat'], ['activity_tags', 'collection', 'activity_tag'], ['event_tags', 'collection', 'event_tag'], ['workout_tags', 'collection', 'workout_tag'],
 ] as const);
 
+/**
+ * Intervals is an analysis companion to Garmin: its activity-list payload
+ * supplies the separately named training calculations without duplicating
+ * Garmin's activity detail, files, streams, or account data.
+ */
+export const intervalsSecondaryReadRegistry = intervalsReadRegistry.filter((endpoint) => endpoint.name === 'athlete' || endpoint.name === 'activities');
+
 export const intervalsActivityReadEndpoints = [
   'activity', 'streams', 'intervals', 'map', 'weather', 'weather_summary', 'best_efforts', 'power_curve', 'pace_curve', 'hr_curve',
   'power_vs_hr', 'hr_load_model', 'segments', 'messages', 'original_file', 'fit_file', 'gpx_file',

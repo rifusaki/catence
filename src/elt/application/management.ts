@@ -28,13 +28,14 @@ type SyncResult = {
   toDate: string;
   dailyCursorSource: CursorSource;
   activityCursorSource: CursorSource;
+  refreshedActivities: boolean;
 };
 
 function packageRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 }
 
-async function syncProvider(database: CatenceDatabase, paths: CatencePaths, provider: SyncProviderChoice, options: { explicitFrom?: string; toDate: string; advanceCursor: boolean }): Promise<SyncResult> {
+async function syncProvider(database: CatenceDatabase, paths: CatencePaths, provider: SyncProviderChoice, options: { explicitFrom?: string; toDate: string; advanceCursor: boolean; refreshActivities: boolean }): Promise<SyncResult> {
   const explicitWindow = options.explicitFrom ? { fromDate: options.explicitFrom, toDate: options.toDate, source: 'explicit' as const } : null;
   const dailyWindow = explicitWindow ?? await database.resolveIncrementalWindow(provider, 'daily', options.toDate, defaultFromDate(), 3);
   const activityWindow = explicitWindow ?? await database.resolveIncrementalWindow(provider, 'activities', options.toDate, defaultFromDate(), 14);
@@ -50,7 +51,10 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       const output = path.join(paths.staging, 'garmin', `${runId}.jsonl`);
       const knownActivities = path.join(paths.staging, 'garmin', `${runId}.known-activities.json`);
       await mkdir(path.dirname(knownActivities), { recursive: true });
-      await writeFile(knownActivities, JSON.stringify(await database.knownActivitySummaryHashes('garmin')));
+      // An explicit refresh intentionally provides no known hashes, causing
+      // the staging worker to re-fetch Garmin activity details, files, and
+      // streams even when the list-summary hash is unchanged.
+      await writeFile(knownActivities, JSON.stringify(options.refreshActivities ? {} : await database.knownActivitySummaryHashes('garmin')));
       extractionStarted = true;
       await execFileAsync('uv', ['run', 'python', '-m', 'python.catence.providers.garmin.cli', '--from', fromDate, '--daily-from', dailyWindow.fromDate, '--activity-from', activityWindow.fromDate, '--to', options.toDate, '--data-dir', paths.root, '--output', output, '--run-id', runId, '--known-activities', knownActivities], {
         cwd: packageRoot(),
@@ -68,7 +72,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
     await database.advanceIncrementalCursor(provider, 'daily', runId, options.toDate, 3);
     await database.advanceIncrementalCursor(provider, 'activities', runId, options.toDate, 14);
   }
-  return { runId, provider, fromDate, dailyFromDate: dailyWindow.fromDate, activityFromDate: activityWindow.fromDate, toDate: options.toDate, dailyCursorSource: dailyWindow.source, activityCursorSource: activityWindow.source };
+  return { runId, provider, fromDate, dailyFromDate: dailyWindow.fromDate, activityFromDate: activityWindow.fromDate, toDate: options.toDate, dailyCursorSource: dailyWindow.source, activityCursorSource: activityWindow.source, refreshedActivities: provider === 'garmin' && options.refreshActivities };
 }
 
 export async function initializeDataStore(paths: CatencePaths): Promise<Record<string, unknown>> {
@@ -78,7 +82,7 @@ export async function initializeDataStore(paths: CatencePaths): Promise<Record<s
   return { dataDir: paths.root, database: paths.database, message: 'Catence data store is ready. Run sync to import provider data.' };
 }
 
-export async function syncData(paths: CatencePaths, provider: ProviderChoice, explicitFrom?: string, advanceCursor = true): Promise<Record<string, unknown>> {
+export async function syncData(paths: CatencePaths, provider: ProviderChoice, explicitFrom?: string, advanceCursor = true, refreshActivities = false): Promise<Record<string, unknown>> {
   await ensurePaths(paths);
   if (provider === 'strava') return { provider, result: await syncStravaGear(paths) };
   const database = await CatenceDatabase.open(paths);
@@ -86,7 +90,7 @@ export async function syncData(paths: CatencePaths, provider: ProviderChoice, ex
     const providers: SyncProviderChoice[] = provider === 'all' ? ['intervals', 'garmin'] : [provider];
     const toDate = new Date().toISOString().slice(0, 10);
     const runs: SyncResult[] = [];
-    for (const source of providers) runs.push(await syncProvider(database, paths, source, { explicitFrom, toDate, advanceCursor }));
+    for (const source of providers) runs.push(await syncProvider(database, paths, source, { explicitFrom, toDate, advanceCursor, refreshActivities }));
     return { runIds: runs.map((run) => run.runId), runs };
   } finally {
     await database.close();
@@ -100,7 +104,7 @@ export async function retryDataSync(paths: CatencePaths, previousRunId: string):
     const previous = await database.getRun(previousRunId);
     if (!previous) throw new Error(`No sync run found for ${previousRunId}.`);
     if (previous.provider === 'strava') throw new Error('Retry Strava gear sync with `catence-data sync --provider strava`.');
-    const run = await syncProvider(database, paths, previous.provider, { explicitFrom: previous.from_date, toDate: new Date().toISOString().slice(0, 10), advanceCursor: false });
+    const run = await syncProvider(database, paths, previous.provider, { explicitFrom: previous.from_date, toDate: new Date().toISOString().slice(0, 10), advanceCursor: false, refreshActivities: false });
     return { retriedRun: previousRunId, runId: run.runId, run };
   } finally {
     await database.close();

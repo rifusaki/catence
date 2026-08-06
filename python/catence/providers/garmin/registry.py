@@ -8,6 +8,7 @@ GARMIN_READ_METHODS = {
         "get_sleep_data", "get_stress_data", "get_all_day_stress", "get_body_battery_events",
         "get_respiration_data", "get_spo2_data", "get_hrv_data", "get_training_readiness",
         "get_morning_training_readiness", "get_training_status", "get_fitnessage_data",
+        "get_floors", "get_intensity_minutes_data", "get_all_day_events", "get_endurance_score",
         "get_max_metrics", "get_hydration_data", "get_menstrual_data_for_date",
         "get_nutrition_daily_food_log", "get_nutrition_daily_meals", "get_nutrition_daily_settings",
     ),
@@ -19,6 +20,10 @@ GARMIN_READ_METHODS = {
         "get_lactate_threshold", "get_heart_rate_zones", "get_power_zones", "get_cycling_ftp",
         "get_personal_record", "get_earned_badges", "get_available_badges", "get_in_progress_badges",
         "get_training_plans", "get_pregnancy_summary", "get_golf_user_stats", "get_golf_club_stats",
+    ),
+    "training_range": (
+        "get_functional_threshold_power_range", "get_max_metrics_range", "get_hrv_data_range",
+        "get_hill_score", "get_running_tolerance", "get_race_predictions",
     ),
     "activities": (
         "get_activities_by_date", "get_activity", "get_activity_details", "get_activity_splits",

@@ -5,6 +5,7 @@ type ActivityRow = {
   activity_source_id: string;
   activity_id: string;
   provider: string;
+  remote_activity_id: string;
   external_id: string | null;
   started_at_utc: string | Date | null;
   sport: string | null;
@@ -49,7 +50,7 @@ function qualifies(source: ActivityRow, candidate: ActivityRow): { score: number
 /** Attach a source to a logical activity only when its link is provable or uniquely high-confidence. */
 export async function reconcileActivityLink(database: CatenceDatabase, activitySourceId: string): Promise<void> {
   const sources = await database.rows<ActivityRow>(`
-    SELECT source.activity_source_id, source.activity_id, source.provider, source.external_id,
+    SELECT source.activity_source_id, source.activity_id, source.provider, source.remote_activity_id, source.external_id,
       activity.started_at_utc, activity.sport, summary.distance_m, summary.moving_s
     FROM activity_sources source
     JOIN activities activity USING (activity_id)
@@ -58,8 +59,65 @@ export async function reconcileActivityLink(database: CatenceDatabase, activityS
   `, { activitySourceId });
   const source = sources[0];
   if (!source) return;
-  const current = await database.rows<{ method: string }>('SELECT method FROM activity_links WHERE activity_source_id = $activitySourceId', { activitySourceId });
-  if (current[0]?.method === 'manual' || current[0]?.method === 'fuzzy_high_confidence') return;
+  const current = await database.rows<{ method: string; activity_id: string }>('SELECT method, activity_id FROM activity_links WHERE activity_source_id = $activitySourceId', { activitySourceId });
+  if (current[0]?.method === 'manual' || current[0]?.method === 'fuzzy_high_confidence') {
+    if (source.activity_id !== current[0].activity_id) {
+      await database.run('UPDATE activity_sources SET activity_id = $activityId WHERE activity_source_id = $activitySourceId', { activityId: current[0].activity_id, activitySourceId });
+    }
+    return;
+  }
+
+  const externalCandidates = source.provider === 'intervals' && source.external_id
+    ? await database.rows<ActivityRow>(`
+      SELECT source.activity_source_id, source.activity_id, source.provider, source.remote_activity_id, source.external_id,
+        activity.started_at_utc, activity.sport, summary.distance_m, summary.moving_s
+      FROM activity_sources source
+      JOIN activities activity USING (activity_id)
+      LEFT JOIN activity_summaries summary USING (activity_source_id)
+      WHERE source.provider = 'garmin' AND source.remote_activity_id = $externalId
+    `, { externalId: source.external_id })
+    : source.provider === 'garmin'
+      ? await database.rows<ActivityRow>(`
+        SELECT source.activity_source_id, source.activity_id, source.provider, source.remote_activity_id, source.external_id,
+          activity.started_at_utc, activity.sport, summary.distance_m, summary.moving_s
+        FROM activity_sources source
+        JOIN activities activity USING (activity_id)
+        LEFT JOIN activity_summaries summary USING (activity_source_id)
+        WHERE source.provider = 'intervals' AND source.external_id = $remoteActivityId
+      `, { remoteActivityId: source.remote_activity_id })
+      : [];
+  const externalCandidate = externalCandidates.length === 1 ? externalCandidates[0] : null;
+  if (externalCandidate) {
+    const linkMethods = await database.rows<{ activity_source_id: string; method: string }>(
+      `SELECT activity_source_id, method FROM activity_links WHERE activity_source_id = $sourceId OR activity_source_id = $candidateId`,
+      { sourceId: source.activity_source_id, candidateId: externalCandidate.activity_source_id },
+    );
+    if (!linkMethods.some((link) => link.method === 'manual')) {
+      const garmin = source.provider === 'garmin' ? source : externalCandidate;
+      const intervals = source.provider === 'intervals' ? source : externalCandidate;
+      const targetActivityId = garmin.activity_id;
+      const previousActivityIds = new Set([source.activity_id, externalCandidate.activity_id]);
+      for (const linkedSource of [source, externalCandidate]) {
+        await database.run('UPDATE activity_sources SET activity_id = $activityId WHERE activity_source_id = $activitySourceId', {
+          activityId: targetActivityId, activitySourceId: linkedSource.activity_source_id,
+        });
+        await database.run(
+          `INSERT INTO activity_links VALUES ($activitySourceId, $activityId, 'strong_external_id', 1.0, $evidence, now())
+           ON CONFLICT (activity_source_id) DO UPDATE SET activity_id = excluded.activity_id, method = excluded.method,
+             confidence = excluded.confidence, evidence_json = excluded.evidence_json, linked_at = now()`,
+          {
+            activitySourceId: linkedSource.activity_source_id, activityId: targetActivityId,
+            evidence: json({ matchedActivitySourceId: linkedSource.provider === 'garmin' ? intervals.activity_source_id : garmin.activity_source_id, externalId: intervals.external_id }),
+          },
+        );
+      }
+      await database.run(`UPDATE activities SET link_state = 'strong_external_id' WHERE activity_id = $activityId`, { activityId: targetActivityId });
+      for (const previousActivityId of previousActivityIds) {
+        await database.run('DELETE FROM activities WHERE activity_id = $activityId AND NOT EXISTS (SELECT 1 FROM activity_sources WHERE activity_id = $activityId)', { activityId: previousActivityId });
+      }
+      return;
+    }
+  }
 
   if (source.external_id) {
     await database.run(
@@ -71,7 +129,7 @@ export async function reconcileActivityLink(database: CatenceDatabase, activityS
   }
 
   const candidates = await database.rows<ActivityRow>(`
-    SELECT source.activity_source_id, source.activity_id, source.provider, source.external_id,
+    SELECT source.activity_source_id, source.activity_id, source.provider, source.remote_activity_id, source.external_id,
       activity.started_at_utc, activity.sport, summary.distance_m, summary.moving_s
     FROM activity_sources source
     JOIN activities activity USING (activity_id)

@@ -8,7 +8,7 @@ from typing import Any, Callable, Mapping
 
 from .registry import GARMIN_READ_METHODS, assert_read_only_registry
 from .staging import StagingWriter
-from .streams import SAMPLE_COLUMNS, activity_details_to_samples, fit_archive_to_samples, write_parquet
+from .streams import SAMPLE_COLUMNS, activity_details_to_samples, activity_power_bests, fit_archive_to_samples, write_parquet
 
 
 def as_dict(value: Any) -> dict[str, Any]:
@@ -19,11 +19,36 @@ def as_items(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, list):
         return [as_dict(item) for item in value]
     if isinstance(value, dict):
-        for key in ("activityList", "items", "data", "meals", "foodLogEntries"):
+        for key in ("activityList", "items", "data", "meals", "foodLogEntries", "hrvSummaries", "individualStats", "results", "values", "events", "racePredictions", "predictions", "dailyPredictions"):
             if isinstance(value.get(key), list):
                 return [as_dict(item) for item in value[key]]
         return [value]
     return []
+
+
+def functional_threshold_power_items(value: Any) -> list[dict[str, Any]]:
+    """Extract records from the undocumented threshold-power range response."""
+    if isinstance(value, list):
+        return [as_dict(item) for item in value]
+    if isinstance(value, dict):
+        for key in ("items", "data", "results", "stats", "series", "values"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                return [as_dict(item) for item in nested]
+        return [value]
+    return []
+
+
+def ftp_history_date(payload: Mapping[str, Any]) -> str | None:
+    for key in ("until", "calendarDate", "date", "updatedDate", "from"):
+        value = payload.get(key)
+        if not isinstance(value, str) or len(value) < 10:
+            continue
+        try:
+            return date.fromisoformat(value[:10]).isoformat()
+        except ValueError:
+            continue
+    return None
 
 
 def remote_id(payload: dict[str, Any], fallback: str) -> str:
@@ -31,6 +56,25 @@ def remote_id(payload: dict[str, Any], fallback: str) -> str:
         if payload.get(key) is not None:
             return str(payload[key])
     return fallback
+
+
+def payload_date(payload: Mapping[str, Any]) -> str | None:
+    """Return the first ISO calendar day exposed by a Garmin payload."""
+    for key in ("calendarDate", "date", "until", "from", "timestamp", "timestampLocal", "startTimestampGMT"):
+        value = payload.get(key)
+        if not isinstance(value, str) or len(value) < 10:
+            continue
+        try:
+            return date.fromisoformat(value[:10]).isoformat()
+        except ValueError:
+            continue
+    for key in ("generic", "cycling", "heatAltitudeAcclimation", "hrvSummary"):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            nested_date = payload_date(nested)
+            if nested_date:
+                return nested_date
+    return None
 
 
 class GarminStagingWorker:
@@ -48,6 +92,10 @@ class GarminStagingWorker:
         self._singletons()
         self._daily(daily_from_date, end)
         self._range(daily_from_date, end)
+        self._cycling_ftp_history(daily_from_date, end)
+        self._max_metrics_history(daily_from_date, end)
+        self._hrv_history(daily_from_date, end)
+        self._score_history(daily_from_date, end)
         self._activities(activity_from_date, end)
         self._collections()
 
@@ -60,10 +108,25 @@ class GarminStagingWorker:
             self.writer.error(endpoint, str(error), remote_id_value)
             return None, None
 
-    def _entity(self, endpoint: str, entity_type: str, payload: Any, raw_hash: str | None, occurred_on: str | None = None, parent_remote_id: str | None = None) -> None:
+    def _entity(
+        self,
+        endpoint: str,
+        entity_type: str,
+        payload: Any,
+        raw_hash: str | None,
+        occurred_on: str | None = None,
+        parent_remote_id: str | None = None,
+        fallback_scope: str | None = None,
+    ) -> None:
+        """Stage source entities without allowing date-scoped calls to collide."""
         for index, item in enumerate(as_items(payload)):
-            item_id = remote_id(item, f"{endpoint}:{index}")
-            self.writer.source_entity(entity_type, item_id, item, raw_hash, parent_remote_id, occurred_on or str(item.get("calendarDate") or item.get("date") or "") or None)
+            item_day = occurred_on or payload_date(item)
+            if occurred_on:
+                discriminator = str(item.get("id") or item.get("uuid") or item.get("timestamp") or item.get("inputContext") or index)
+                item_id = f"{endpoint}:{occurred_on}:{discriminator}"
+            else:
+                item_id = remote_id(item, f"{endpoint}:{fallback_scope or item_day or 'undated'}:{index}")
+            self.writer.source_entity(entity_type, item_id, item, raw_hash, parent_remote_id, item_day)
 
     def _singletons(self) -> None:
         calls = {
@@ -93,13 +156,15 @@ class GarminStagingWorker:
     def _daily(self, from_date: date, to_date: date) -> None:
         calls = {
             "stats": ("get_stats", "daily_health"), "user_summary": ("get_user_summary", "daily_health"),
+            "floors": ("get_floors", "daily_health"), "intensity_minutes": ("get_intensity_minutes_data", "daily_health"),
             "steps": ("get_steps_data", "daily_health"), "heart_rates": ("get_heart_rates", "daily_health"),
             "sleep": ("get_sleep_data", "daily_health"), "stress": ("get_stress_data", "daily_health"),
             "all_day_stress": ("get_all_day_stress", "daily_health"), "body_battery_events": ("get_body_battery_events", "daily_health"),
             "respiration": ("get_respiration_data", "daily_health"), "spo2": ("get_spo2_data", "daily_health"),
-            "hrv": ("get_hrv_data", "daily_health"), "training_readiness": ("get_training_readiness", "daily_health"),
+            "all_day_events": ("get_all_day_events", "health_event"),
+            "training_readiness": ("get_training_readiness", "daily_health"),
             "morning_training_readiness": ("get_morning_training_readiness", "daily_health"), "training_status": ("get_training_status", "training_status"),
-            "fitness_age": ("get_fitnessage_data", "fitness_age"), "max_metrics": ("get_max_metrics", "max_metric"),
+            "fitness_age": ("get_fitnessage_data", "fitness_age"), "endurance_score": ("get_endurance_score", "endurance_score"),
             "hydration": ("get_hydration_data", "nutrition_log"), "menstrual": ("get_menstrual_data_for_date", "menstrual"),
             "nutrition_food_log": ("get_nutrition_daily_food_log", "nutrition_log"), "nutrition_meals": ("get_nutrition_daily_meals", "nutrition_log"),
             "nutrition_settings": ("get_nutrition_daily_settings", "nutrition_setting"),
@@ -114,16 +179,159 @@ class GarminStagingWorker:
             current += timedelta(days=1)
 
     def _range(self, from_date: date, to_date: date) -> None:
-        start, end = from_date.isoformat(), to_date.isoformat()
         calls = {
             "daily_steps": ("get_daily_steps", "daily_health"), "body_battery": ("get_body_battery", "daily_health"),
             "blood_pressure": ("get_blood_pressure", "blood_pressure"), "weigh_ins": ("get_weigh_ins", "body_composition"),
             "progress_summary": ("get_progress_summary_between_dates", "progress_summary"), "menstrual_calendar": ("get_menstrual_calendar_data", "menstrual"),
         }
         for endpoint, (method, entity_type) in calls.items():
-            payload, raw_hash = self._capture(endpoint, lambda method=method: getattr(self.api, method)(start, end), None, {"from": start, "to": end})
+            # Garmin rejects broad body-battery and menstrual-calendar ranges.
+            # Keep every request inside the provider's 92-day limit.
+            window_start = from_date
+            # Garmin rejects the Body Battery endpoint's larger historical
+            # ranges. Keep it deliberately small; the captures are
+            # content-addressed so overlapping retry windows are harmless.
+            window_days = 7 if endpoint == "body_battery" else (90 if endpoint == "menstrual_calendar" else (to_date - from_date).days + 1)
+            while window_start <= to_date:
+                window_end = min(to_date, window_start + timedelta(days=window_days - 1))
+                start, end = window_start.isoformat(), window_end.isoformat()
+                payload, raw_hash = self._capture(endpoint, lambda method=method, start=start, end=end: getattr(self.api, method)(start, end), None, {"from": start, "to": end})
+                if payload is not None:
+                    self._entity(endpoint, entity_type, payload, raw_hash, fallback_scope=start)
+                window_start = window_end + timedelta(days=1)
+
+    def _cycling_ftp_history(self, from_date: date, to_date: date) -> None:
+        """Stage daily cycling FTP setting history from Garmin's range endpoint."""
+        endpoint = "functional_threshold_power_range"
+        window_start = from_date
+        while window_start <= to_date:
+            # This private Connect endpoint is not documented with a maximum
+            # range. Keep requests aligned with other conservative range calls.
+            window_end = min(to_date, window_start + timedelta(days=89))
+            start, end = window_start.isoformat(), window_end.isoformat()
+            payload, raw_hash = self._capture(
+                endpoint,
+                lambda start=start, end=end: self.api.get_functional_threshold_power_range(
+                    start, end, sport="CYCLING"
+                ),
+                None,
+                {"from": start, "to": end, "sport": "CYCLING", "aggregation": "daily"},
+            )
             if payload is not None:
-                self._entity(endpoint, entity_type, payload, raw_hash)
+                for item in functional_threshold_power_items(payload):
+                    series = str(item.get("series") or item.get("sport") or "").upper()
+                    value = item.get("value", item.get("functionalThresholdPower"))
+                    occurred_on = ftp_history_date(item)
+                    if series != "CYCLING" or isinstance(value, bool) or not isinstance(value, (int, float)) or occurred_on is None:
+                        continue
+                    normalized = {
+                        **item,
+                        "sport": "CYCLING",
+                        "calendarDate": occurred_on,
+                        "functionalThresholdPower": value,
+                    }
+                    self.writer.source_entity(
+                        "functional_threshold_power",
+                        f"cycling:{occurred_on}",
+                        normalized,
+                        raw_hash,
+                        occurred_on=occurred_on,
+                    )
+            window_start = window_end + timedelta(days=1)
+
+    def _max_metrics_history(self, from_date: date, to_date: date) -> None:
+        """Stage range max-metric responses by their actual calendar date."""
+        window_start = from_date
+        while window_start <= to_date:
+            window_end = min(to_date, window_start + timedelta(days=89))
+            start, end = window_start.isoformat(), window_end.isoformat()
+            payload, raw_hash = self._capture(
+                "max_metrics_range",
+                lambda start=start, end=end: self.api.get_max_metrics_range(start, end),
+                None,
+                {"from": start, "to": end},
+            )
+            observed: set[str] = set()
+            if payload is not None:
+                for item in as_items(payload):
+                    item_day = payload_date(item)
+                    if item_day:
+                        observed.add(item_day)
+                        self.writer.source_entity("max_metric", f"max_metrics:{item_day}", item, raw_hash, occurred_on=item_day)
+            current = window_start
+            while current <= window_end:
+                day = current.isoformat()
+                if day not in observed:
+                    fallback, fallback_hash = self._capture(
+                        "max_metrics",
+                        lambda day=day: self.api.get_max_metrics(day),
+                        day,
+                        {"date": day, "fallback": "range-missing"},
+                    )
+                    if fallback is not None:
+                        for item in as_items(fallback):
+                            self.writer.source_entity("max_metric", f"max_metrics:{day}", item, fallback_hash, occurred_on=day)
+                current += timedelta(days=1)
+            window_start = window_end + timedelta(days=1)
+
+    def _hrv_history(self, from_date: date, to_date: date) -> None:
+        """Stage the PR-402 HRV range API, retaining daily fallback coverage."""
+        window_start = from_date
+        while window_start <= to_date:
+            window_end = min(to_date, window_start + timedelta(days=89))
+            start, end = window_start.isoformat(), window_end.isoformat()
+            payload, raw_hash = self._capture(
+                "hrv_range",
+                lambda start=start, end=end: self.api.get_hrv_data_range(start, end),
+                None,
+                {"from": start, "to": end},
+            )
+            observed: set[str] = set()
+            if payload is not None:
+                for item in as_items(payload):
+                    item_day = payload_date(item)
+                    if item_day:
+                        observed.add(item_day)
+                        self.writer.source_entity("daily_health", f"hrv:{item_day}", item, raw_hash, occurred_on=item_day)
+            current = window_start
+            while current <= window_end:
+                day = current.isoformat()
+                if day not in observed:
+                    fallback, fallback_hash = self._capture("hrv", lambda day=day: self.api.get_hrv_data(day), day, {"date": day, "fallback": "range-missing"})
+                    if fallback is not None:
+                        self.writer.source_entity("daily_health", f"hrv:{day}", as_dict(fallback), fallback_hash, occurred_on=day)
+                current += timedelta(days=1)
+            window_start = window_end + timedelta(days=1)
+
+    def _score_history(self, from_date: date, to_date: date) -> None:
+        """Stage daily-capable endurance-adjacent metrics from range endpoints."""
+        window_start = from_date
+        while window_start <= to_date:
+            window_end = min(to_date, window_start + timedelta(days=89))
+            start, end = window_start.isoformat(), window_end.isoformat()
+            for endpoint, method, entity_type in (
+                ("hill_score", lambda: self.api.get_hill_score(start, end), "hill_score"),
+                ("running_tolerance", lambda: self.api.get_running_tolerance(start, end, aggregation="daily"), "running_tolerance"),
+            ):
+                payload, raw_hash = self._capture(endpoint, method, None, {"from": start, "to": end, "aggregation": "daily"})
+                if payload is not None:
+                    for index, item in enumerate(as_items(payload)):
+                        item_day = payload_date(item)
+                        if item_day:
+                            self.writer.source_entity(entity_type, f"{endpoint}:{item_day}:{index}", item, raw_hash, occurred_on=item_day)
+            window_start = window_end + timedelta(days=1)
+
+        # Garmin limits daily race-prediction windows to one year.
+        window_start = from_date
+        while window_start <= to_date:
+            window_end = min(to_date, window_start + timedelta(days=365))
+            start, end = window_start.isoformat(), window_end.isoformat()
+            payload, raw_hash = self._capture("race_predictions", lambda start=start, end=end: self.api.get_race_predictions(start, end, "daily"), None, {"from": start, "to": end, "aggregation": "daily"})
+            if payload is not None:
+                for index, item in enumerate(as_items(payload)):
+                    item_day = payload_date(item) or start
+                    self.writer.source_entity("race_prediction", f"race_prediction:{item_day}:{index}", item, raw_hash, occurred_on=item_day)
+            window_start = window_end + timedelta(days=1)
 
     def _activities(self, from_date: date, to_date: date) -> None:
         start, end = from_date.isoformat(), to_date.isoformat()
@@ -170,12 +378,14 @@ class GarminStagingWorker:
             self.writer.error("activity_files", str(error), activity_id, False)
             return
         original_path: Path | None = None
+        original_hash: str | None = None
         for endpoint, format_value in formats.items():
             try:
                 contents = self.api.download_activity(activity_id, format_value)
                 digest = self.writer.archive_bytes(endpoint, activity_id, contents, "zip" if endpoint == "activity_original" else endpoint.rsplit("_", 1)[1])
                 if endpoint == "activity_original":
                     original_path = self.data_dir / "raw" / "garmin" / endpoint / activity_id / f"{digest}.zip"
+                    original_hash = digest
             except Exception as error:
                 self.writer.error(endpoint, str(error), activity_id)
         samples = activity_details_to_samples(f"garmin:{activity_id}", details or {})
@@ -190,10 +400,20 @@ class GarminStagingWorker:
                 "startAt": samples[0].get("timestamp_utc"), "endAt": samples[-1].get("timestamp_utc"),
                 "columns": SAMPLE_COLUMNS, "rawObjectHash": None,
             })
+            for duration, best_power in activity_power_bests(samples).items():
+                self.writer.source_entity(
+                    "activity_power_best",
+                    f"{activity_id}:{duration}",
+                    {"durationSeconds": duration, "bestPowerWatts": best_power, "sourceType": "garmin_fit_derived"},
+                    original_hash,
+                    parent_remote_id=activity_id,
+                    occurred_on=start_date[:10],
+                )
 
     def _collections(self) -> None:
+        today = date.today()
         calls = {
-            "workouts": ("get_workouts", (), "workout"), "scheduled_workouts": ("get_scheduled_workouts", (), "scheduled_workout"),
+            "workouts": ("get_workouts", (), "workout"), "scheduled_workouts": ("get_scheduled_workouts", (today.year, today.month), "scheduled_workout"),
             "goals": ("get_goals", (), "goal"), "golf_summary": ("get_golf_summary", (), "golf_scorecard"),
         }
         for endpoint, (method, arguments, entity_type) in calls.items():

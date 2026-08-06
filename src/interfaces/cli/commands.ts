@@ -21,17 +21,19 @@ program.command('init')
 program.command('sync')
   .requiredOption('--provider <provider>', 'intervals, garmin, strava, or all')
   .option('--from <date>', 'explicit ISO date range; otherwise use incremental cursors')
-  .action(async (options: { provider: ProviderChoice; from?: string }) => {
+  .option('--refresh', 're-fetch Garmin activity details, files, and streams even when summaries are unchanged')
+  .action(async (options: { provider: ProviderChoice; from?: string; refresh?: boolean }) => {
     if (!['intervals', 'garmin', 'strava', 'all'].includes(options.provider)) throw new Error('--provider must be intervals, garmin, strava, or all.');
-    process.stdout.write(`${JSON.stringify(await syncData(currentPaths(), options.provider, options.from), null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(await syncData(currentPaths(), options.provider, options.from, true, options.refresh ?? false), null, 2)}\n`);
   });
 
 program.command('backfill')
   .requiredOption('--from <date>', 'ISO date at which to begin backfill')
   .option('--provider <provider>', 'intervals, garmin, strava, or all', 'all')
-  .action(async (options: { provider: ProviderChoice; from: string }) => {
+  .option('--refresh', 're-fetch Garmin activity details, files, and streams even when summaries are unchanged')
+  .action(async (options: { provider: ProviderChoice; from: string; refresh?: boolean }) => {
     if (!['intervals', 'garmin', 'strava', 'all'].includes(options.provider)) throw new Error('--provider must be intervals, garmin, strava, or all.');
-    process.stdout.write(`${JSON.stringify(await syncData(currentPaths(), options.provider, options.from, false), null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(await syncData(currentPaths(), options.provider, options.from, false, options.refresh ?? false), null, 2)}\n`);
   });
 
 program.command('retry')
