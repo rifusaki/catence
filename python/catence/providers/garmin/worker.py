@@ -347,6 +347,18 @@ class GarminStagingWorker:
                 self._activity_details(activity_id, summary)
             self.writer.activity_sync_state(activity_id, summary_hash, details_fetched)
 
+    def _multisport_children(self, parent_activity_id: str, activity: dict[str, Any]) -> None:
+        if not activity.get("isMultiSportParent"):
+            return
+        metadata = as_dict(activity.get("metadataDTO"))
+        child_ids = metadata.get("childIds")
+        if not isinstance(child_ids, list):
+            return
+        for child_id in dict.fromkeys(str(value) for value in child_ids if value is not None and str(value) != parent_activity_id):
+            payload, raw_hash = self._capture("activity", lambda child_id=child_id: self.api.get_activity(child_id), child_id, {"parentActivityId": parent_activity_id})
+            if isinstance(payload, dict):
+                self.writer.source_entity("activity", child_id, payload, raw_hash, parent_remote_id=parent_activity_id)
+
     def _activity_details(self, activity_id: str, summary: dict[str, Any]) -> None:
         calls = {
             "activity": ("get_activity", "activity_detail"), "activity_details": ("get_activity_details", "activity_detail"),
@@ -360,6 +372,8 @@ class GarminStagingWorker:
             payload, raw_hash = self._capture(endpoint, lambda method=method: getattr(self.api, method)(activity_id), activity_id)
             if payload is not None:
                 self._entity(endpoint, entity_type, payload, raw_hash, parent_remote_id=activity_id)
+                if endpoint == "activity" and isinstance(payload, dict):
+                    self._multisport_children(activity_id, payload)
                 if endpoint == "activity_details" and isinstance(payload, dict):
                     details = payload
         self._activity_files(activity_id, summary, details)

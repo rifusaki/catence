@@ -7,6 +7,7 @@ export type DatasetName =
   | 'daily_metrics'
   | 'daily_health'
   | 'training_metrics'
+  | 'training_metric_observations'
   | 'wellness_samples'
   | 'health_sessions'
   | 'power_bests'
@@ -53,7 +54,7 @@ export type DatasetDefinition = {
 
 const column = (name: string, type: string, options: Omit<CatalogColumn, 'name' | 'type'> = {}): CatalogColumn => ({ name, type, ...options });
 
-export const DATASET_CATALOG: Record<DatasetName, DatasetDefinition> = {
+export const DATASET_CATALOG: Record<Exclude<DatasetName, 'training_metrics'>, DatasetDefinition> = {
   activities: {
     name: 'activities', relation: 'activities', description: 'Logical activities linked by provider IDs, unique high-confidence fuzzy evidence, or an explicit manual correction.', dateColumn: 'started_at_utc', provenanceColumns: ['activity_id', 'link_state'], permittedGroupings: ['sport', 'link_state'],
     columns: [column('activity_id', 'VARCHAR', { filterable: true, groupable: true }), column('started_at_utc', 'TIMESTAMPTZ', { filterable: true }), column('started_at_local', 'VARCHAR'), column('timezone', 'VARCHAR'), column('sport', 'VARCHAR', { filterable: true, groupable: true }), column('name', 'VARCHAR', { filterable: true }), column('link_state', 'VARCHAR', { filterable: true, groupable: true })],
@@ -82,8 +83,8 @@ export const DATASET_CATALOG: Record<DatasetName, DatasetDefinition> = {
     name: 'daily_health', relation: 'daily_health', description: 'One canonical daily-health record per date. Garmin wins whenever it has facts for that date; Intervals or another provider is a whole-day fallback. Use daily_metrics to compare source observations.', dateColumn: 'metric_date', provenanceColumns: ['provider'], permittedGroupings: ['provider'],
     columns: [column('provider', 'VARCHAR', { filterable: true, groupable: true }), column('metric_date', 'DATE', { filterable: true, groupable: true }), column('resting_hr_bpm', 'DOUBLE', { unit: 'bpm', metric: true }), column('hrv_ms', 'DOUBLE', { unit: 'ms', metric: true }), column('sleep_seconds', 'DOUBLE', { unit: 's', metric: true }), column('sleep_score', 'DOUBLE', { metric: true }), column('stress', 'DOUBLE', { metric: true }), column('body_battery', 'DOUBLE', { metric: true }), column('readiness', 'DOUBLE', { metric: true }), column('spo2_pct', 'DOUBLE', { unit: '%', metric: true }), column('weight_kg', 'DOUBLE', { unit: 'kg', metric: true }), column('steps', 'DOUBLE', { unit: 'count', metric: true })],
   },
-  training_metrics: {
-    name: 'training_metrics', relation: 'training_metric_observations', description: 'Provider training-metric observations. Garmin cycling FTP records retain historical setting values, the direct latest setting, and the FTP observed in each cycling activity.', dateColumn: 'observed_at', provenanceColumns: ['provider', 'source_type', 'source_remote_id', 'activity_source_id', 'raw_object_hash'], permittedGroupings: ['provider', 'metric_name', 'sport', 'source_type'],
+  training_metric_observations: {
+    name: 'training_metric_observations', relation: 'training_metric_observations', description: 'Provider training-metric observations. Garmin cycling FTP records retain historical setting values, the direct latest setting, and the FTP observed in each cycling activity. Garmin may label its running VO₂max estimate as generic.', dateColumn: 'observed_at', provenanceColumns: ['provider', 'source_type', 'source_remote_id', 'activity_source_id', 'raw_object_hash'], permittedGroupings: ['provider', 'metric_name', 'sport', 'source_type'],
     columns: [column('observation_id', 'VARCHAR', { filterable: true, groupable: true }), column('provider', 'VARCHAR', { filterable: true, groupable: true }), column('metric_name', 'VARCHAR', { filterable: true, groupable: true }), column('sport', 'VARCHAR', { filterable: true, groupable: true }), column('observed_at', 'TIMESTAMPTZ', { filterable: true }), column('value_number', 'DOUBLE', { metric: true }), column('value_text', 'VARCHAR', { filterable: true, groupable: true }), column('unit', 'VARCHAR', { filterable: true, groupable: true }), column('device_id', 'VARCHAR', { filterable: true, groupable: true }), column('dimensions_json', 'JSON'), column('source_type', 'VARCHAR', { filterable: true, groupable: true }), column('source_remote_id', 'VARCHAR', { filterable: true }), column('activity_source_id', 'VARCHAR', { filterable: true }), column('raw_object_hash', 'VARCHAR')],
   },
   wellness_samples: {
@@ -157,7 +158,11 @@ function domain(name: DatasetName, id: string, description: string, dateColumn?:
 }
 
 export function getDataset(name: string): DatasetDefinition {
-  const dataset = DATASET_CATALOG[name as DatasetName];
+  // training_metrics was the original public catalog name. Keep it as a
+  // backwards-compatible input alias, while presenting the actual queryable
+  // relation everywhere so describe_dataset and the SQL allow-list agree.
+  const normalizedName = name === 'training_metrics' ? 'training_metric_observations' : name;
+  const dataset = DATASET_CATALOG[normalizedName as Exclude<DatasetName, 'training_metrics'>];
   if (!dataset) throw new QueryValidationError(`Unknown dataset: ${name}. Use describe_data to see the catalog.`);
   return dataset;
 }

@@ -378,5 +378,51 @@ const garminHistoricalMetricsAndStreamsMigration: Migration = {
   `,
 };
 
-export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration];
+const garminUtcActivityTimestampMigration: Migration = {
+  version: 11,
+  name: 'garmin_gmt_activity_timestamps_are_utc',
+  sql: `
+    -- Garmin labels these fields GMT but commonly omits the offset. Without an
+    -- explicit Z DuckDB treats them as the host's local time when binding them
+    -- to TIMESTAMPTZ, shifting activity matching by the local UTC offset.
+    UPDATE activities AS activity
+    SET started_at_utc = try_cast(replace(gmt_value, ' ', 'T') || 'Z' AS TIMESTAMPTZ)
+    FROM activity_sources AS source
+    JOIN source_entities AS entity
+      ON entity.provider = source.provider
+      AND entity.entity_type = 'activity'
+      AND entity.remote_id = source.remote_activity_id
+    CROSS JOIN LATERAL (
+      SELECT coalesce(
+        json_extract_string(entity.payload_json, '$.startTimeGMT'),
+        json_extract_string(entity.payload_json, '$.summaryDTO.startTimeGMT')
+      ) AS gmt_value
+    ) AS timestamp_source
+    WHERE source.provider = 'garmin'
+      AND source.activity_id = activity.activity_id
+      AND gmt_value IS NOT NULL
+      AND NOT regexp_matches(gmt_value, '(Z|[+-][0-9]{2}:?[0-9]{2})$');
+
+    UPDATE training_metric_observations AS observation
+    SET observed_at = try_cast(replace(gmt_value, ' ', 'T') || 'Z' AS TIMESTAMPTZ)
+    FROM source_entities AS entity
+    CROSS JOIN LATERAL (
+      SELECT coalesce(
+        json_extract_string(entity.payload_json, '$.startTimeGMT'),
+        json_extract_string(entity.payload_json, '$.summaryDTO.startTimeGMT')
+      ) AS gmt_value
+    ) AS timestamp_source
+    WHERE observation.provider = 'garmin'
+      AND observation.source_type = 'activity_summary'
+      AND observation.source_remote_id = entity.remote_id
+      AND entity.provider = 'garmin'
+      AND entity.entity_type = 'activity'
+      AND gmt_value IS NOT NULL
+      AND NOT regexp_matches(gmt_value, '(Z|[+-][0-9]{2}:?[0-9]{2})$');
+
+    UPDATE retrieval_index_state SET status = 'stale' WHERE index_name = 'context';
+  `,
+};
+
+export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration];
 export type { Migration };

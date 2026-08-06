@@ -113,8 +113,9 @@ only after their shared service methods and fixture tests exist.
 
 ## Implemented fitness and hydration endpoints
 
-- `describe_dataset(dataset)` returns one cataloged schema and its coverage.
-- `get_ftp_history`, `get_vo2max_history`, and `power_curve_trend` read normalized, source-aware fitness facts. They do not scrape JSON payloads or rely on curve-array positions.
+- `describe_dataset(dataset)` returns one cataloged schema and its coverage. `training_metric_observations` also reports its observed sports, metric names, units, and source types.
+- `get_ftp_history`, `get_vo2max_history`, and `power_curve_trend` read normalized, source-aware fitness facts. They do not scrape JSON payloads or rely on curve-array positions. `get_vo2max_history` does not default to cycling: omission returns available sports and requires an explicit choice; Garmin running VO₂max may be labelled `generic`.
+- `find_activities` is implemented for compact, canonical, paginated activity/race discovery by sport, distance, name, and date. Its race flags are transparent heuristics, not provider-confirmed race metadata.
 - `latest_cycling_activities` returns Garmin source records to avoid silently double-counting linked Intervals summaries; optional multisport parents are explicitly flagged.
 - `cycling_progress_report` composes the preceding read-only outputs with monthly canonical volume/load. It is descriptive, not a physiological model.
 - `hydrate_recent_strava_activities` accepts an explicit list or a bounded date/sport window and awaits each write in sequence. Its unmatched output includes the exact Strava search window and safe-match rejection diagnostics.

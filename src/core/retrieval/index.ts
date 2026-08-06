@@ -211,16 +211,25 @@ export async function searchContext(repository: ReadOnlyRepository, request: { q
     void ignoredQuery;
     rows = await repository.rows(`SELECT document_id, entity_type, entity_id, activity_source_id, provider, occurred_on, left(document_text, 600) AS snippet, (${keywordScore}) AS score FROM retrieval_documents WHERE (${keywordScore}) > 0${filterSql} ORDER BY score DESC, occurred_on DESC NULLS LAST, document_id ASC LIMIT $limit`, keywordParams as never);
   }
+  const indexStatus = state[0]?.status ?? 'stale';
+  const indexIsFresh = indexStatus === 'ready';
   return jsonSafe({
     data: rows.map((row) => ({ ...row, recommendedFollowUpTool: recommendedTool(String(row.entity_type)) })),
-    provenance: { dataset: 'retrieval_documents', mode, indexStatus: state[0]?.status ?? 'stale' },
+    retrievalIndex: {
+      status: indexStatus,
+      fresh: indexIsFresh,
+      authoritativeAlternative: indexIsFresh ? null : 'Use find_activities or query_read_only_data for authoritative activity discovery until the index is rebuilt.',
+    },
+    provenance: { dataset: 'retrieval_documents', mode, indexStatus },
     query: { query, filters: request.filters ?? [], limit },
-    caveats: state[0]?.status !== 'ready' ? ['The retrieval index is stale. Run catence build-retrieval-index after sync.'] : ['Search results are context pointers; use the recommended tool for authoritative numeric facts.'],
+    caveats: !indexIsFresh
+      ? ['Index stale; use direct activity query (find_activities or query_read_only_data) for authoritative results. Run catence-data build-retrieval-index after sync.']
+      : ['Search results are context pointers; use the recommended tool for authoritative numeric facts.'],
   });
 }
 
 function recommendedTool(entityType: string): string {
-  if (entityType.startsWith('activity')) return 'read_series';
+  if (entityType.startsWith('activity')) return 'find_activities';
   if (entityType.startsWith('nutrition')) return 'aggregate_data';
   if (entityType === 'weekly_training_summary' || entityType === 'training_metric') return 'aggregate_data';
   return 'query_read_only_data';

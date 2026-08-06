@@ -41,6 +41,13 @@ function activityIdentity(provider: Provider, remoteId: string, payload: JsonObj
   return externalId ? `external:${externalId}` : providerActivityId(provider, remoteId);
 }
 
+/** Garmin's GMT strings often omit their offset; make their UTC meaning explicit for DuckDB. */
+function garminUtcTimestamp(value: string | null): string | null {
+  if (!value) return null;
+  const normalized = value.trim().replace(' ', 'T');
+  return /(?:Z|[+-]\d{2}:?\d{2})$/i.test(normalized) ? normalized : `${normalized}Z`;
+}
+
 function activityFields(provider: Provider, payload: JsonObject): {
   startAtUtc: string | null;
   startAtLocal: string | null;
@@ -53,8 +60,11 @@ function activityFields(provider: Provider, payload: JsonObject): {
   const summaryPayload = object(payload.summaryDTO);
   const source = { ...summaryPayload, ...payload };
   const intervals = provider === 'intervals';
+  const garminStartAtGmt = firstString(source, ['startTimeGMT']);
   return {
-    startAtUtc: firstString(source, intervals ? ['start_date'] : ['startTimeGMT', 'startTimeLocal']),
+    startAtUtc: intervals
+      ? firstString(source, ['start_date'])
+      : garminUtcTimestamp(garminStartAtGmt) ?? firstString(source, ['startTimeLocal']),
     startAtLocal: firstString(source, intervals ? ['start_date_local', 'start_date'] : ['startTimeLocal', 'startTimeGMT']),
     timezone: firstString(source, intervals ? ['timezone'] : ['timeZoneUnitDTO']),
     sport: intervals

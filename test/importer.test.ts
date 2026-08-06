@@ -3,6 +3,22 @@ import { importRecord } from '../src/elt/ingestion/importer.js';
 import { temporaryDatabase } from './helpers.js';
 
 describe('normalization importer', () => {
+  it('interprets Garmin offset-less GMT activity timestamps as UTC', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('garmin', '2026-02-01');
+    try {
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity', remoteId: 'gmt-activity', parentRemoteId: null,
+        occurredOn: '2026-02-01', sourceUpdatedAt: null, rawObjectHash: 'gmt-raw', extension: {},
+        payload: { activityId: 'gmt-activity', startTimeGMT: '2026-02-01 10:00:00', startTimeLocal: '2026-02-01 05:00:00', activityType: 'running', distance: 10_000, duration: 3_600 },
+      });
+      expect(await database.rows<{ epoch_s: string }>("SELECT CAST(CAST(epoch(started_at_utc) AS BIGINT) AS VARCHAR) AS epoch_s FROM activities WHERE activity_id = 'garmin:gmt-activity'"))
+        .toEqual([{ epoch_s: String(Date.UTC(2026, 1, 1, 10, 0, 0) / 1_000) }]);
+    } finally {
+      await database.close();
+    }
+  });
+
   it('retains Garmin cycling FTP observations from activity summaries and the direct setting', async () => {
     const { database } = await temporaryDatabase();
     const runId = await database.beginRun('garmin', '2026-02-01');

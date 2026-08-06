@@ -89,6 +89,28 @@ def test_unchanged_activity_skips_deep_garmin_calls(tmp_path):
     assert writer.states == [("42", digest, False)]
 
 
+def test_multisport_parent_stages_its_child_activities(tmp_path):
+    class MultiSportApi:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get_activity(self, activity_id: str):
+            self.calls.append(activity_id)
+            return {"activityId": int(activity_id), "summaryDTO": {"startTimeGMT": "2026-07-30T10:00:00.0"}}
+
+    writer = Writer()
+    api = MultiSportApi()
+    worker = GarminStagingWorker(api, writer, tmp_path)
+
+    worker._multisport_children("100", {"isMultiSportParent": True, "metadataDTO": {"childIds": ["101", "102", "101", "100"]}})
+
+    assert api.calls == ["101", "102"]
+    assert [(entity[0], entity[1], entity[-1]["parent_remote_id"]) for entity in writer.entities] == [
+        ("activity", "101", "100"),
+        ("activity", "102", "100"),
+    ]
+
+
 def test_range_limited_endpoints_are_chunked_and_scheduled_workouts_receive_a_month(tmp_path):
     writer = Writer()
     api = RangeApi()

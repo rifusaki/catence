@@ -143,6 +143,7 @@ export class ReadOnlyRepository {
     const rows = await this.rows(`
       SELECT 'activities' AS dataset, min(cast(started_at_utc AS DATE)) AS start_date, max(cast(started_at_utc AS DATE)) AS end_date, count(*)::INTEGER AS row_count FROM activities
       UNION ALL SELECT 'daily_metrics', min(metric_date), max(metric_date), count(*)::INTEGER FROM daily_metrics
+      UNION ALL SELECT 'training_metric_observations', min(cast(observed_at AS DATE)), max(cast(observed_at AS DATE)), count(*)::INTEGER FROM training_metric_observations
       UNION ALL SELECT 'nutrition_days', min(nutrition_date), max(nutrition_date), count(*)::INTEGER FROM nutrition_days
       UNION ALL SELECT 'source_entities', min(occurred_on), max(occurred_on), count(*)::INTEGER FROM source_entities
     `);

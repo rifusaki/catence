@@ -163,9 +163,11 @@ export class AnalyticsService {
     const date = timestampExpression(dataset);
     const rawSelect = `${date} AS timestamp, ${metrics.map(quoteIdentifier).join(', ')}, ${dataset.provenanceColumns.filter((column) => dataset.columns.some((known) => known.name === column)).map(quoteIdentifier).join(', ')}`;
     const order = `${date} ASC, ${dataset.provenanceColumns[0] ? quoteIdentifier(dataset.provenanceColumns[0]) : '1'} ASC`;
+    let rawTotalRows: number | undefined;
     if (resolution === 'auto') {
       const probe = await this.repository.rows(`SELECT count(*)::BIGINT AS row_count FROM ${source} AS source ${where}`, values);
       const rowCount = Number(probe[0]?.row_count ?? 0);
+      rawTotalRows = rowCount;
       resolution = rowCount > pageSize
         ? dataset.name === 'activity_samples' ? '1m'
           : ['daily_metrics', 'daily_health', 'nutrition_days', 'nutrition_items'].includes(dataset.name) ? 'week'
@@ -173,6 +175,25 @@ export class AnalyticsService {
         : 'raw';
     }
     const offset = cursor?.offset ?? 0;
+    let totalRows: number;
+    if (resolution === 'raw') {
+      if (rawTotalRows === undefined) {
+        const total = await this.repository.rows<{ total_rows: number | bigint }>(`SELECT count(*) AS total_rows FROM ${source} AS source ${where}`, values);
+        rawTotalRows = Number(total[0]?.total_rows ?? 0);
+      }
+      totalRows = rawTotalRows;
+    } else {
+      const bucket = bucketExpression(date, resolution);
+      const provenance = dataset.provenanceColumns.filter((column) => dataset.columns.some((known) => known.name === column));
+      const total = await this.repository.rows<{ total_rows: number | bigint }>(`
+        SELECT count(*) AS total_rows FROM (
+          SELECT ${bucket} AS timestamp
+          FROM ${source} AS source ${where}
+          GROUP BY ${bucket}, ${provenance.map(quoteIdentifier).join(', ')}
+        ) AS series_total
+      `, values);
+      totalRows = Number(total[0]?.total_rows ?? 0);
+    }
     values.limit = pageSize + 1;
     values.offset = offset;
     let rows: Record<string, unknown>[];
@@ -191,12 +212,20 @@ export class AnalyticsService {
     }
     const hasMore = rows.length > pageSize;
     if (hasMore) rows.pop();
+    const returnedRows = rows.length;
+    const truncated = offset + returnedRows < totalRows;
     return jsonSafe({
+      returnedRows,
+      totalRows,
+      truncated,
+      nextCursor: truncated ? encodeCursor({ hash: fingerprint, offset: offset + returnedRows, resolution }) : undefined,
       data: rows,
       provenance: { dataset: dataset.name, source: dataset.relation ?? 'registered stream_manifest Parquet only', columns: dataset.provenanceColumns },
       query: { dataset: dataset.name, metrics, filters: request.filters ?? [], startDate: request.startDate, endDate: request.endDate, activityId: request.activityId, requestedResolution, resolution, pageSize },
-      caveats: resolution !== requestedResolution && requestedResolution === 'auto' ? ['Automatically downsampled to stay within the first response page. Use the returned cursor for later pages.'] : [],
-      nextCursor: hasMore ? encodeCursor({ hash: fingerprint, offset: offset + pageSize, resolution }) : undefined,
+      caveats: [
+        ...(resolution !== requestedResolution && requestedResolution === 'auto' ? ['Automatically downsampled to stay within the first response page. Use the returned cursor for later pages.'] : []),
+        ...(truncated ? ['Results are incomplete. Do not draw exhaustive conclusions; retrieve remaining pages with nextCursor or narrow the query.'] : []),
+      ],
     });
   }
 

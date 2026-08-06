@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import type { CatencePaths } from '../../../../contracts/runtime.js';
 import { ensurePaths, loadCatenceConfig } from '../../../../core/runtime/configuration.js';
-import { CatenceDatabase } from '../../../storage/database.js';
+import { CatenceDatabase, openReadOnlyRepository } from '../../../storage/database.js';
 import { importJsonl } from '../../importer.js';
 import { withDataWriteLock } from '../../../storage/write-lock.js';
 
@@ -174,7 +174,7 @@ export async function syncStravaGear(paths: CatencePaths, refresh = true): Promi
   return runReadOperation(paths, 'gear', [], { type: 'gear', id: 'authenticated_athlete' }, refresh);
 }
 
-type ActivityMatch = { activity_source_id: string; activity_id: string; provider: string; remote_activity_id: string; external_id: string | null; source_payload: string | Record<string, unknown> | null; started_at_utc: string | Date | null; sport: string | null; distance_m: number | null; moving_s: number | null };
+type ActivityMatch = { activity_source_id: string; activity_id: string; provider: string; remote_activity_id: string; external_id: string | null; source_payload: string | Record<string, unknown> | null; started_at_utc: string | Date | null; sport: string | null; distance_m: number | null; elapsed_s: number | null };
 
 /** Returns a Strava activity ID only for formats that identify one directly. */
 export function stravaActivityIdFromExternalId(value: string | null | undefined): string | null {
@@ -209,13 +209,63 @@ export function resolveStravaActivityId(activityId: string, matches: Array<{ pro
     ?? null;
 }
 
+export async function multisportChildActivitySourceIds(paths: CatencePaths, activityId: string): Promise<string[] | null> {
+  const repository = await openReadOnlyRepository(paths);
+  try {
+    const parent = (await repository.rows<{ is_multisport_parent: boolean }>(`
+      SELECT coalesce(
+        try_cast(json_extract_string(raw.payload_json, '$.isMultiSportParent') AS BOOLEAN),
+        try_cast(json_extract_string(raw.payload_json, '$.isParent') AS BOOLEAN),
+        false
+      ) AS is_multisport_parent
+      FROM activity_sources AS source
+      JOIN source_entities AS raw ON raw.provider = source.provider AND raw.entity_type = 'activity' AND raw.remote_id = source.remote_activity_id
+      WHERE source.activity_source_id = $activityId AND source.provider = 'garmin'
+    `, { activityId }))[0];
+    if (!parent?.is_multisport_parent) return null;
+    const children = await repository.rows<{ activity_source_id: string }>(`
+      SELECT child_source.activity_source_id
+      FROM activity_sources AS parent_source
+      JOIN source_entities AS child_raw
+        ON child_raw.provider = 'garmin' AND child_raw.entity_type = 'activity' AND child_raw.parent_remote_id = parent_source.remote_activity_id
+      JOIN activity_sources AS child_source
+        ON child_source.provider = 'garmin' AND child_source.remote_activity_id = child_raw.remote_id
+      JOIN activities AS child_activity ON child_activity.activity_id = child_source.activity_id
+      WHERE parent_source.activity_source_id = $activityId
+        AND parent_source.provider = 'garmin'
+        AND lower(coalesce(child_activity.sport, '')) NOT LIKE '%transition%'
+      ORDER BY child_activity.started_at_utc, child_source.activity_source_id
+    `, { activityId });
+    return children.map((child) => child.activity_source_id);
+  } finally {
+    await repository.close();
+  }
+}
+
 export async function hydrateStravaActivity(paths: CatencePaths, activityId: string, refresh = false): Promise<WorkerResult | Record<string, unknown>> {
+  const multisportChildren = await multisportChildActivitySourceIds(paths, activityId);
+  if (multisportChildren) {
+    if (!multisportChildren.length) {
+      throw new StravaEnrichmentError('This Garmin multisport parent has no staged child activities. Refresh the Garmin activity before hydrating Strava.');
+    }
+    const childOutcomes: Array<{ activityId: string; status: string; result: WorkerResult | Record<string, unknown> }> = [];
+    for (const childActivityId of multisportChildren) {
+      const result = await hydrateStravaActivity(paths, childActivityId, refresh);
+      const status = typeof result.status === 'string' ? result.status : 'completed';
+      childOutcomes.push({ activityId: childActivityId, status, result });
+    }
+    return {
+      status: childOutcomes.every((outcome) => outcome.status === 'completed') ? 'completed' : 'partial',
+      hydrationStrategy: 'garmin_multisport_children',
+      childOutcomes,
+    };
+  }
   return withDataWriteLock(paths, async () => {
     await ensurePaths(paths);
     const database = await CatenceDatabase.open(paths);
     try {
       const matches = await database.rows<ActivityMatch>(`
-        SELECT source.activity_source_id, source.activity_id, source.provider, source.remote_activity_id, source.external_id, raw.payload_json AS source_payload, activity.started_at_utc, activity.sport, summary.distance_m, summary.moving_s
+        SELECT source.activity_source_id, source.activity_id, source.provider, source.remote_activity_id, source.external_id, raw.payload_json AS source_payload, activity.started_at_utc, activity.sport, summary.distance_m, summary.elapsed_s
         FROM activity_sources source JOIN activities activity USING (activity_id)
         LEFT JOIN activity_summaries summary USING (activity_source_id)
         LEFT JOIN source_entities raw ON raw.provider = source.provider AND raw.entity_type = 'activity' AND raw.remote_id = source.remote_activity_id
@@ -236,8 +286,8 @@ export async function hydrateStravaActivity(paths: CatencePaths, activityId: str
         const cached = await cachedState(database, resource.type, resource.id);
         if (cached) return cached;
       }
-      if (!directStravaActivityId && (!activity.started_at_utc || !activity.sport || activity.distance_m === null || activity.moving_s === null)) {
-        throw new StravaEnrichmentError('This activity lacks the timestamp, sport, distance, or moving duration required for safe Strava matching.');
+      if (!directStravaActivityId && (!activity.started_at_utc || !activity.sport || activity.distance_m === null || activity.elapsed_s === null)) {
+        throw new StravaEnrichmentError('This activity lacks the timestamp, sport, distance, or elapsed duration required for safe Strava matching.');
       }
       await checkBudget(database, paths);
       const runId = await database.beginRun('strava', new Date().toISOString().slice(0, 10));
@@ -249,8 +299,8 @@ export async function hydrateStravaActivity(paths: CatencePaths, activityId: str
         const matchingArguments = [
           ...(directStravaActivityId ? ['--strava-activity-id', directStravaActivityId] : []),
           ...(matchMethod ? ['--strava-match-method', matchMethod] : []),
-          ...(activity.started_at_utc && activity.sport && activity.distance_m !== null && activity.moving_s !== null
-            ? ['--started-at', new Date(activity.started_at_utc).toISOString(), '--sport', activity.sport, '--distance-m', String(activity.distance_m), '--moving-s', String(activity.moving_s)]
+          ...(activity.started_at_utc && activity.sport && activity.distance_m !== null && activity.elapsed_s !== null
+            ? ['--started-at', new Date(activity.started_at_utc).toISOString(), '--sport', activity.sport, '--distance-m', String(activity.distance_m), '--elapsed-s', String(activity.elapsed_s)]
             : []),
         ];
         result = await invokeWorker(paths, [

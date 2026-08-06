@@ -148,7 +148,36 @@ export class FitnessService {
   }
 
   async vo2MaxHistory(request: Vo2MaxHistoryRequest = {}): Promise<Record<string, unknown>> {
-    const sport = request.sport ?? 'cycling';
+    if (!request.sport) {
+      const values: QueryValues = {};
+      const clauses = ["metric_name = 'vo2_max_ml_kg_min'", ...addDateRange('observed_at', request, values)];
+      const availableSports = await this.repository.rows<{ sport: string; count: number; latest: number | null; latest_observed_at: string | null }>(`
+        WITH ranked AS (
+          SELECT sport, value_number, observed_at,
+            count(*) OVER (PARTITION BY sport)::INTEGER AS count,
+            row_number() OVER (PARTITION BY sport ORDER BY observed_at DESC, observation_id DESC) AS latest_rank
+          FROM training_metric_observations
+          WHERE ${clauses.join(' AND ')}
+        )
+        SELECT sport, max(count)::INTEGER AS count,
+          max(value_number) FILTER (WHERE latest_rank = 1) AS latest,
+          cast(max(observed_at) FILTER (WHERE latest_rank = 1) AS VARCHAR) AS latest_observed_at
+        FROM ranked GROUP BY sport ORDER BY sport ASC
+      `, values);
+      return {
+        data: {
+          availableSports,
+          actionRequired: 'Choose a sport explicitly.',
+        },
+        provenance: { dataset: 'training_metric_observations', metric: 'vo2_max_ml_kg_min' },
+        query: { ...request, sport: null },
+        caveats: [
+          'No VO₂max observations are returned until sport is chosen explicitly; Catence never silently defaults to cycling.',
+          'Garmin may label its running VO₂max estimate as generic. Choose sport: generic when applicable.',
+        ],
+      };
+    }
+    const sport = request.sport;
     const values: QueryValues = { sport };
     const clauses = ["metric_name = 'vo2_max_ml_kg_min'", 'lower(sport) = lower($sport)', ...addDateRange('observed_at', request, values)];
     const observations = await this.repository.rows<MetricRow>(`

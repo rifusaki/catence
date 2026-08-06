@@ -7,6 +7,7 @@ import { hydrateStravaActivity, hydrateStravaSegmentHistory, StravaEnrichmentErr
 import { openReadOnlyRepository, ReadOnlyDatabaseError } from '../../elt/storage/database.js';
 import { searchContext } from '../../core/retrieval/index.js';
 import { AnalyticsService, type DataFilter } from '../../core/query/analytics.js';
+import { ActivityDiscoveryService } from '../../core/query/activity-discovery.js';
 import { getDataset, QueryValidationError } from '../../core/query/catalog.js';
 import { FitnessService } from '../../core/query/fitness.js';
 import { jsonSafe, ReadOnlyRepository } from '../../core/query/repository.js';
@@ -115,8 +116,19 @@ export function createCatenceMcpServer(paths = resolvePaths()): McpServer {
   }, tool('describe_dataset', async (input) => useRepository(paths, async (repository) => {
     const dataset = getDataset(input.dataset);
     const coverage = (await repository.coverage()).coverage as Array<Record<string, unknown>>;
+    const observedValues = dataset.name === 'training_metric_observations'
+      ? await (async () => {
+        const [sports, metricNames, units, sourceTypes] = await Promise.all([
+          repository.rows<{ sport: string }>(`SELECT distinct sport FROM training_metric_observations WHERE sport IS NOT NULL ORDER BY sport ASC`),
+          repository.rows<{ metric_name: string }>(`SELECT distinct metric_name FROM training_metric_observations ORDER BY metric_name ASC`),
+          repository.rows<{ unit: string }>(`SELECT distinct unit FROM training_metric_observations WHERE unit IS NOT NULL ORDER BY unit ASC`),
+          repository.rows<{ source_type: string }>(`SELECT distinct source_type FROM training_metric_observations ORDER BY source_type ASC`),
+        ]);
+        return { sports: sports.map((row) => row.sport), metricNames: metricNames.map((row) => row.metric_name), units: units.map((row) => row.unit), sourceTypes: sourceTypes.map((row) => row.source_type) };
+      })()
+      : undefined;
     return {
-      data: { dataset, coverage: coverage.find((item) => item.dataset === dataset.name) ?? null },
+      data: { dataset, coverage: coverage.find((item) => item.dataset === dataset.name) ?? null, observedValues },
       provenance: { catalog: 'Catence catalog', database: 'read-only DuckDB snapshot' }, query: input, caveats: [],
     };
   })));
@@ -156,6 +168,18 @@ export function createCatenceMcpServer(paths = resolvePaths()): McpServer {
     inputSchema: { sport: z.string().min(1).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional() },
   }, tool('get_vo2max_history', async (input) => useRepository(paths, (repository) => new FitnessService(repository).vo2MaxHistory(input))));
 
+  server.registerTool('find_activities', {
+    title: 'Find activities and likely races',
+    description: 'Find canonical activities by sport, distance, name, and date. Results are paginated and transparently flag likely-race signals without claiming provider-confirmed race metadata. Read-only.',
+    inputSchema: {
+      sports: z.array(z.string().min(1)).min(1).max(12).optional(),
+      distanceKm: z.tuple([z.number().min(0), z.number().min(0)]).optional(),
+      nameContains: z.array(z.string().min(1)).min(1).max(12).optional(),
+      startDate: z.string().date().optional(), endDate: z.string().date().optional(),
+      sort: z.enum(['date_desc', 'date_asc']).optional(), limit: z.number().int().min(1).max(100).optional(), cursor: z.string().min(1).optional(),
+    },
+  }, tool('find_activities', async (input) => useRepository(paths, (repository) => new ActivityDiscoveryService(repository).findActivities(input))));
+
   server.registerTool('power_curve_trend', {
     title: 'Read labelled power-curve trends',
     description: 'Return monthly bests for selected power durations, including the supporting activity and source type. Read-only.',
@@ -175,8 +199,8 @@ export function createCatenceMcpServer(paths = resolvePaths()): McpServer {
   }, tool('cycling_progress_report', async (input) => useRepository(paths, (repository) => new FitnessService(repository).cyclingProgressReport(input))));
 
   server.registerTool('query_read_only_data', {
-    title: 'Query cataloged read-only data', description: 'Advanced fallback: one parameterized SELECT or WITH … SELECT over cataloged views only. Filesystem access, extensions, DDL, and mutation are rejected.',
-    inputSchema: { sql: z.string().min(1).max(20_000), values: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).refine((value) => Object.keys(value).length <= 100, 'At most 100 bind values are allowed.').optional() },
+    title: 'Query cataloged read-only data', description: 'Advanced fallback: one parameterized SELECT or WITH … SELECT over cataloged views only. Results use deterministic cursor pagination and always report whether they are incomplete. Filesystem access, extensions, DDL, and mutation are rejected.',
+    inputSchema: { sql: z.string().min(1).max(20_000), values: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).refine((value) => Object.keys(value).length <= 100, 'At most 100 bind values are allowed.').optional(), cursor: z.string().min(1).optional(), pageSize: z.number().int().min(1).max(500).optional() },
   }, tool('query_read_only_data', async (input) => useRepository(paths, (repository) => queryReadOnlyData(repository, input))));
 
   server.registerTool('search_context', {

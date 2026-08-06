@@ -89,7 +89,7 @@ commands; there is no scheduler or provider mutation in this phase.
 
 Normalized tables preserve provenance rather than force an early merge:
 
-- Activities remain provider-specific through `activity_sources`. Provider external IDs are strong links; an auto-link is allowed only for one sport-compatible candidate within 90 seconds and tight duration/distance tolerances, while ambiguity and virtual/indoor conflicts remain unlinked. Garmin is the canonical original activity detail source. Intervals training load, RPE, feel, and related calculations remain separately named analysis fields; Strava is never canonical.
+- Activities remain provider-specific through `activity_sources`. Provider external IDs are strong links; the general cross-provider auto-link requires one sport-compatible candidate within 90 seconds and tight moving-duration/distance tolerances, while ambiguity and virtual/indoor conflicts remain unlinked. Strava hydration is separate: it uses elapsed duration and does not reject an otherwise compatible candidate on Strava's indoor/virtual classification. Garmin is the canonical original activity detail source. Intervals training load, RPE, feel, and related calculations remain separately named analysis fields; Strava is never canonical.
 - Daily health observations retain provider/source values in `daily_metrics`,
   while the default `daily_health` projection selects Garmin for every date
   where Garmin has health facts (another provider is a whole-day fallback).
@@ -130,9 +130,12 @@ The query layer has four shared pieces:
    yet justify a dedicated tool. It accepts one parameterized `SELECT` or
    `WITH … SELECT` over cataloged views, inspects its resolved table names,
    rejects filesystem/extension/mutation statements, interrupts after four
-   seconds, and caps output at 500 rows / 512 KB.
+   seconds, and returns deterministic `ORDER BY ALL` pages of at most 500 rows.
+   Every page reports `returnedRows`, `totalRows`, `truncated`, and a query-bound
+   `nextCursor`; a truncated response explicitly warns against exhaustive conclusions.
 
-`read_series` returns a maximum of 1,000 points per page. Dense activity
+`read_series` returns a maximum of 1,000 points per page, along with the same
+explicit row-count/truncation fields. Dense activity
 streams default to minute aggregation on the first `auto` page; raw data stays
 available through the same bounded interface with a deterministic query-bound
 cursor. This lets an agent first answer an HRV evolution or training-load
@@ -140,9 +143,9 @@ question safely, then request a narrower/raw series only when it is useful.
 
 ### 4. Serving and retrieval
 
-The server currently exposes `catence_status`, `describe_data`, `read_series`,
+The server currently exposes `catence_status`, `describe_data`, `describe_dataset`, `read_series`,
 `aggregate_data`, `analyze_series`, `fit_series_model`,
-`query_read_only_data`, `search_context`, `hydrate_strava_activity`, `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history`, plus resources for status,
+`query_read_only_data`, `find_activities`, `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, `latest_cycling_activities`, `cycling_progress_report`, `search_context`, `hydrate_strava_activity`, `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history`, plus resources for status,
 catalog, a single activity, and a date-range summary.
 
 `catence-data build-retrieval-index` explicitly generates `retrieval_documents` and
@@ -151,7 +154,9 @@ summary facts, interval labels, routes/messages, planned workouts/events,
 weekly training summaries, nutrition daily summaries, and food names. They do
 not include sample streams, GPS paths, source JSON, raw nutrition payloads, or
 activity files. Sync marks the index stale; rebuilding is idempotent and records
-the raw-data watermark.
+the raw-data watermark. When the index is stale, `search_context` says so before
+its result can be used as activity evidence and directs callers to `find_activities`
+or `query_read_only_data` instead.
 
 When the DuckDB FTS extension is already available locally, the build uses it;
 otherwise—and without attempting installation—search falls back to normalized

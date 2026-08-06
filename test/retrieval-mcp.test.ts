@@ -7,6 +7,7 @@ import { writeParquetSamples, type ActivitySample } from '../src/elt/streams.js'
 import { openReadOnlyRepository } from '../src/elt/storage/database.js';
 import { buildRetrievalIndex, searchContext } from '../src/core/retrieval/index.js';
 import { AnalyticsService } from '../src/core/query/analytics.js';
+import { ActivityDiscoveryService } from '../src/core/query/activity-discovery.js';
 import { FitnessService } from '../src/core/query/fitness.js';
 import { queryReadOnlyData } from '../src/core/query/sql-guard.js';
 import { temporaryDatabase } from './helpers.js';
@@ -35,7 +36,7 @@ async function fixture() {
   });
   await importRecord(setup.database, runId, {
     kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'max_metric', remoteId: 'max-1', parentRemoteId: null, occurredOn: '2026-01-08', sourceUpdatedAt: null, rawObjectHash: 'max-raw',
-    payload: { cycling: { calendarDate: '2026-01-08', vo2MaxPreciseValue: 55.2 } }, extension: {},
+    payload: { generic: { calendarDate: '2026-01-08', vo2MaxPreciseValue: 58.5 }, cycling: { calendarDate: '2026-01-08', vo2MaxPreciseValue: 55.2 } }, extension: {},
   });
   for (const [durationSeconds, bestPowerWatts] of [[5, 600], [300, 280], [1_200, 240]] as const) {
     await importRecord(setup.database, runId, {
@@ -84,16 +85,23 @@ describe('read-only retrieval and analytics', () => {
       const downsampled = await analytics.readSeries({ dataset: 'activity_samples', metrics: ['power_w'], filters: [{ column: 'activity_source_id', op: 'eq', value: 'intervals:ride-1' }], resolution: 'auto' });
       expect((downsampled.query as { resolution: string }).resolution).toBe('1m');
       expect(downsampled.data).toHaveLength(17);
-      const sql = await queryReadOnlyData(repository, { sql: 'SELECT metric_date, hrv_ms FROM daily_health ORDER BY metric_date' });
-      expect(sql.data).toHaveLength(8);
+      const sql = await queryReadOnlyData(repository, { sql: 'SELECT metric_date, hrv_ms FROM daily_health ORDER BY metric_date', pageSize: 2 });
+      expect(sql.data).toHaveLength(2);
+      expect(sql).toEqual(expect.objectContaining({ returnedRows: 2, totalRows: 8, truncated: true, nextCursor: expect.any(String) }));
+      const sqlPageTwo = await queryReadOnlyData(repository, { sql: 'SELECT metric_date, hrv_ms FROM daily_health ORDER BY metric_date', pageSize: 2, cursor: sql.nextCursor as string });
+      expect((sqlPageTwo.data as Array<{ metric_date: string }>)[0]?.metric_date).toContain('2026-01-03');
       const aliasedSql = await queryReadOnlyData(repository, { sql: 'SELECT a.activity_id, source.activity_source_id FROM activities AS a JOIN activity_sources AS source ON a.activity_id = source.activity_id ORDER BY source.activity_source_id' });
       expect(aliasedSql.data).toEqual(expect.arrayContaining([expect.objectContaining({ activity_source_id: 'garmin:garmin-ride-1' })]));
       const fitness = new FitnessService(repository);
       expect((await fitness.ftpHistory()).data).toEqual(expect.objectContaining({ preferredSeries: expect.arrayContaining([expect.objectContaining({ value_number: 255 })]) }));
-      expect(await fitness.vo2MaxHistory()).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ value_number: 55.2 })]) }));
+      expect(await fitness.vo2MaxHistory()).toEqual(expect.objectContaining({ data: expect.objectContaining({ availableSports: expect.arrayContaining([expect.objectContaining({ sport: 'cycling', latest: 55.2 })]), actionRequired: 'Choose a sport explicitly.' }) }));
+      expect(await fitness.vo2MaxHistory({ sport: 'cycling' })).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ value_number: 55.2 })]) }));
+      expect(await fitness.vo2MaxHistory({ sport: 'generic' })).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ value_number: 58.5 })]) }));
       expect(await fitness.powerCurveTrend({ durations: [5, 300] })).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ durationLabel: '5 s' })]) }));
       expect(await fitness.latestCyclingActivities()).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ activity_source_id: 'garmin:garmin-ride-1' })]) }));
       expect(await fitness.cyclingProgressReport()).toEqual(expect.objectContaining({ data: expect.objectContaining({ monthlyVolume: expect.any(Array) }) }));
+      const activities = await new ActivityDiscoveryService(repository).findActivities({ sports: ['road_biking'], distanceKm: [40, 45] });
+      expect(activities).toEqual(expect.objectContaining({ totalRows: 1, truncated: false, data: expect.arrayContaining([expect.objectContaining({ activity_source_id: 'garmin:garmin-ride-1' })]) }));
       await expect(queryReadOnlyData(repository, { sql: 'DELETE FROM daily_health' })).rejects.toThrow('Only a single SELECT');
       const context = await searchContext(repository, { query: 'oats banana' });
       expect(context.data).toEqual(expect.arrayContaining([expect.objectContaining({ entity_type: 'nutrition_item', recommendedFollowUpTool: 'aggregate_data' })]));
@@ -123,13 +131,17 @@ describe('read-only retrieval and analytics', () => {
     await client.connect(clientTransport);
     try {
       const tools = await client.listTools();
-      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['catence_status', 'describe_dataset', 'read_series', 'query_read_only_data', 'search_context', 'get_ftp_history', 'get_vo2max_history', 'power_curve_trend', 'latest_cycling_activities', 'cycling_progress_report', 'hydrate_recent_strava_activities']));
+      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['catence_status', 'describe_dataset', 'read_series', 'query_read_only_data', 'search_context', 'get_ftp_history', 'get_vo2max_history', 'find_activities', 'power_curve_trend', 'latest_cycling_activities', 'cycling_progress_report', 'hydrate_recent_strava_activities']));
       const result = await client.callTool({ name: 'read_series', arguments: { dataset: 'daily_health', metrics: ['hrv_ms'], startDate: '2026-01-01', endDate: '2026-01-08', resolution: 'day' } });
       const payload = JSON.parse(((result as { content: Array<{ text: string }> }).content[0]).text) as { data: unknown[] };
       expect(payload.data).toHaveLength(8);
       const ftpResult = await client.callTool({ name: 'get_ftp_history', arguments: { sport: 'cycling' } });
       const ftpPayload = JSON.parse(((ftpResult as { content: Array<{ text: string }> }).content[0]).text) as { data: { preferredSeries: unknown[] } };
       expect(ftpPayload.data.preferredSeries).toHaveLength(1);
+      const datasetResult = await client.callTool({ name: 'describe_dataset', arguments: { dataset: 'training_metric_observations' } });
+      const datasetPayload = JSON.parse(((datasetResult as { content: Array<{ text: string }> }).content[0]).text) as { data: { dataset: { name: string }; coverage: { row_count: number } | null } };
+      expect(datasetPayload.data.dataset.name).toBe('training_metric_observations');
+      expect(datasetPayload.data.coverage?.row_count).toBeGreaterThan(0);
       const resource = await client.readResource({ uri: 'catence://summary/2026-01-01/2026-01-08' });
       expect(resource.contents[0]?.mimeType).toBe('application/json');
     } finally {
