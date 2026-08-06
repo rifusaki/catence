@@ -47,7 +47,7 @@ dev = [
 requires-dist = [
     { name = "duckdb", specifier = ">=1.4.0" },
     { name = "fitdecode", specifier = ">=0.10.0" },
-    { name = "garminconnect", editable = "../python-garminconnect" },
+    { name = "garminconnect", git = "https://github.com/rifusaki/python-garminconnect.git?rev=732bf14602bce2ca22cb569ba6583c3229bf904d" },
     { name = "polars", specifier = ">=1.0.0" },
     { name = "pyarrow", specifier = ">=18.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
@@ -319,41 +319,12 @@ wheels = [
 [[package]]
 name = "garminconnect"
 version = "0.3.8"
-source = { editable = "../python-garminconnect" }
+source = { git = "https://github.com/rifusaki/python-garminconnect.git?rev=732bf14602bce2ca22cb569ba6583c3229bf904d#732bf14602bce2ca22cb569ba6583c3229bf904d" }
 dependencies = [
     { name = "curl-cffi" },
     { name = "requests" },
     { name = "ua-generator" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "bandit", extras = ["toml"], marker = "extra == 'security'" },
-    { name = "black", extras = ["jupyter"], marker = "extra == 'linting'" },
-    { name = "codespell", marker = "extra == 'linting'" },
-    { name = "coverage", marker = "extra == 'testing'" },
-    { name = "curl-cffi", specifier = ">=0.15.0" },
-    { name = "ipdb", marker = "extra == 'dev'" },
-    { name = "ipykernel", marker = "extra == 'dev'" },
-    { name = "ipython", marker = "extra == 'dev'" },
-    { name = "isort", marker = "extra == 'linting'" },
-    { name = "matplotlib", marker = "extra == 'dev'" },
-    { name = "mypy", marker = "extra == 'linting'" },
-    { name = "pandas", marker = "extra == 'dev'" },
-    { name = "pip-audit", marker = "extra == 'security'" },
-    { name = "pre-commit", marker = "extra == 'linting'" },
-    { name = "pydantic", marker = "extra == 'typed'", specifier = ">=2.4.0" },
-    { name = "pydantic", marker = "extra == 'workout'", specifier = ">=2.4.0" },
-    { name = "pytest", marker = "extra == 'testing'" },
-    { name = "pytest-vcr", marker = "extra == 'testing'", specifier = ">=1.0.2" },
-    { name = "readchar", marker = "extra == 'example'" },
-    { name = "requests", specifier = ">=2.33.0" },
-    { name = "ruff", marker = "extra == 'linting'" },
-    { name = "types-requests", marker = "extra == 'linting'" },
-    { name = "ua-generator", specifier = ">=1.0" },
-    { name = "vcrpy", marker = "extra == 'testing'", specifier = ">=7.0.0" },
-]
-provides-extras = ["dev", "workout", "typed", "security", "linting", "testing", "example"]
 
 [[package]]
 name = "idna"
