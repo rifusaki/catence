@@ -26,6 +26,7 @@ type WorkerResult = {
   candidateCount?: number;
   rawHash?: string;
   matchEvidence?: Record<string, unknown>;
+  matchDiagnostics?: Record<string, unknown>;
   rateHeaders?: Record<string, string>;
 };
 
@@ -173,7 +174,40 @@ export async function syncStravaGear(paths: CatencePaths, refresh = true): Promi
   return runReadOperation(paths, 'gear', [], { type: 'gear', id: 'authenticated_athlete' }, refresh);
 }
 
-type ActivityMatch = { activity_source_id: string; activity_id: string; started_at_utc: string | Date | null; sport: string | null; distance_m: number | null; moving_s: number | null };
+type ActivityMatch = { activity_source_id: string; activity_id: string; provider: string; remote_activity_id: string; external_id: string | null; source_payload: string | Record<string, unknown> | null; started_at_utc: string | Date | null; sport: string | null; distance_m: number | null; moving_s: number | null };
+
+/** Returns a Strava activity ID only for formats that identify one directly. */
+export function stravaActivityIdFromExternalId(value: string | null | undefined): string | null {
+  const externalId = value?.trim();
+  if (!externalId) return null;
+  const match = externalId.match(/^strava:(\d+)$/i)
+    ?? externalId.match(/^https?:\/\/(?:www\.)?strava\.com\/activities\/(\d+)\/?$/i);
+  return match?.[1] ?? null;
+}
+
+function object(value: string | Record<string, unknown> | null): Record<string, unknown> {
+  if (value && typeof value === 'object') return value;
+  if (typeof value !== 'string') return {};
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+export function stravaActivityIdFromSourcePayload(value: string | Record<string, unknown> | null): string | null {
+  const stravaId = object(value).strava_id;
+  const candidate = typeof stravaId === 'number' ? String(stravaId) : typeof stravaId === 'string' ? stravaId.trim() : '';
+  return /^\d+$/.test(candidate) ? candidate : null;
+}
+
+/** Prefer a persisted Strava source over a generic provider external ID. */
+export function resolveStravaActivityId(activityId: string, matches: Array<{ provider: string; remote_activity_id: string; external_id: string | null }>): string | null {
+  return stravaActivityIdFromExternalId(activityId)
+    ?? matches.find((match) => match.provider === 'strava')?.remote_activity_id
+    ?? null;
+}
 
 export async function hydrateStravaActivity(paths: CatencePaths, activityId: string, refresh = false): Promise<WorkerResult | Record<string, unknown>> {
   return withDataWriteLock(paths, async () => {
@@ -181,20 +215,28 @@ export async function hydrateStravaActivity(paths: CatencePaths, activityId: str
     const database = await CatenceDatabase.open(paths);
     try {
       const matches = await database.rows<ActivityMatch>(`
-        SELECT source.activity_source_id, source.activity_id, activity.started_at_utc, activity.sport, summary.distance_m, summary.moving_s
+        SELECT source.activity_source_id, source.activity_id, source.provider, source.remote_activity_id, source.external_id, raw.payload_json AS source_payload, activity.started_at_utc, activity.sport, summary.distance_m, summary.moving_s
         FROM activity_sources source JOIN activities activity USING (activity_id)
         LEFT JOIN activity_summaries summary USING (activity_source_id)
-        WHERE source.activity_source_id = $activityId OR source.activity_id = $activityId
+        LEFT JOIN source_entities raw ON raw.provider = source.provider AND raw.entity_type = 'activity' AND raw.remote_id = source.remote_activity_id
+        LEFT JOIN activity_links link USING (activity_source_id)
+        WHERE source.activity_source_id = $activityId
+          OR source.activity_id = (SELECT activity_id FROM activity_sources WHERE activity_source_id = $activityId)
+          OR link.activity_id = (SELECT activity_id FROM activity_sources WHERE activity_source_id = $activityId)
         ORDER BY CASE source.provider WHEN 'garmin' THEN 0 WHEN 'intervals' THEN 1 ELSE 2 END
       `, { activityId });
       const activity = matches[0];
       if (!activity) throw new StravaEnrichmentError(`No Catence activity or activity source named ${activityId} exists.`);
+      const requestedSource = matches.find((match) => match.activity_source_id === activityId);
+      const sourceStravaActivityId = requestedSource ? stravaActivityIdFromSourcePayload(requestedSource.source_payload) : null;
+      const directStravaActivityId = sourceStravaActivityId ?? resolveStravaActivityId(activityId, matches);
+      const matchMethod = sourceStravaActivityId ? 'source_strava_id' : directStravaActivityId ? 'linked_strava_source' : null;
       const resource = { type: 'activity', id: activity.activity_source_id };
       if (!refresh) {
         const cached = await cachedState(database, resource.type, resource.id);
         if (cached) return cached;
       }
-      if (!activity.started_at_utc || !activity.sport || activity.distance_m === null || activity.moving_s === null) {
+      if (!directStravaActivityId && (!activity.started_at_utc || !activity.sport || activity.distance_m === null || activity.moving_s === null)) {
         throw new StravaEnrichmentError('This activity lacks the timestamp, sport, distance, or moving duration required for safe Strava matching.');
       }
       await checkBudget(database, paths);
@@ -204,10 +246,16 @@ export async function hydrateStravaActivity(paths: CatencePaths, activityId: str
       const resultPath = path.join(directory, `${runId}.result.json`);
       let result: WorkerResult;
       try {
+        const matchingArguments = [
+          ...(directStravaActivityId ? ['--strava-activity-id', directStravaActivityId] : []),
+          ...(matchMethod ? ['--strava-match-method', matchMethod] : []),
+          ...(activity.started_at_utc && activity.sport && activity.distance_m !== null && activity.moving_s !== null
+            ? ['--started-at', new Date(activity.started_at_utc).toISOString(), '--sport', activity.sport, '--distance-m', String(activity.distance_m), '--moving-s', String(activity.moving_s)]
+            : []),
+        ];
         result = await invokeWorker(paths, [
           '--mode', 'activity', '--run-id', runId, '--output', stagingPath,
-          '--activity-id', activity.activity_source_id, '--started-at', new Date(activity.started_at_utc).toISOString(),
-          '--sport', activity.sport, '--distance-m', String(activity.distance_m), '--moving-s', String(activity.moving_s),
+          '--activity-id', activity.activity_source_id, ...matchingArguments,
           ...(refresh ? ['--refresh'] : []),
         ], resultPath);
         if (existsSync(stagingPath)) await importJsonl(database, runId, stagingPath);

@@ -5,7 +5,7 @@ import stat
 from argparse import Namespace
 from pathlib import Path
 
-from python.catence.providers.strava.cli import SCOPES, StravaConnectionError, StravaReader, matches_activity, read_secret, stage_segment_history, write_secret
+from python.catence.providers.strava.cli import SCOPES, StravaConnectionError, StravaReader, matches_activity, read_secret, stage_activity, stage_segment_history, write_secret
 from python.catence.providers.strava.staging import StravaStagingWriter
 
 
@@ -66,6 +66,94 @@ def test_rate_header_capture_preserves_the_stravalib_limiter() -> None:
 
     assert reader.observed_headers == {"x-ratelimit-limit": "100,1000", "x-ratelimit-usage": "2,20"}
     assert delegated == [({"X-RateLimit-Limit": "100,1000", "x-ratelimit-usage": "2,20", "Content-Type": "application/json"}, "GET")]
+
+
+def test_activity_hydration_uses_the_provider_supplied_strava_id_directly(tmp_path: Path) -> None:
+    output = tmp_path / "stage.jsonl"
+    writer = StravaStagingWriter(tmp_path, output)
+    calls: list[tuple[str, str]] = []
+
+    class Reader:
+        observed_headers = {"x-ratelimit-limit": "100,1000"}
+
+        def get(self, endpoint: str, path: str, **_params: object) -> object:
+            calls.append((endpoint, path))
+            if endpoint == "activity_detail":
+                return {"id": 23408388054, "gear_id": "bike-1", "segment_efforts": []}
+            return {"id": "bike-1", "name": "Road bike"}
+
+    result = stage_activity(Reader(), writer, Namespace(activity_id="intervals:i162943791", strava_activity_id="23408388054", strava_match_method="source_strava_id", started_at=None, sport=None, distance_m=None, moving_s=None))
+
+    assert result["status"] == "completed"
+    assert result["matchEvidence"] == {"method": "source_strava_id", "stravaActivityId": "23408388054"}
+    assert calls == [("activity_detail", "/activities/23408388054"), ("gear", "/gear/bike-1")]
+
+
+def test_activity_hydration_falls_back_to_timestamp_matching_after_a_missing_strava_id(tmp_path: Path) -> None:
+    output = tmp_path / "stage.jsonl"
+    writer = StravaStagingWriter(tmp_path, output)
+    calls: list[tuple[str, str]] = []
+
+    class Reader:
+        observed_headers: dict[str, str] = {}
+
+        def get(self, endpoint: str, path: str, **_params: object) -> object:
+            calls.append((endpoint, path))
+            if path == "/activities/22995929424":
+                raise StravaConnectionError("Not Found: Record Not Found: []")
+            if endpoint == "activity_candidates":
+                return [{"id": 18635626846, "start_date": "2026-05-24T12:24:15Z", "sport_type": "Ride", "distance": 7_000, "moving_time": 670}]
+            return {"id": 18635626846, "segment_efforts": []}
+
+    result = stage_activity(Reader(), writer, Namespace(activity_id="intervals:i151098464", strava_activity_id="22995929424", strava_match_method="linked_strava_source", started_at="2026-05-24T12:24:15Z", sport="Ride", distance_m=7_000, moving_s=670))
+
+    assert result["status"] == "completed"
+    assert result["stravaActivityId"] == "18635626846"
+    assert calls == [("activity_detail", "/activities/22995929424"), ("activity_candidates", "/athlete/activities"), ("activity_detail", "/activities/18635626846")]
+
+
+def test_source_strava_id_does_not_fall_back_to_a_different_activity(tmp_path: Path) -> None:
+    writer = StravaStagingWriter(tmp_path, tmp_path / "stage.jsonl")
+
+    class Reader:
+        observed_headers: dict[str, str] = {}
+
+        def get(self, _endpoint: str, _path: str, **_params: object) -> object:
+            raise StravaConnectionError("Not Found: Record Not Found: []")
+
+    result = stage_activity(Reader(), writer, Namespace(activity_id="intervals:i151098464", strava_activity_id="18635626894", strava_match_method="source_strava_id", started_at="2026-05-24T13:00:57Z", sport="Ride", distance_m=21_064, moving_s=2_170))
+
+    assert result["status"] == "not_found"
+    assert result["stravaActivityId"] == "18635626894"
+
+
+def test_activity_hydration_reports_a_search_window_when_strava_returns_no_candidates(tmp_path: Path) -> None:
+    writer = StravaStagingWriter(tmp_path, tmp_path / "stage.jsonl")
+
+    class Reader:
+        observed_headers: dict[str, str] = {}
+
+        def get(self, endpoint: str, _path: str, **_params: object) -> object:
+            assert endpoint == "activity_candidates"
+            return []
+
+    result = stage_activity(Reader(), writer, Namespace(activity_id="garmin:1", strava_activity_id=None, strava_match_method=None, started_at="2026-05-24T13:00:57Z", sport="Ride", distance_m=21_064, moving_s=2_170))
+
+    assert result["status"] == "not_found"
+    assert result["candidateCount"] == 0
+    assert result["matchDiagnostics"] == {
+        "strategy": "time_sport_distance",
+        "searchWindow": {"startAt": "2026-05-24T12:59:27Z", "endAt": "2026-05-24T13:02:27Z"},
+        "returnedCandidateCount": 0,
+        "qualifiedCandidateCount": 0,
+        "rejectionCounts": {},
+        "directLookupUnavailable": False,
+        "likelyReasons": [
+            "Strava returned no activities in the exact ±90-second search window.",
+            "Confirm that Catence is connected to the same Strava athlete and that activity:read_all access includes the activity.",
+            "A private, deleted, or differently timestamped Strava activity cannot be matched from this result.",
+        ],
+    }
 
 
 def test_scope_set_is_the_minimum_requested_for_targeted_enrichment() -> None:

@@ -5,6 +5,7 @@
       "tools": {
         "*": { "requests": 60, "windowSeconds": 60 },
         "hydrate_strava_activity": { "requests": 6, "windowSeconds": 60 },
+        "hydrate_recent_strava_activities": { "requests": 1, "windowSeconds": 60 },
         "hydrate_strava_segment_history": { "requests": 4, "windowSeconds": 60 }
       },
       "resources": {

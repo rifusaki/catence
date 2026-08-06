@@ -31,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--code")
     parser.add_argument("--redirect-uri", default="http://localhost")
     parser.add_argument("--activity-id")
+    parser.add_argument("--strava-activity-id")
+    parser.add_argument("--strava-match-method")
     parser.add_argument("--started-at")
     parser.add_argument("--sport")
     parser.add_argument("--distance-m", type=float)
@@ -104,29 +106,53 @@ def is_virtual_or_indoor(value: Any) -> bool:
     return isinstance(value, str) and ("virtual" in value.lower() or "indoor" in value.lower())
 
 
-def matches_activity(candidate: dict[str, Any], started_at: str, sport: str | None, distance_m: float | None, moving_s: float | None) -> tuple[bool, dict[str, float]]:
+def is_not_found(error: Exception) -> bool:
+    message = str(error).lower()
+    return "404" in message or "not found" in message or "record not found" in message
+
+
+def matches_activity(candidate: dict[str, Any], started_at: str, sport: str | None, distance_m: float | None, moving_s: float | None) -> tuple[bool, dict[str, Any]]:
     candidate_start = timestamp(candidate.get("start_date"))
     requested_start = timestamp(started_at)
     candidate_distance = candidate.get("distance")
     candidate_moving = candidate.get("moving_time")
+    requested_sport = sport_family(sport)
+    candidate_sport = sport_family(candidate.get("sport_type") or candidate.get("type"))
+    evidence: dict[str, Any] = {
+        "requestedSportFamily": requested_sport,
+        "candidateSportFamily": candidate_sport,
+        "candidateVirtualOrIndoor": is_virtual_or_indoor(candidate.get("sport_type") or candidate.get("type")),
+        "rejectionReasons": [],
+    }
     if requested_start is None or candidate_start is None or not isinstance(candidate_distance, (int, float)) or not isinstance(candidate_moving, (int, float)):
-        return False, {}
-    if sport_family(candidate.get("sport_type") or candidate.get("type")) != sport_family(sport):
-        return False, {}
-    if is_virtual_or_indoor(candidate.get("sport_type") or candidate.get("type")) != is_virtual_or_indoor(sport):
-        return False, {}
+        evidence["rejectionReasons"] = ["candidate_missing_required_fields"]
+        return False, evidence
     if distance_m is None or moving_s is None:
-        return False, {}
+        evidence["rejectionReasons"] = ["catence_activity_missing_required_fields"]
+        return False, evidence
     start_delta = abs(requested_start - candidate_start)
     duration_delta = abs(moving_s - float(candidate_moving))
     distance_delta = abs(distance_m - float(candidate_distance))
     duration_limit = max(120.0, moving_s * 0.05)
     distance_limit = max(200.0, distance_m * 0.025)
-    return start_delta <= 90 and duration_delta <= duration_limit and distance_delta <= distance_limit, {
+    evidence.update({
         "startDeltaSeconds": start_delta, "durationDeltaSeconds": duration_delta,
         "distanceDeltaMeters": distance_delta, "durationLimitSeconds": duration_limit,
         "distanceLimitMeters": distance_limit,
-    }
+    })
+    reasons: list[str] = []
+    if candidate_sport != requested_sport:
+        reasons.append("sport_family_mismatch")
+    if is_virtual_or_indoor(candidate.get("sport_type") or candidate.get("type")) != is_virtual_or_indoor(sport):
+        reasons.append("virtual_or_indoor_mismatch")
+    if start_delta > 90:
+        reasons.append("start_time_outside_90_second_window")
+    if duration_delta > duration_limit:
+        reasons.append("moving_duration_outside_tolerance")
+    if distance_delta > distance_limit:
+        reasons.append("distance_outside_tolerance")
+    evidence["rejectionReasons"] = reasons
+    return not reasons, evidence
 
 
 class StravaReader:
@@ -221,6 +247,37 @@ def stage_gear(reader: StravaReader, writer: StravaStagingWriter) -> dict[str, A
 
 
 def stage_activity(reader: StravaReader, writer: StravaStagingWriter, args: argparse.Namespace) -> dict[str, Any]:
+    direct_lookup_unavailable = False
+    if args.strava_activity_id:
+        remote_id = str(args.strava_activity_id)
+        match_method = args.strava_match_method or "strong_strava_id"
+        try:
+            detail = object_value(reader.get("activity_detail", f"/activities/{remote_id}", include_all_efforts="true"))
+            if str(detail.get("id")) != remote_id:
+                raise StravaConnectionError("Strava returned an activity whose ID did not match Catence's provider-supplied Strava ID.")
+            detail_hash = writer.archive_json("activity_detail", remote_id, detail, {"activitySourceId": args.activity_id, "includeAllEfforts": True, "matchMethod": match_method})
+            writer.source_entity("activity", remote_id, detail, detail_hash)
+            gear_id = detail.get("gear_id")
+            if isinstance(gear_id, (str, int)) and str(gear_id):
+                gear = object_value(reader.get("gear", f"/gear/{gear_id}"))
+                gear_hash = writer.archive_json("gear", str(gear_id), gear, {"activityId": remote_id})
+                writer.source_entity("gear", str(gear_id), gear, gear_hash)
+            return {"status": "completed", "stravaActivityId": remote_id, "rawHash": detail_hash, "matchEvidence": {"method": match_method, "stravaActivityId": remote_id}, "rateHeaders": reader.observed_headers}
+        except Exception as error:
+            if match_method == "source_strava_id" and is_not_found(error):
+                return {
+                    "status": "not_found", "stravaActivityId": remote_id,
+                    "message": "The source's archived Strava activity ID is not available to the authenticated Strava account.",
+                    "matchEvidence": {"method": match_method, "stravaActivityId": remote_id},
+                    "matchDiagnostics": {
+                        "strategy": "direct_strava_activity_id",
+                        "likelyReasons": ["The activity is unavailable to the authenticated Strava account.", "Confirm the connected athlete and that the activity has not been deleted or made inaccessible."],
+                    },
+                    "rateHeaders": reader.observed_headers,
+                }
+            if not is_not_found(error):
+                raise
+            direct_lookup_unavailable = True
     if not args.started_at or not args.sport or args.distance_m is None or args.moving_s is None:
         raise StravaConnectionError("Activity hydration requires a start time, sport, distance, and moving duration from the Catence activity.")
     start = timestamp(args.started_at)
@@ -230,15 +287,42 @@ def stage_activity(reader: StravaReader, writer: StravaStagingWriter, args: argp
     if not isinstance(candidates, list):
         candidates = []
     candidates_hash = writer.archive_json("activity_candidates", args.activity_id, candidates, {"activitySourceId": args.activity_id})
-    qualified: list[tuple[dict[str, Any], dict[str, float]]] = []
+    qualified: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    rejection_counts: dict[str, int] = {}
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
         accepted, evidence = matches_activity(candidate, args.started_at, args.sport, args.distance_m, args.moving_s)
         if accepted:
             qualified.append((candidate, evidence))
+        else:
+            for reason in evidence.get("rejectionReasons", []):
+                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
     if len(qualified) != 1:
-        return {"status": "not_found" if not qualified else "ambiguous", "candidateCount": len(qualified), "candidatesRawHash": candidates_hash, "rateHeaders": reader.observed_headers}
+        search_start = datetime.fromtimestamp(start - 90, timezone.utc).isoformat().replace("+00:00", "Z")
+        search_end = datetime.fromtimestamp(start + 90, timezone.utc).isoformat().replace("+00:00", "Z")
+        if not candidates:
+            likely_reasons = [
+                "Strava returned no activities in the exact ±90-second search window.",
+                "Confirm that Catence is connected to the same Strava athlete and that activity:read_all access includes the activity.",
+                "A private, deleted, or differently timestamped Strava activity cannot be matched from this result.",
+            ]
+        elif not qualified:
+            likely_reasons = ["Strava returned activities, but none met Catence's safe sport, indoor/virtual, time, duration, and distance tolerances."]
+        else:
+            likely_reasons = ["More than one Strava activity met the safe matching tolerances; Catence will not choose one automatically."]
+        return {
+            "status": "not_found" if not qualified else "ambiguous", "candidateCount": len(qualified),
+            "candidatesRawHash": candidates_hash,
+            "matchDiagnostics": {
+                "strategy": "time_sport_distance",
+                "searchWindow": {"startAt": search_start, "endAt": search_end},
+                "returnedCandidateCount": len(candidates), "qualifiedCandidateCount": len(qualified),
+                "rejectionCounts": rejection_counts, "directLookupUnavailable": direct_lookup_unavailable,
+                "likelyReasons": likely_reasons,
+            },
+            "rateHeaders": reader.observed_headers,
+        }
     selected, evidence = qualified[0]
     remote_id = str(selected["id"])
     detail = object_value(reader.get("activity_detail", f"/activities/{remote_id}", include_all_efforts="true"))
