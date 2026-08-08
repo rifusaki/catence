@@ -30,10 +30,10 @@ program.command('sync')
 program.command('backfill')
   .requiredOption('--from <date>', 'ISO date at which to begin backfill')
   .option('--provider <provider>', 'intervals, garmin, strava, or all', 'all')
-  .option('--refresh', 're-fetch Garmin activity details, files, and streams even when summaries are unchanged')
+  .option('--refresh', 're-fetch and upsert data already covered by the requested range (including Garmin activity details, files, and streams)')
   .action(async (options: { provider: ProviderChoice; from: string; refresh?: boolean }) => {
     if (!['intervals', 'garmin', 'strava', 'all'].includes(options.provider)) throw new Error('--provider must be intervals, garmin, strava, or all.');
-    process.stdout.write(`${JSON.stringify(await syncData(currentPaths(), options.provider, options.from, false, options.refresh ?? false), null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(await syncData(currentPaths(), options.provider, options.from, false, options.refresh ?? false, true), null, 2)}\n`);
   });
 
 program.command('retry')

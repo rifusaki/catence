@@ -114,11 +114,26 @@ only after their shared service methods and fixture tests exist.
 ## Implemented fitness and hydration endpoints
 
 - `describe_dataset(dataset)` returns one cataloged schema and its coverage. `training_metric_observations` also reports its observed sports, metric names, units, and source types.
-- `get_ftp_history`, `get_vo2max_history`, and `power_curve_trend` read normalized, source-aware fitness facts. They do not scrape JSON payloads or rely on curve-array positions. `get_vo2max_history` does not default to cycling: omission returns available sports and requires an explicit choice; Garmin running VO₂max may be labelled `generic`.
+- `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, and `power_coverage_report` read normalized, source-aware fitness facts. Power tools require an explicit sport or sport family, use `power_bests`/`power_best_facts` for FIT-derived duration values, and do not treat sparse `avg_power` summaries as coverage. `get_vo2max_history` does not default to cycling: omission returns available sports and requires an explicit choice; Garmin running VO₂max may be labelled `generic`.
 - `find_activities` is implemented for compact, canonical, paginated activity/race discovery by sport, distance, name, and date. Its race flags are transparent heuristics, not provider-confirmed race metadata.
 - `latest_cycling_activities` returns Garmin source records to avoid silently double-counting linked Intervals summaries; optional multisport parents are explicitly flagged.
 - `cycling_progress_report` composes the preceding read-only outputs with monthly canonical volume/load. It is descriptive, not a physiological model.
 - `hydrate_recent_strava_activities` accepts an explicit list or a bounded date/sport window and awaits each write in sequence. Its unmatched output includes the exact Strava search window and safe-match rejection diagnostics.
+
+### Power investigation procedure
+
+For a question about running or cycling power, do not begin with
+`canonical_activities.avg_power`: it is an activity-summary field and can be
+null even when the FIT stream has power. Instead:
+
+1. Call `describe_dataset` for `power_bests` and use `power_coverage_report`
+   with an explicit `sport` or `sportFamily` to establish coverage and every
+   available duration.
+2. Use `power_curve_trend` with the same selector and
+   `sourceQuality: "garmin_fit_derived"` for comparable monthly curve bests.
+3. Inspect `activity_samples` only for a selected `activity_source_id` when a
+   specific extreme needs validation. Raw sample reads are paginated and are
+   not evidence that the global power dataset is absent.
 
 ### `list_recent_activities`
 

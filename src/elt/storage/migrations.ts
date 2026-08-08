@@ -424,5 +424,83 @@ const garminUtcActivityTimestampMigration: Migration = {
   `,
 };
 
-export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration];
+const garminLactateThresholdMetricsMigration: Migration = {
+  version: 12,
+  name: 'garmin_lactate_threshold_training_metrics',
+  sql: `
+    WITH source AS (
+      SELECT remote_id, raw_object_hash,
+        try_cast(
+          CASE WHEN regexp_matches(coalesce(json_extract_string(payload_json, '$.power.calendarDate'), ''), '(Z|[+-][0-9]{2}:?[0-9]{2})$')
+            THEN replace(json_extract_string(payload_json, '$.power.calendarDate'), ' ', 'T')
+            ELSE replace(json_extract_string(payload_json, '$.power.calendarDate'), ' ', 'T') || 'Z'
+          END AS TIMESTAMPTZ
+        ) AS power_observed_at,
+        try_cast(
+          CASE WHEN regexp_matches(coalesce(json_extract_string(payload_json, '$.speed_and_heart_rate.calendarDate'), ''), '(Z|[+-][0-9]{2}:?[0-9]{2})$')
+            THEN replace(json_extract_string(payload_json, '$.speed_and_heart_rate.calendarDate'), ' ', 'T')
+            ELSE replace(json_extract_string(payload_json, '$.speed_and_heart_rate.calendarDate'), ' ', 'T') || 'Z'
+          END AS TIMESTAMPTZ
+        ) AS heart_rate_observed_at,
+        try_cast(json_extract_string(payload_json, '$.power.functionalThresholdPower') AS DOUBLE) AS running_power_w,
+        try_cast(json_extract_string(payload_json, '$.power.powerToWeight') AS DOUBLE) AS running_power_w_kg,
+        try_cast(json_extract_string(payload_json, '$.speed_and_heart_rate.speed') AS DOUBLE) AS running_pace_encoding,
+        try_cast(json_extract_string(payload_json, '$.speed_and_heart_rate.heartRate') AS DOUBLE) AS running_heart_rate_bpm,
+        try_cast(json_extract_string(payload_json, '$.speed_and_heart_rate.heartRateCycling') AS DOUBLE) AS cycling_heart_rate_bpm,
+        json_extract_string(payload_json, '$.power.origin') AS origin,
+        try_cast(json_extract_string(payload_json, '$.power.isStale') AS BOOLEAN) AS is_stale,
+        try_cast(json_extract_string(payload_json, '$.power.weight') AS DOUBLE) AS weight_kg,
+        json_extract_string(payload_json, '$.power.ftpCreateTime') AS ftp_create_time,
+        json_extract_string(payload_json, '$.power.weightCreateTime') AS weight_create_time
+      FROM source_entities
+      WHERE provider = 'garmin' AND entity_type = 'lactate_threshold'
+    ), observations AS (
+      SELECT 'garmin:lactate_threshold:' || remote_id || ':running_power' AS observation_id,
+        'running_lactate_threshold_power_w' AS metric_name, 'running' AS sport,
+        coalesce(power_observed_at, heart_rate_observed_at) AS observed_at, running_power_w AS value_number,
+        'W' AS unit, json_object('origin', origin, 'isStale', is_stale, 'weightKg', weight_kg,
+          'powerToWeight', running_power_w_kg, 'ftpCreateTime', ftp_create_time, 'weightCreateTime', weight_create_time) AS dimensions_json,
+        remote_id, raw_object_hash
+      FROM source
+      UNION ALL
+      SELECT 'garmin:lactate_threshold:' || remote_id || ':running_power_to_weight',
+        'running_lactate_threshold_power_w_kg', 'running', coalesce(power_observed_at, heart_rate_observed_at), running_power_w_kg,
+        'W/kg', json_object('origin', origin, 'isStale', is_stale, 'weightKg', weight_kg,
+          'powerToWeight', running_power_w_kg, 'ftpCreateTime', ftp_create_time, 'weightCreateTime', weight_create_time),
+        remote_id, raw_object_hash
+      FROM source
+      UNION ALL
+      SELECT 'garmin:lactate_threshold:' || remote_id || ':running_pace',
+        'running_lactate_threshold_pace_s_per_km', 'running', coalesce(heart_rate_observed_at, power_observed_at), running_pace_encoding * 600,
+        's/km', json_object('rawPaceEncoding', running_pace_encoding), remote_id, raw_object_hash
+      FROM source
+      UNION ALL
+      SELECT 'garmin:lactate_threshold:' || remote_id || ':running_heart_rate',
+        'running_lactate_threshold_hr_bpm', 'running', coalesce(heart_rate_observed_at, power_observed_at), running_heart_rate_bpm,
+        'bpm', json('{}'), remote_id, raw_object_hash
+      FROM source
+      UNION ALL
+      SELECT 'garmin:lactate_threshold:' || remote_id || ':cycling_heart_rate',
+        'cycling_lactate_threshold_hr_bpm', 'cycling', coalesce(heart_rate_observed_at, power_observed_at), cycling_heart_rate_bpm,
+        'bpm', json('{}'), remote_id, raw_object_hash
+      FROM source
+    )
+    INSERT INTO training_metric_observations
+      (observation_id, provider, metric_name, sport, observed_at, value_number, value_text, unit, device_id, dimensions_json, source_type, source_remote_id, activity_source_id, raw_object_hash)
+    SELECT observation_id, 'garmin', metric_name, sport, observed_at, value_number, NULL, unit, NULL, dimensions_json,
+      'lactate_threshold', remote_id, NULL, raw_object_hash
+    FROM observations
+    WHERE observed_at IS NOT NULL AND value_number IS NOT NULL
+    ON CONFLICT (observation_id) DO UPDATE SET
+      sport = excluded.sport, observed_at = excluded.observed_at, value_number = excluded.value_number,
+      value_text = excluded.value_text, unit = excluded.unit, device_id = excluded.device_id,
+      dimensions_json = excluded.dimensions_json, source_type = excluded.source_type,
+      source_remote_id = excluded.source_remote_id, activity_source_id = excluded.activity_source_id,
+      raw_object_hash = excluded.raw_object_hash;
+
+    UPDATE retrieval_index_state SET status = 'stale' WHERE index_name = 'context';
+  `,
+};
+
+export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration];
 export type { Migration };

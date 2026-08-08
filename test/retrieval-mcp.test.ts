@@ -31,6 +31,10 @@ async function fixture() {
     payload: { activityId: 'garmin-ride-1', startTimeGMT: '2026-01-07T10:00:00Z', activityType: 'road_biking', activityName: 'Road ride', distance: 42_000, duration: 6_300, maxFtp: 250 }, extension: {},
   });
   await importRecord(setup.database, runId, {
+    kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity', remoteId: 'garmin-run-1', parentRemoteId: null, occurredOn: '2026-01-06', sourceUpdatedAt: null, rawObjectHash: 'garmin-run-raw',
+    payload: { activityId: 'garmin-run-1', startTimeGMT: '2026-01-06T10:00:00Z', activityType: { typeKey: 'trail_running' }, activityName: 'Trail run', distance: 15_000, duration: 5_400 }, extension: {},
+  });
+  await importRecord(setup.database, runId, {
     kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'functional_threshold_power', remoteId: 'cycling:2026-01-08', parentRemoteId: null, occurredOn: '2026-01-08', sourceUpdatedAt: null, rawObjectHash: 'ftp-raw',
     payload: { sport: 'CYCLING', calendarDate: '2026-01-08', functionalThresholdPower: 255 }, extension: {},
   });
@@ -42,6 +46,12 @@ async function fixture() {
     await importRecord(setup.database, runId, {
       kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity_power_best', remoteId: `power-${durationSeconds}`, parentRemoteId: 'garmin-ride-1', occurredOn: '2026-01-07', sourceUpdatedAt: null, rawObjectHash: `power-${durationSeconds}`,
       payload: { durationSeconds, bestPowerWatts }, extension: {},
+    });
+  }
+  for (const [durationSeconds, bestPowerWatts] of [[5, 390], [300, 270]] as const) {
+    await importRecord(setup.database, runId, {
+      kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity_power_best', remoteId: `run-power-${durationSeconds}`, parentRemoteId: 'garmin-run-1', occurredOn: '2026-01-06', sourceUpdatedAt: null, rawObjectHash: `run-power-${durationSeconds}`,
+      payload: { durationSeconds, bestPowerWatts, sourceType: 'garmin_fit_derived' }, extension: {},
     });
   }
   const samples: ActivitySample[] = Array.from({ length: 1_001 }, (_, index) => ({
@@ -97,7 +107,16 @@ describe('read-only retrieval and analytics', () => {
       expect(await fitness.vo2MaxHistory()).toEqual(expect.objectContaining({ data: expect.objectContaining({ availableSports: expect.arrayContaining([expect.objectContaining({ sport: 'cycling', latest: 55.2 })]), actionRequired: 'Choose a sport explicitly.' }) }));
       expect(await fitness.vo2MaxHistory({ sport: 'cycling' })).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ value_number: 55.2 })]) }));
       expect(await fitness.vo2MaxHistory({ sport: 'generic' })).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ value_number: 58.5 })]) }));
-      expect(await fitness.powerCurveTrend({ durations: [5, 300] })).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ durationLabel: '5 s' })]) }));
+      await expect(fitness.powerCurveTrend({ durations: [5, 300] })).rejects.toThrow('require an explicit sport or sportFamily');
+      expect(await fitness.powerCurveTrend({ sportFamily: 'running', durations: [5, 300], sourceQuality: 'garmin_fit_derived' })).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ durationLabel: '5 s', sport: 'trail_running' })]) }));
+      expect(await fitness.powerCoverageReport({ sportFamily: 'running' })).toEqual(expect.objectContaining({
+        data: expect.objectContaining({
+          activityCoverage: [expect.objectContaining({ sport: 'trail_running', activities: 1, powered_activities: 1, datapoints: 2 })],
+          durationInventory: expect.arrayContaining([expect.objectContaining({ durationLabel: '5 s', datapoints: 1, min_power_w: 390, max_power_w: 390 })]),
+        }),
+      }));
+      expect(await queryReadOnlyData(repository, { sql: "SELECT avg_power FROM activity_summary_facts WHERE activity_source_id = 'garmin:garmin-run-1'" }))
+        .toEqual(expect.objectContaining({ data: [{ avg_power: null }] }));
       expect(await fitness.latestCyclingActivities()).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ activity_source_id: 'garmin:garmin-ride-1' })]) }));
       expect(await fitness.cyclingProgressReport()).toEqual(expect.objectContaining({ data: expect.objectContaining({ monthlyVolume: expect.any(Array) }) }));
       const activities = await new ActivityDiscoveryService(repository).findActivities({ sports: ['road_biking'], distanceKm: [40, 45] });
@@ -131,7 +150,7 @@ describe('read-only retrieval and analytics', () => {
     await client.connect(clientTransport);
     try {
       const tools = await client.listTools();
-      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['catence_status', 'describe_dataset', 'read_series', 'query_read_only_data', 'search_context', 'get_ftp_history', 'get_vo2max_history', 'find_activities', 'power_curve_trend', 'latest_cycling_activities', 'cycling_progress_report', 'hydrate_recent_strava_activities']));
+      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['catence_status', 'describe_dataset', 'read_series', 'query_read_only_data', 'search_context', 'get_ftp_history', 'get_vo2max_history', 'find_activities', 'power_curve_trend', 'power_coverage_report', 'latest_cycling_activities', 'cycling_progress_report', 'hydrate_recent_strava_activities']));
       const result = await client.callTool({ name: 'read_series', arguments: { dataset: 'daily_health', metrics: ['hrv_ms'], startDate: '2026-01-01', endDate: '2026-01-08', resolution: 'day' } });
       const payload = JSON.parse(((result as { content: Array<{ text: string }> }).content[0]).text) as { data: unknown[] };
       expect(payload.data).toHaveLength(8);

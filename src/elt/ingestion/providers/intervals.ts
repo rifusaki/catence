@@ -60,16 +60,20 @@ export class IntervalsExtractor {
     this.client = new IntervalsClient({ apiKey, athleteId, maxRetries: 3 });
   }
 
-  async sync(runId: string, dailyFromDate: string, activityFromDate: string, toDate: string): Promise<void> {
+  async sync(runId: string, activityWindow: { fromDate: string; toDate: string } | null, includeAccount = true): Promise<void> {
     assertReadOnlyRegistry();
-    const athlete = await this.capture(runId, 'athlete', null, {}, async () => this.client.athletes.getAthlete());
-    const athletePayload = asObject(athlete);
-    const resolvedAthleteId = typeof athletePayload.id === 'string' ? athletePayload.id : this.athleteId;
-    await this.database.insertSourceAccount('intervals', resolvedAthleteId, typeof athletePayload.name === 'string' ? athletePayload.name : null, athletePayload);
+    let resolvedAthleteId = this.athleteId;
+    if (includeAccount) {
+      const athlete = await this.capture(runId, 'athlete', null, {}, async () => this.client.athletes.getAthlete());
+      const athletePayload = asObject(athlete);
+      resolvedAthleteId = typeof athletePayload.id === 'string' ? athletePayload.id : this.athleteId;
+      await this.database.insertSourceAccount('intervals', resolvedAthleteId, typeof athletePayload.name === 'string' ? athletePayload.name : null, athletePayload);
+    }
 
     for (const endpoint of intervalsSecondaryReadRegistry) {
       if (endpoint.name === 'athlete') continue;
-      const fromDate = endpoint.name === 'activities' ? activityFromDate : dailyFromDate;
+      if (!activityWindow) continue;
+      const { fromDate, toDate } = activityWindow;
       const payload = await this.capture(runId, endpoint.name, null, { fromDate, toDate }, async () => this.getCollection(endpoint.name, resolvedAthleteId, fromDate, toDate));
       if (payload === undefined) continue;
       await this.importEntities(endpoint.entityType, endpoint.name, payload, null, runId);

@@ -182,9 +182,15 @@ export function createCatenceMcpServer(paths = resolvePaths()): McpServer {
 
   server.registerTool('power_curve_trend', {
     title: 'Read labelled power-curve trends',
-    description: 'Return monthly bests for selected power durations, including the supporting activity and source type. Read-only.',
-    inputSchema: { sport: z.string().min(1).optional(), durations: z.array(z.number().int().min(1).max(86_400)).min(1).max(12).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional(), sourceQuality: z.enum(['all', 'garmin_fit_derived']).optional() },
+    description: 'Return monthly bests for selected power durations from an explicit sport or sport family, including the supporting activity and source type. Read-only.',
+    inputSchema: { sport: z.string().min(1).optional(), sportFamily: z.enum(['cycling', 'running']).optional(), durations: z.array(z.number().int().min(1).max(86_400)).min(1).max(12).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional(), sourceQuality: z.enum(['all', 'garmin_fit_derived']).optional() },
   }, tool('power_curve_trend', async (input) => useRepository(paths, (repository) => new FitnessService(repository).powerCurveTrend(input))));
+
+  server.registerTool('power_coverage_report', {
+    title: 'Inspect FIT-derived power coverage',
+    description: 'Report powered activities and the complete duration-best inventory for an explicit sport or sport family. Uses Garmin FIT-derived power, not sparse activity summaries. Read-only.',
+    inputSchema: { sport: z.string().min(1).optional(), sportFamily: z.enum(['cycling', 'running']).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional(), sourceQuality: z.enum(['all', 'garmin_fit_derived']).optional() },
+  }, tool('power_coverage_report', async (input) => useRepository(paths, (repository) => new FitnessService(repository).powerCoverageReport(input))));
 
   server.registerTool('latest_cycling_activities', {
     title: 'List latest cycling activities',

@@ -210,6 +210,7 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
   if (entity.entityType === 'wellness' || entity.entityType === 'daily_health') await importDailyMetrics(database, entity.provider, entity.remoteId, entity.occurredOn, payload, rawHash);
   if (entity.entityType === 'nutrition_day' || entity.entityType === 'nutrition_log') await importNutrition(database, entity.provider, entity.occurredOn, entity.remoteId, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'training_metric') await importGarminCyclingFtp(database, entity.remoteId, payload, rawHash);
+  if (entity.provider === 'garmin' && entity.entityType === 'lactate_threshold') await importGarminLactateThreshold(database, entity.remoteId, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'functional_threshold_power') await importGarminCyclingFtpHistory(database, entity.remoteId, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'max_metric') await importGarminMaxMetrics(database, entity.remoteId, entity.occurredOn, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'fitness_age') await importGarminFitnessAge(database, entity.remoteId, entity.occurredOn, payload, rawHash);
@@ -316,6 +317,56 @@ async function importGarminCyclingFtpHistory(database: CatenceDatabase, remoteId
     observationId: `garmin:cycling_ftp:history:${remoteId}`,
     metricName: 'cycling_ftp_w', sport: 'cycling', observedAt: `${observedAt}T00:00:00Z`, value,
     sourceType: 'cycling_ftp_history', sourceRemoteId: remoteId, activitySourceId: null, rawHash,
+  });
+}
+
+function thresholdObservedAt(payload: JsonObject): string | null {
+  return garminUtcTimestamp(firstString(payload, ['calendarDate', 'ftpCreateTime', 'weightCreateTime']));
+}
+
+async function importGarminLactateThreshold(database: CatenceDatabase, remoteId: string, payload: JsonObject, rawHash: string | null): Promise<void> {
+  const speedAndHeartRate = nested(payload, 'speed_and_heart_rate');
+  const power = nested(payload, 'power');
+  const runningObservedAt = thresholdObservedAt(power) ?? thresholdObservedAt(speedAndHeartRate);
+  const heartRateObservedAt = thresholdObservedAt(speedAndHeartRate) ?? runningObservedAt;
+  const powerDimensions: JsonObject = {
+    origin: firstString(power, ['origin']),
+    isStale: typeof power.isStale === 'boolean' ? power.isStale : null,
+    weightKg: firstNumber(power, ['weight']),
+    powerToWeight: firstNumber(power, ['powerToWeight']),
+    ftpCreateTime: firstString(power, ['ftpCreateTime']),
+    weightCreateTime: firstString(power, ['weightCreateTime']),
+  };
+  const sourceType = 'lactate_threshold';
+  const runningPower = firstNumber(power, ['functionalThresholdPower', 'value']);
+  if (runningObservedAt && runningPower !== null) await upsertTrainingMetricObservation(database, {
+    observationId: `garmin:lactate_threshold:${remoteId}:running_power`, metricName: 'running_lactate_threshold_power_w', sport: 'running',
+    observedAt: runningObservedAt, value: runningPower, unit: 'W', dimensions: powerDimensions,
+    sourceType, sourceRemoteId: remoteId, activitySourceId: null, rawHash,
+  });
+  const powerToWeight = firstNumber(power, ['powerToWeight']);
+  if (runningObservedAt && powerToWeight !== null) await upsertTrainingMetricObservation(database, {
+    observationId: `garmin:lactate_threshold:${remoteId}:running_power_to_weight`, metricName: 'running_lactate_threshold_power_w_kg', sport: 'running',
+    observedAt: runningObservedAt, value: powerToWeight, unit: 'W/kg', dimensions: powerDimensions,
+    sourceType, sourceRemoteId: remoteId, activitySourceId: null, rawHash,
+  });
+  const paceEncoding = firstNumber(speedAndHeartRate, ['speed']);
+  // Garmin's threshold endpoint names this field `speed`, but its value is
+  // minutes per 100 m (for example 0.4222 represents 4:13/km).
+  if (heartRateObservedAt && paceEncoding !== null && paceEncoding > 0) await upsertTrainingMetricObservation(database, {
+    observationId: `garmin:lactate_threshold:${remoteId}:running_pace`, metricName: 'running_lactate_threshold_pace_s_per_km', sport: 'running',
+    observedAt: heartRateObservedAt, value: paceEncoding * 600, unit: 's/km', dimensions: { rawPaceEncoding: paceEncoding },
+    sourceType, sourceRemoteId: remoteId, activitySourceId: null, rawHash,
+  });
+  const runningHeartRate = firstNumber(speedAndHeartRate, ['heartRate', 'hearRate']);
+  if (heartRateObservedAt && runningHeartRate !== null) await upsertTrainingMetricObservation(database, {
+    observationId: `garmin:lactate_threshold:${remoteId}:running_heart_rate`, metricName: 'running_lactate_threshold_hr_bpm', sport: 'running',
+    observedAt: heartRateObservedAt, value: runningHeartRate, unit: 'bpm', sourceType, sourceRemoteId: remoteId, activitySourceId: null, rawHash,
+  });
+  const cyclingHeartRate = firstNumber(speedAndHeartRate, ['heartRateCycling']);
+  if (heartRateObservedAt && cyclingHeartRate !== null) await upsertTrainingMetricObservation(database, {
+    observationId: `garmin:lactate_threshold:${remoteId}:cycling_heart_rate`, metricName: 'cycling_lactate_threshold_hr_bpm', sport: 'cycling',
+    observedAt: heartRateObservedAt, value: cyclingHeartRate, unit: 'bpm', sourceType, sourceRemoteId: remoteId, activitySourceId: null, rawHash,
   });
 }
 

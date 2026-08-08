@@ -19,9 +19,19 @@ export type Vo2MaxHistoryRequest = FitnessDateRange & {
   sport?: string;
 };
 
-export type PowerCurveTrendRequest = FitnessDateRange & {
+export type PowerSportFamily = 'cycling' | 'running';
+
+type PowerSportSelection = {
   sport?: string;
+  sportFamily?: PowerSportFamily;
+};
+
+export type PowerCurveTrendRequest = FitnessDateRange & PowerSportSelection & {
   durations?: number[];
+  sourceQuality?: 'all' | 'garmin_fit_derived';
+};
+
+export type PowerCoverageReportRequest = FitnessDateRange & PowerSportSelection & {
   sourceQuality?: 'all' | 'garmin_fit_derived';
 };
 
@@ -92,6 +102,17 @@ function cyclingSportClause(column: string, sport: string | undefined, values: Q
   if (!sport || sport.toLowerCase() === 'cycling') return `lower(${column}) IN (${CYCLING_SPORTS.map((item) => `'${item}'`).join(', ')})`;
   values.sport = sport;
   return `lower(${column}) = lower($sport)`;
+}
+
+function powerSportClause(column: string, selection: PowerSportSelection, values: QueryValues): string {
+  if (selection.sport && selection.sportFamily) throw new QueryValidationError('Choose either sport or sportFamily, not both.');
+  if (selection.sport) {
+    values.sport = selection.sport;
+    return `lower(${column}) = lower($sport)`;
+  }
+  if (selection.sportFamily === 'cycling') return `lower(${column}) IN (${CYCLING_SPORTS.map((item) => `'${item}'`).join(', ')})`;
+  if (selection.sportFamily === 'running') return `lower(${column}) LIKE '%run%'`;
+  throw new QueryValidationError('power queries require an explicit sport or sportFamily.');
 }
 
 function durationLabel(duration: number): string {
@@ -210,7 +231,7 @@ export class FitnessService {
       values[key] = duration;
       return `$${key}`;
     });
-    const clauses = [cyclingSportClause('sport', request.sport ?? 'cycling', values), `duration_s IN (${durationPlaceholders.join(', ')})`, ...addDateRange('started_at_utc', request, values)];
+    const clauses = [powerSportClause('sport', request, values), `duration_s IN (${durationPlaceholders.join(', ')})`, ...addDateRange('started_at_utc', request, values)];
     if (sourceQuality !== 'all') clauses.push("source_type = 'garmin_fit_derived'");
     const rows = await this.repository.rows<PowerCurveRow>(`
       WITH ranked AS (
@@ -229,10 +250,72 @@ export class FitnessService {
     return {
       data: rows.map((row) => ({ ...row, durationLabel: durationLabel(row.duration_s) })),
       provenance: { dataset: 'power_best_facts', sourceQuality },
-      query: { ...request, sport: request.sport ?? 'cycling', durations, sourceQuality, aggregation: 'monthly maximum per duration' },
+      query: { ...request, durations, sourceQuality, aggregation: 'monthly maximum per duration' },
       caveats: [
         'Values are duration-labelled Garmin FIT-derived power bests; each month/duration row identifies its supporting activity.',
         ...(rows.length === 0 ? ['No normalized power-best observations matched the requested durations and range.'] : []),
+      ],
+    };
+  }
+
+  async powerCoverageReport(request: PowerCoverageReportRequest = {}): Promise<Record<string, unknown>> {
+    const sourceQuality = request.sourceQuality ?? 'garmin_fit_derived';
+    const values: QueryValues = {};
+    const activityClauses = [powerSportClause('activity.sport', request, values), ...addDateRange('activity.started_at_utc', request, values)];
+    const bestClause = sourceQuality === 'garmin_fit_derived' ? "WHERE best.source_type = 'garmin_fit_derived'" : '';
+    const scoped = `
+      WITH source_activities AS (
+        SELECT source.activity_source_id, activity.started_at_utc, activity.sport
+        FROM activity_sources AS source
+        JOIN activities AS activity USING (activity_id)
+        WHERE ${activityClauses.join(' AND ')}
+      ), scoped_bests AS (
+        SELECT best.activity_source_id, best.duration_s, best.best_power_w, best.source_type
+        FROM activity_power_bests AS best
+        JOIN source_activities USING (activity_source_id)
+        ${bestClause}
+      )
+    `;
+    const [activityCoverage, durationInventory] = await Promise.all([
+      this.repository.rows<{
+        sport: string;
+        activities: number;
+        powered_activities: number;
+        datapoints: number;
+        first_activity_at: string | null;
+        last_activity_at: string | null;
+      }>(`${scoped}
+        SELECT sport, count(DISTINCT source_activities.activity_source_id)::INTEGER AS activities,
+          count(DISTINCT scoped_bests.activity_source_id)::INTEGER AS powered_activities,
+          count(scoped_bests.duration_s)::INTEGER AS datapoints,
+          cast(min(started_at_utc) AS VARCHAR) AS first_activity_at,
+          cast(max(started_at_utc) AS VARCHAR) AS last_activity_at
+        FROM source_activities
+        LEFT JOIN scoped_bests USING (activity_source_id)
+        GROUP BY sport
+        ORDER BY sport`, values),
+      this.repository.rows<{
+        duration_s: number;
+        datapoints: number;
+        activities: number;
+        min_power_w: number;
+        max_power_w: number;
+      }>(`${scoped}
+        SELECT duration_s, count(*)::INTEGER AS datapoints,
+          count(DISTINCT activity_source_id)::INTEGER AS activities,
+          min(best_power_w) AS min_power_w, max(best_power_w) AS max_power_w
+        FROM scoped_bests
+        GROUP BY duration_s
+        ORDER BY duration_s`, values),
+    ]);
+    return {
+      data: { activityCoverage, durationInventory: durationInventory.map((row) => ({ ...row, durationLabel: durationLabel(row.duration_s) })) },
+      provenance: { activityDataset: 'activities', powerDataset: 'power_best_facts', sourceQuality },
+      query: { ...request, sourceQuality },
+      caveats: [
+        'Coverage is based on FIT-derived per-activity duration bests, never sparse activity-summary average power.',
+        'Short-duration maxima can include sensor spikes; inspect the supporting activity stream before treating an extreme as physiological.',
+        'Raw activity samples remain scoped to one activity source at a time and may paginate.',
       ],
     };
   }

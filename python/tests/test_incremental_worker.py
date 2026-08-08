@@ -129,6 +129,24 @@ def test_range_limited_endpoints_are_chunked_and_scheduled_workouts_receive_a_mo
     assert scheduled == [(date.today().year, date.today().month)]
 
 
+def test_historical_only_sync_skips_non_historical_endpoints_and_respects_activity_window(tmp_path):
+    writer = Writer()
+    api = RangeApi()
+    worker = GarminStagingWorker(api, writer, tmp_path)
+
+    worker.sync(
+        daily_from_date=None,
+        activity_from_date=date(2025, 1, 1),
+        to_date=date(2025, 7, 1),
+        activity_to_date=date(2025, 1, 31),
+        include_non_historical=False,
+    )
+
+    assert [arguments for name, arguments in api.calls if name == "get_activities_by_date"] == [("2025-01-01", "2025-01-31")]
+    assert "get_user_profile" not in [name for name, _arguments in api.calls]
+    assert "get_workouts" not in [name for name, _arguments in api.calls]
+
+
 def test_cycling_ftp_history_uses_bounded_ranges_and_stages_date_stable_entities(tmp_path):
     writer = Writer()
     api = FunctionalThresholdPowerApi()

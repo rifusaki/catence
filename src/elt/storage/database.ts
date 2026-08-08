@@ -148,6 +148,24 @@ export class CatenceDatabase implements WriteDataStore {
     return { fromDate: initialFromDate, toDate, source: 'initial' };
   }
 
+  /**
+   * Return the uncovered historical portion of an explicit backfill range.
+   *
+   * A backfill is normally used to extend history backwards from data already
+   * present locally.  Its newest normalized source date is therefore a
+   * coverage boundary: re-reading that day and everything after it only
+   * creates provider traffic and upserts that the caller did not request.
+   * Callers can opt into the complete explicit range with `includeExisting`.
+   */
+  async resolveBackfillWindow(provider: Provider, cursorName: 'daily' | 'activities', fromDate: string, toDate: string, includeExisting = false): Promise<{ fromDate: string; toDate: string } | null> {
+    if (includeExisting) return { fromDate, toDate };
+    const latestSourceDate = await this.latestSourceDate(provider, cursorName);
+    if (!latestSourceDate || latestSourceDate < fromDate) return { fromDate, toDate };
+    if (latestSourceDate >= toDate) return null;
+    const uncoveredThrough = subtractDays(latestSourceDate, 1);
+    return uncoveredThrough < fromDate ? null : { fromDate, toDate: uncoveredThrough };
+  }
+
   async advanceIncrementalCursor(provider: Provider, cursorName: 'daily' | 'activities', runId: string, coveredThroughDate: string, lookbackDays: number): Promise<void> {
     const latestSourceDate = await this.latestSourceDate(provider, cursorName);
     const run = await this.rows<{ error_count: number }>('SELECT error_count FROM sync_runs WHERE run_id = $runId', { runId });

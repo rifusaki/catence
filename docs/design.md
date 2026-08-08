@@ -85,7 +85,10 @@ normalized coverage. Afterwards, normal syncs are cursor-backed: daily facts
 reconcile the most recent three days and activity discovery reconciles the most
 recent fourteen. Activity child endpoints and files are fetched only for new or
 changed activity summaries. Historical imports remain explicit backfill
-commands; there is no scheduler or provider mutation in this phase.
+commands; by default they stop before the newest local source date for each
+daily/activity data family, avoiding remote reads and upserts of recent data.
+`backfill --refresh` intentionally disables that boundary. There is no
+scheduler or provider mutation in this phase.
 
 Normalized tables preserve provenance rather than force an early merge:
 
@@ -145,7 +148,7 @@ question safely, then request a narrower/raw series only when it is useful.
 
 The server currently exposes `catence_status`, `describe_data`, `describe_dataset`, `read_series`,
 `aggregate_data`, `analyze_series`, `fit_series_model`,
-`query_read_only_data`, `find_activities`, `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, `latest_cycling_activities`, `cycling_progress_report`, `search_context`, `hydrate_strava_activity`, `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history`, plus resources for status,
+`query_read_only_data`, `find_activities`, `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, `power_coverage_report`, `latest_cycling_activities`, `cycling_progress_report`, `search_context`, `hydrate_strava_activity`, `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history`, plus resources for status,
 catalog, a single activity, and a date-range summary.
 
 `catence-data build-retrieval-index` explicitly generates `retrieval_documents` and

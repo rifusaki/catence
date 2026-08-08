@@ -69,12 +69,16 @@ three-day overlap, activities use a fourteen-day overlap, and unchanged
 activities do not re-download their detail endpoints, original files, or
 streams. `--from` and `backfill` are explicit ranges and do not move the
 incremental cursor. `catence-data status` reports each provider cursor and its next
-effective start date. `backfill --provider garmin --from YYYY-MM-DD --refresh`
-re-fetches every Garmin activity's detail, files, and streams in the selected
-range and upserts the resulting facts through today. It also fetches Garmin's
-historical cycling FTP setting range, retaining each daily setting separately
-from activity-level FTP and the current-only setting. It preserves archived raw
-artifacts and does not delete data merely absent from a later provider payload.
+effective start date. A normal `backfill` stops before each provider's newest
+local daily/activity source date, so it fetches only older, uncovered history;
+it also skips current account and collection endpoints. A fully covered range
+returns as skipped without contacting the provider. `backfill --refresh` is the
+explicit override: it re-fetches and upserts the complete selected range,
+including every Garmin activity's details, files, and streams. Backfills also
+fetch Garmin's historical cycling FTP setting range, retaining each daily
+setting separately from activity-level FTP and the current-only setting. They
+preserve archived raw artifacts and do not delete data merely absent from a
+later provider payload.
 
 Build the retrieval index after a completed sync. It contains compact, derived
 activity/plan/nutrition context only—not GPS tracks, sample streams, raw JSON,
@@ -97,7 +101,7 @@ The ordinary tool set is analytical; the only mutation-capable additions are `hy
 - `catence_status` and `describe_data` expose coverage, provenance, units, and catalog constraints.
 - `describe_dataset` is the compact schema browser for one cataloged dataset, avoiding exploratory SQL just to find field names. `training_metric_observations` includes observed sports, metric names, units, and source types.
 - `read_series`, `aggregate_data`, `analyze_series`, and `fit_series_model` cover bounded time-series work. `read_series` automatically aggregates dense streams and returns deterministic cursor pagination with `returnedRows`, `totalRows`, and `truncated`.
-- `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, `latest_cycling_activities`, and `cycling_progress_report` expose source-aware fitness projections without JSON-path or array-index SQL. VO₂max requires an explicit sport for observations; an omitted sport returns the available-sport summary, because Garmin often stores a running estimate as `generic`.
+- `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, `power_coverage_report`, `latest_cycling_activities`, and `cycling_progress_report` expose source-aware fitness projections without JSON-path or array-index SQL. Power-curve and coverage requests require an explicit sport or sport family, and distinguish FIT-derived duration bests from activity-summary average power. VO₂max requires an explicit sport for observations; an omitted sport returns the available-sport summary, because Garmin often stores a running estimate as `generic`.
 - `find_activities` is the authoritative, paginated way to discover activities or likely races by sport, distance, name, and date.
 - `search_context` finds generated context and prominently identifies a stale index and its direct-query alternative.
 - `query_read_only_data` is the escape hatch for novel questions. It permits one parameterized `SELECT`/`WITH … SELECT` against cataloged views only, with a 500-row per-page, safe response-size, and four-second limit. It returns deterministic pagination plus `returnedRows`, `totalRows`, `truncated`, and `nextCursor`, and rejects comments, multiple statements, mutations/DDL, extension commands, `COPY`/`ATTACH`, and filesystem table functions.

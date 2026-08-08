@@ -81,6 +81,41 @@ describe('normalization importer', () => {
     }
   });
 
+  it('normalizes Garmin running lactate-threshold settings with their provenance', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('garmin', '2026-07-29');
+    try {
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'lactate_threshold', remoteId: 'lactate_threshold:latest', parentRemoteId: null,
+        occurredOn: null, sourceUpdatedAt: null, rawObjectHash: 'threshold-raw', extension: {},
+        payload: {
+          speed_and_heart_rate: { calendarDate: '2026-07-29T15:23:20.706', speed: 0.42222104, heartRate: 179, heartRateCycling: 175 },
+          power: {
+            calendarDate: '2026-07-29T10:06:23.6', origin: 'weight', sport: 'RUNNING', functionalThresholdPower: 296,
+            weight: 51.298, powerToWeight: 5.7702054661, ftpCreateTime: '2026-07-25T18:54:58.0', weightCreateTime: '2026-07-29T10:06:23.6', isStale: false,
+          },
+        },
+      });
+      const observations = await database.rows<{ metric_name: string; sport: string; value_number: number; unit: string; origin: string | null; stale: string | null }>(`
+        SELECT metric_name, sport, value_number, unit,
+          json_extract_string(dimensions_json, '$.origin') AS origin,
+          json_extract_string(dimensions_json, '$.isStale') AS stale
+        FROM training_metric_observations
+        WHERE source_type = 'lactate_threshold'
+        ORDER BY metric_name
+      `);
+      expect(observations).toEqual([
+        { metric_name: 'cycling_lactate_threshold_hr_bpm', sport: 'cycling', value_number: 175, unit: 'bpm', origin: null, stale: null },
+        { metric_name: 'running_lactate_threshold_hr_bpm', sport: 'running', value_number: 179, unit: 'bpm', origin: null, stale: null },
+        { metric_name: 'running_lactate_threshold_pace_s_per_km', sport: 'running', value_number: expect.closeTo(253.332624), unit: 's/km', origin: null, stale: null },
+        { metric_name: 'running_lactate_threshold_power_w', sport: 'running', value_number: 296, unit: 'W', origin: 'weight', stale: 'false' },
+        { metric_name: 'running_lactate_threshold_power_w_kg', sport: 'running', value_number: 5.7702054661, unit: 'W/kg', origin: 'weight', stale: 'false' },
+      ]);
+    } finally {
+      await database.close();
+    }
+  });
+
   it('keeps historical generic and cycling VO2 max observations queryable by date', async () => {
     const { database } = await temporaryDatabase();
     const runId = await database.beginRun('garmin', '2025-06-01');

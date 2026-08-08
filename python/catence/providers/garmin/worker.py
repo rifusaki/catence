@@ -86,18 +86,32 @@ class GarminStagingWorker:
         self.data_dir = data_dir
         self.known_activity_hashes = dict(known_activity_hashes or {})
 
-    def sync(self, daily_from_date: date, activity_from_date: date, to_date: date | None = None) -> None:
+    def sync(
+        self,
+        daily_from_date: date | None,
+        activity_from_date: date | None,
+        to_date: date | None = None,
+        daily_to_date: date | None = None,
+        activity_to_date: date | None = None,
+        include_non_historical: bool = True,
+    ) -> None:
         assert_read_only_registry()
         end = to_date or date.today()
-        self._singletons()
-        self._daily(daily_from_date, end)
-        self._range(daily_from_date, end)
-        self._cycling_ftp_history(daily_from_date, end)
-        self._max_metrics_history(daily_from_date, end)
-        self._hrv_history(daily_from_date, end)
-        self._score_history(daily_from_date, end)
-        self._activities(activity_from_date, end)
-        self._collections()
+        daily_end = daily_to_date or end
+        activity_end = activity_to_date or end
+        if include_non_historical:
+            self._singletons()
+        if daily_from_date and daily_from_date <= daily_end:
+            self._daily(daily_from_date, daily_end)
+            self._range(daily_from_date, daily_end)
+            self._cycling_ftp_history(daily_from_date, daily_end)
+            self._max_metrics_history(daily_from_date, daily_end)
+            self._hrv_history(daily_from_date, daily_end)
+            self._score_history(daily_from_date, daily_end)
+        if activity_from_date and activity_from_date <= activity_end:
+            self._activities(activity_from_date, activity_end)
+        if include_non_historical:
+            self._collections()
 
     def _capture(self, endpoint: str, action: Callable[[], Any], remote_id_value: str | None = None, scope: dict[str, Any] | None = None) -> tuple[Any | None, str | None]:
         try:

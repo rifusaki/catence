@@ -34,4 +34,21 @@ describe('incremental sync state', () => {
       await database.close();
     }
   });
+
+  it('makes backfills stop before existing source coverage unless refreshed', async () => {
+    const { database } = await temporaryDatabase();
+    try {
+      await database.run(
+        `INSERT INTO source_entities
+          (provider, entity_type, remote_id, parent_remote_id, occurred_on, source_updated_at, raw_object_hash, payload_json, extension_json)
+         VALUES ('garmin', 'daily_health', '2026-07-30', NULL, '2026-07-30', NULL, NULL, '{}', '{}')`,
+      );
+
+      await expect(database.resolveBackfillWindow('garmin', 'daily', '2020-01-01', '2026-08-01')).resolves.toEqual({ fromDate: '2020-01-01', toDate: '2026-07-29' });
+      await expect(database.resolveBackfillWindow('garmin', 'daily', '2020-01-01', '2026-08-01', true)).resolves.toEqual({ fromDate: '2020-01-01', toDate: '2026-08-01' });
+      await expect(database.resolveBackfillWindow('garmin', 'daily', '2026-07-30', '2026-08-01')).resolves.toBeNull();
+    } finally {
+      await database.close();
+    }
+  });
 });
