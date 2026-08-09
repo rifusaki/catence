@@ -32,15 +32,23 @@ describe('post-commit migrations', () => {
       `);
       await connection.run("INSERT INTO training_metric_observations VALUES ('ftp-1', 'garmin', 'cycling_ftp_w', 'cycling', now(), 250, 'fixture', 'ftp-1', NULL, NULL)");
       await connection.run('CREATE INDEX training_metric_observations_metric_idx ON training_metric_observations (provider, metric_name, sport, observed_at)');
-      await connection.run('CREATE TABLE activity_sources (activity_source_id VARCHAR, activity_id VARCHAR, provider VARCHAR, remote_activity_id VARCHAR)');
-      await connection.run('CREATE TABLE activities (activity_id VARCHAR, started_at_utc TIMESTAMPTZ, sport VARCHAR)');
-      await connection.run('CREATE TABLE source_entities (provider VARCHAR, entity_type VARCHAR, remote_id VARCHAR, payload_json JSON, raw_object_hash VARCHAR)');
+      await connection.run('CREATE TABLE activity_sources (activity_source_id VARCHAR, activity_id VARCHAR, provider VARCHAR, remote_activity_id VARCHAR, external_id VARCHAR, raw_object_hash VARCHAR)');
+      await connection.run('CREATE TABLE activities (activity_id VARCHAR, started_at_utc TIMESTAMPTZ, started_at_local VARCHAR, timezone VARCHAR, sport VARCHAR, name VARCHAR, link_state VARCHAR)');
+      await connection.run('CREATE TABLE activity_summaries (activity_source_id VARCHAR, distance_m DOUBLE, moving_s DOUBLE, elapsed_s DOUBLE, avg_hr DOUBLE, metrics_json JSON)');
+      await connection.run('CREATE TABLE activity_intervals (activity_source_id VARCHAR, interval_key VARCHAR, label VARCHAR, start_s DOUBLE, end_s DOUBLE, distance_m DOUBLE, avg_power DOUBLE, avg_hr DOUBLE, avg_pace DOUBLE, intensity DOUBLE, metrics_json JSON, PRIMARY KEY (activity_source_id, interval_key))');
+      await connection.run('CREATE TABLE source_entities (provider VARCHAR, entity_type VARCHAR, remote_id VARCHAR, parent_remote_id VARCHAR, payload_json JSON, raw_object_hash VARCHAR)');
       await connection.run('CREATE TABLE retrieval_index_state (index_name VARCHAR, status VARCHAR)');
       await connection.run("INSERT INTO retrieval_index_state VALUES ('context', 'ready')");
-      await connection.run("INSERT INTO activities VALUES ('garmin:g1', '2026-08-04T15:42:59Z', 'swimming')");
-      await connection.run("INSERT INTO activity_sources VALUES ('garmin:g1', 'garmin:g1', 'garmin', 'g1')");
-      await connection.run("INSERT INTO source_entities VALUES ('garmin', 'activity', 'g1', '{\"startTimeGMT\":\"2026-08-04 10:42:59\"}', NULL)");
-      await connection.run("INSERT INTO source_entities VALUES ('garmin', 'lactate_threshold', 'latest', '{\"speed_and_heart_rate\":{\"calendarDate\":\"2026-08-04T10:42:59\",\"speed\":0.42,\"heartRate\":178},\"power\":{\"calendarDate\":\"2026-08-04T10:42:59\",\"functionalThresholdPower\":295,\"powerToWeight\":5.7}}', 'threshold-raw')");
+      await connection.run("INSERT INTO activities VALUES ('garmin:g1', '2026-08-04T15:42:59Z', NULL, NULL, 'swimming', NULL, 'unlinked')");
+      await connection.run("INSERT INTO activity_sources VALUES ('garmin:g1', 'garmin:g1', 'garmin', 'g1', NULL, NULL)");
+      await connection.run("INSERT INTO source_entities VALUES ('garmin', 'activity', 'g1', NULL, '{\"startTimeGMT\":\"2026-08-04 10:42:59\"}', NULL)");
+      await connection.run("INSERT INTO source_entities VALUES ('garmin', 'lactate_threshold', 'latest', NULL, '{\"speed_and_heart_rate\":{\"calendarDate\":\"2026-08-04T10:42:59\",\"speed\":0.42,\"heartRate\":178},\"power\":{\"calendarDate\":\"2026-08-04T10:42:59\",\"functionalThresholdPower\":295,\"powerToWeight\":5.7}}', 'threshold-raw')");
+      await connection.run(`CREATE VIEW activity_summary_facts AS
+        SELECT summary.*, source.activity_id, source.provider, source.remote_activity_id, source.raw_object_hash,
+          activity.started_at_utc, activity.started_at_local, activity.timezone, activity.sport, activity.name
+        FROM activity_summaries AS summary
+        JOIN activity_sources AS source USING (activity_source_id)
+        JOIN activities AS activity USING (activity_id)`);
     } finally {
       connection.closeSync();
       instance.closeSync();
@@ -48,7 +56,7 @@ describe('post-commit migrations', () => {
 
     const database = await CatenceDatabase.open(paths);
     try {
-      expect(await database.rows("SELECT version FROM schema_migrations WHERE version = 12")).toEqual([{ version: 12 }]);
+      expect(await database.rows("SELECT version FROM schema_migrations WHERE version = 13")).toEqual([{ version: 13 }]);
       expect(await database.rows("SELECT value_text, unit, device_id, dimensions_json FROM training_metric_observations WHERE observation_id = 'ftp-1'"))
         .toEqual([{ value_text: null, unit: null, device_id: null, dimensions_json: null }]);
       const indexes = await database.rows<{ index_name: string }>("SELECT index_name FROM duckdb_indexes() WHERE table_name = 'training_metric_observations'");

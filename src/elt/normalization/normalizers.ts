@@ -8,6 +8,19 @@ function object(value: unknown): JsonObject {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : {};
 }
 
+function objectFromJson(value: unknown): JsonObject {
+  if (typeof value !== 'string') return object(value);
+  try {
+    return object(JSON.parse(value));
+  } catch {
+    return {};
+  }
+}
+
+function objectArray(value: unknown): JsonObject[] {
+  return Array.isArray(value) ? value.map(object).filter((item) => Object.keys(item).length > 0) : [];
+}
+
 function firstString(payload: JsonObject, keys: readonly string[]): string | null {
   for (const key of keys) {
     const value = payload[key];
@@ -24,6 +37,30 @@ function firstNumber(payload: JsonObject, keys: readonly string[]): number | nul
     if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) return Number(value);
   }
   return null;
+}
+
+function firstBoolean(payload: JsonObject, keys: readonly string[]): boolean | null {
+  for (const key of keys) {
+    const value = payload[key];
+    if (typeof value === 'boolean') return value;
+    if (value === 0 || value === '0' || value === 'false') return false;
+    if (value === 1 || value === '1' || value === 'true') return true;
+  }
+  return null;
+}
+
+function garminPoolLengthM(payload: JsonObject): number | null {
+  const value = firstNumber(payload, ['poolLength', 'pool_length', 'poolLengthM']);
+  if (value === null || value <= 0) return null;
+  // Garmin's activity summary currently reports its pool length in centimetres
+  // (for example 2500 for a 25 m pool). Keep support for a future metre-valued
+  // endpoint without treating a 25 m setting as 0.25 m.
+  return value >= 100 ? value / 100 : value;
+}
+
+function swimSourceLabel(payload: JsonObject): string | null {
+  const direct = firstString(payload, ['lengthType', 'swimType', 'type', 'label', 'name']);
+  return direct ? direct.toLowerCase() : null;
 }
 
 function datePart(value: string | null): string | null {
@@ -201,12 +238,16 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
 
   if (entity.entityType === 'activity') {
     await importActivity(database, entity.provider, entity.remoteId, payload, rawHash);
+    if (entity.provider === 'intervals') await importIntervalsAutoSwimSets(database, entity.remoteId, payload, rawHash);
     if (entity.provider === 'garmin') {
       await importGarminCyclingFtpFromActivity(database, entity.remoteId, payload, rawHash);
       await importGarminActivityPerformance(database, entity.remoteId, payload, rawHash);
     }
   }
   if (entity.entityType === 'activity_interval') await importActivityIntervals(database, entity.provider, entity.parentRemoteId, payload, rawHash);
+  if (entity.provider === 'garmin' && ['activity_detail', 'activity_interval', 'activity_exercise_set'].includes(entity.entityType)) {
+    await importGarminExplicitSwimLengths(database, entity.parentRemoteId, entity.entityType, payload, rawHash);
+  }
   if (entity.entityType === 'wellness' || entity.entityType === 'daily_health') await importDailyMetrics(database, entity.provider, entity.remoteId, entity.occurredOn, payload, rawHash);
   if (entity.entityType === 'nutrition_day' || entity.entityType === 'nutrition_log') await importNutrition(database, entity.provider, entity.occurredOn, entity.remoteId, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'training_metric') await importGarminCyclingFtp(database, entity.remoteId, payload, rawHash);
@@ -522,25 +563,272 @@ async function importWellnessSamples(database: CatenceDatabase, remoteId: string
   }
 }
 
-async function importActivityIntervals(database: CatenceDatabase, provider: Provider, parentRemoteId: string | null, payload: JsonObject, _rawHash: string | null): Promise<void> {
-  if (!parentRemoteId) return;
-  const activitySourceId = providerActivityId(provider, parentRemoteId);
-  const key = firstString(payload, ['id', 'intervalId', 'start_index']) ?? crypto.randomUUID();
+type SwimSetInput = {
+  sourceType: 'garmin_detected' | 'intervals_auto';
+  setIndex: number;
+  label: string | null;
+  reps: number | null;
+  repDistanceM: number | null;
+  totalDistanceM: number | null;
+  workS: number | null;
+  restS: number | null;
+  avgPace: number | null;
+  avgHr: number | null;
+  maxHr: number | null;
+  strokeRate: number | null;
+  metrics: JsonObject;
+};
+
+async function upsertSwimSet(database: CatenceDatabase, activitySourceId: string, input: SwimSetInput, rawHash: string | null): Promise<void> {
+  await database.run(
+    `INSERT INTO swim_sets
+      (activity_source_id, source_type, set_index, label, reps, rep_distance_m, total_distance_m, work_s, rest_s, avg_pace, avg_hr, max_hr, stroke_rate, metrics_json, raw_object_hash)
+     VALUES ($activitySourceId, $sourceType, $setIndex, $label, $reps, $repDistanceM, $totalDistanceM, $workS, $restS, $avgPace, $avgHr, $maxHr, $strokeRate, $metrics, $rawHash)
+     ON CONFLICT (activity_source_id, source_type, set_index) DO UPDATE SET
+       label = excluded.label, reps = excluded.reps, rep_distance_m = excluded.rep_distance_m,
+       total_distance_m = excluded.total_distance_m, work_s = excluded.work_s, rest_s = excluded.rest_s,
+       avg_pace = excluded.avg_pace, avg_hr = excluded.avg_hr, max_hr = excluded.max_hr,
+       stroke_rate = excluded.stroke_rate, metrics_json = excluded.metrics_json, raw_object_hash = excluded.raw_object_hash`,
+    { activitySourceId, ...input, metrics: json(input.metrics), rawHash },
+  );
+}
+
+async function upsertActivityInterval(database: CatenceDatabase, activitySourceId: string, values: {
+  key: string;
+  label: string | null;
+  startS: number | null;
+  endS: number | null;
+  distanceM: number | null;
+  avgPower: number | null;
+  avgHr: number | null;
+  avgPace: number | null;
+  intensity: number | null;
+  durationS: number | null;
+  movingS: number | null;
+  sourceType: string;
+  metrics: JsonObject;
+}): Promise<void> {
   await database.run(
     `INSERT INTO activity_intervals
-      (activity_source_id, interval_key, label, start_s, end_s, distance_m, avg_power, avg_hr, avg_pace, intensity, metrics_json)
-      VALUES ($activitySourceId, $key, $label, $startS, $endS, $distanceM, $avgPower, $avgHr, $avgPace, $intensity, $metrics)
-      ON CONFLICT (activity_source_id, interval_key) DO UPDATE SET label = excluded.label, start_s = excluded.start_s,
-        end_s = excluded.end_s, distance_m = excluded.distance_m, avg_power = excluded.avg_power, avg_hr = excluded.avg_hr,
-        avg_pace = excluded.avg_pace, intensity = excluded.intensity, metrics_json = excluded.metrics_json`,
-    {
-      activitySourceId, key, label: firstString(payload, ['label', 'name']),
-      startS: firstNumber(payload, ['start_secs', 'start_time', 'start_index']), endS: firstNumber(payload, ['end_secs', 'end_time', 'end_index']),
-      distanceM: firstNumber(payload, ['distance']), avgPower: firstNumber(payload, ['average_watts', 'averagePower']),
-      avgHr: firstNumber(payload, ['average_heartrate', 'averageHR']), avgPace: firstNumber(payload, ['average_pace']),
-      intensity: firstNumber(payload, ['intensity']), metrics: json(payload),
-    },
+      (activity_source_id, interval_key, label, start_s, end_s, distance_m, avg_power, avg_hr, avg_pace, intensity, metrics_json, duration_s, moving_s, source_type)
+     VALUES ($activitySourceId, $key, $label, $startS, $endS, $distanceM, $avgPower, $avgHr, $avgPace, $intensity, $metrics, $durationS, $movingS, $sourceType)
+     ON CONFLICT (activity_source_id, interval_key) DO UPDATE SET
+       label = excluded.label, start_s = excluded.start_s, end_s = excluded.end_s,
+       distance_m = excluded.distance_m, avg_power = excluded.avg_power, avg_hr = excluded.avg_hr,
+       avg_pace = excluded.avg_pace, intensity = excluded.intensity, metrics_json = excluded.metrics_json,
+       duration_s = excluded.duration_s, moving_s = excluded.moving_s, source_type = excluded.source_type`,
+    { activitySourceId, ...values, metrics: json(values.metrics) },
   );
+}
+
+function parseIntervalsAutoBlock(value: unknown): { rawLabel: string; reps: number; repDistanceM: number; avgHr: number | null } | null {
+  if (typeof value !== 'string') return null;
+  const rawLabel = value.trim();
+  const match = rawLabel.replaceAll('×', 'x').match(/^(\d+)\s*x\s*(\d+(?:\.\d+)?)\s*m(?:\s+(\d+(?:\.\d+)?)\s*bpm)?$/i);
+  if (!match) return null;
+  const reps = Number(match[1]);
+  const repDistanceM = Number(match[2]);
+  const avgHr = match[3] ? Number(match[3]) : null;
+  if (!Number.isInteger(reps) || reps <= 0 || !Number.isFinite(repDistanceM) || repDistanceM <= 0 || (avgHr !== null && !Number.isFinite(avgHr))) return null;
+  return { rawLabel, reps, repDistanceM, avgHr };
+}
+
+async function importIntervalsAutoSwimSets(database: CatenceDatabase, remoteId: string, payload: JsonObject, rawHash: string | null): Promise<void> {
+  const blocks = Array.isArray(payload.interval_summary) ? payload.interval_summary : [];
+  if (blocks.length === 0) return;
+  const activitySourceId = providerActivityId('intervals', remoteId);
+  await database.run("DELETE FROM swim_sets WHERE activity_source_id = $activitySourceId AND source_type = 'intervals_auto'", { activitySourceId });
+  await database.run("DELETE FROM activity_intervals WHERE activity_source_id = $activitySourceId AND source_type = 'intervals_auto'", { activitySourceId });
+  for (const [index, block] of blocks.entries()) {
+    const parsed = parseIntervalsAutoBlock(block);
+    if (!parsed) continue;
+    const totalDistanceM = parsed.reps * parsed.repDistanceM;
+    const metrics = { rawLabel: parsed.rawLabel, providerGrouping: 'intervals_auto' };
+    await upsertSwimSet(database, activitySourceId, {
+      sourceType: 'intervals_auto', setIndex: index, label: parsed.rawLabel,
+      reps: parsed.reps, repDistanceM: parsed.repDistanceM, totalDistanceM,
+      workS: null, restS: null, avgPace: null, avgHr: parsed.avgHr, maxHr: null, strokeRate: null, metrics,
+    }, rawHash);
+    await upsertActivityInterval(database, activitySourceId, {
+      key: `intervals:auto:${index}`, label: parsed.rawLabel,
+      startS: null, endS: null, distanceM: totalDistanceM, avgPower: null, avgHr: parsed.avgHr,
+      avgPace: null, intensity: null, durationS: null, movingS: null, sourceType: 'intervals_auto', metrics,
+    });
+  }
+}
+
+async function importGarminSplitSummaries(database: CatenceDatabase, parentRemoteId: string, payload: JsonObject, rawHash: string | null): Promise<void> {
+  const summaries = objectArray(payload.splitSummaries);
+  const activitySourceId = providerActivityId('garmin', parentRemoteId);
+  await database.run("DELETE FROM swim_sets WHERE activity_source_id = $activitySourceId AND source_type = 'garmin_detected'", { activitySourceId });
+  await database.run("DELETE FROM activity_intervals WHERE activity_source_id = $activitySourceId AND source_type = 'garmin_detected'", { activitySourceId });
+  await database.run(`DELETE FROM activity_intervals
+    WHERE activity_source_id = $activitySourceId AND source_type IS NULL
+      AND start_s IS NULL AND end_s IS NULL AND duration_s IS NULL AND moving_s IS NULL
+      AND distance_m IS NULL AND avg_power IS NULL AND avg_hr IS NULL AND avg_pace IS NULL AND intensity IS NULL`, { activitySourceId });
+  for (const [index, summary] of summaries.entries()) {
+    const label = firstString(summary, ['splitType', 'label', 'name']);
+    const durationS = firstNumber(summary, ['duration', 'durationSeconds']);
+    const movingS = firstNumber(summary, ['movingDuration', 'movingDurationSeconds']);
+    const distanceM = firstNumber(summary, ['distance']);
+    const avgHr = firstNumber(summary, ['averageHR', 'averageHeartRate']);
+    const maxHr = firstNumber(summary, ['maxHR', 'maxHeartRate']);
+    const metrics = { splitSummary: summary, providerGrouping: 'garmin_detected' };
+    await upsertActivityInterval(database, activitySourceId, {
+      key: `garmin:split_summary:${index}`, label,
+      startS: null, endS: null, distanceM, avgPower: null, avgHr, avgPace: null, intensity: null,
+      durationS, movingS, sourceType: 'garmin_detected', metrics,
+    });
+    await upsertSwimSet(database, activitySourceId, {
+      sourceType: 'garmin_detected', setIndex: index, label,
+      reps: firstNumber(summary, ['noOfSplits', 'repetitions']), repDistanceM: null, totalDistanceM: distanceM,
+      workS: movingS, restS: null, avgPace: null, avgHr, maxHr, strokeRate: null, metrics,
+    }, rawHash);
+  }
+}
+
+async function importActivityIntervals(database: CatenceDatabase, provider: Provider, parentRemoteId: string | null, payload: JsonObject, rawHash: string | null): Promise<void> {
+  if (!parentRemoteId) return;
+  if (provider === 'garmin' && Array.isArray(payload.splitSummaries)) {
+    await importGarminSplitSummaries(database, parentRemoteId, payload, rawHash);
+    return;
+  }
+  const activitySourceId = providerActivityId(provider, parentRemoteId);
+  const key = firstString(payload, ['id', 'intervalId', 'start_index']) ?? crypto.randomUUID();
+  await upsertActivityInterval(database, activitySourceId, {
+    key, label: firstString(payload, ['label', 'name']),
+    startS: firstNumber(payload, ['start_secs', 'start_time', 'start_index']), endS: firstNumber(payload, ['end_secs', 'end_time', 'end_index']),
+    distanceM: firstNumber(payload, ['distance']), avgPower: firstNumber(payload, ['average_watts', 'averagePower']),
+    avgHr: firstNumber(payload, ['average_heartrate', 'averageHR']), avgPace: firstNumber(payload, ['average_pace']),
+    intensity: firstNumber(payload, ['intensity']), durationS: firstNumber(payload, ['duration', 'durationSeconds']),
+    movingS: firstNumber(payload, ['movingDuration', 'moving_time']), sourceType: `${provider}_interval`, metrics: payload,
+  });
+}
+
+async function activityPoolLengthM(database: CatenceDatabase, activitySourceId: string): Promise<number | null> {
+  const rows = await database.rows<{ metrics_json: unknown }>('SELECT metrics_json FROM activity_summaries WHERE activity_source_id = $activitySourceId', { activitySourceId });
+  return garminPoolLengthM(objectFromJson(rows[0]?.metrics_json));
+}
+
+async function importGarminExplicitSwimLengths(database: CatenceDatabase, parentRemoteId: string | null, entityType: string, payload: JsonObject, rawHash: string | null): Promise<void> {
+  if (!parentRemoteId) return;
+  const activitySourceId = providerActivityId('garmin', parentRemoteId);
+  const summaryPoolLengthM = await activityPoolLengthM(database, activitySourceId);
+  for (const field of ['lengths', 'swimLengths', 'lengthSummaries'] as const) {
+    const lengths = objectArray(payload[field]);
+    if (lengths.length === 0) continue;
+    const source = `garmin_provider_length:${entityType}:${field}`;
+    await database.run('DELETE FROM swim_lengths WHERE activity_source_id = $activitySourceId AND source = $source', { activitySourceId, source });
+    for (const [offset, length] of lengths.entries()) {
+      const durationS = firstNumber(length, ['duration', 'durationSeconds', 'elapsedDuration']);
+      const distanceM = firstNumber(length, ['distance', 'distanceM']);
+      // The provider has to explicitly label this object as a length and give
+      // at least duration or distance. We never derive lengths from samples.
+      if (durationS === null && distanceM === null) continue;
+      const sourceLabel = swimSourceLabel(length);
+      const isRest = firstBoolean(length, ['isRest', 'rest']) ?? Boolean(sourceLabel && /rest|idle|pause/.test(sourceLabel));
+      const lengthIndex = Math.round(firstNumber(length, ['lengthIndex', 'lengthNumber', 'index']) ?? offset);
+      await database.run(
+        `INSERT INTO swim_lengths
+          (activity_source_id, source, length_index, lap_index, pool_length_m, start_time, duration_s, active_duration_s, distance_m, stroke_count, stroke_rate, swolf, avg_hr, max_hr, is_rest, confidence, metrics_json, raw_object_hash)
+         VALUES ($activitySourceId, $source, $lengthIndex, $lapIndex, $poolLengthM, $startTime, $durationS, $activeDurationS, $distanceM, $strokeCount, $strokeRate, $swolf, $avgHr, $maxHr, $isRest, 'provider_supplied', $metrics, $rawHash)
+         ON CONFLICT (activity_source_id, source, length_index) DO UPDATE SET
+           lap_index = excluded.lap_index, pool_length_m = excluded.pool_length_m, start_time = excluded.start_time,
+           duration_s = excluded.duration_s, active_duration_s = excluded.active_duration_s, distance_m = excluded.distance_m,
+           stroke_count = excluded.stroke_count, stroke_rate = excluded.stroke_rate, swolf = excluded.swolf,
+           avg_hr = excluded.avg_hr, max_hr = excluded.max_hr, is_rest = excluded.is_rest,
+           confidence = excluded.confidence, metrics_json = excluded.metrics_json, raw_object_hash = excluded.raw_object_hash`,
+        {
+          activitySourceId, source, lengthIndex,
+          lapIndex: firstNumber(length, ['lapIndex', 'lapNumber']), poolLengthM: garminPoolLengthM(length) ?? summaryPoolLengthM,
+          startTime: timestamp(length.startTime ?? length.startTimestamp ?? length.timestamp), durationS,
+          activeDurationS: firstNumber(length, ['activeDuration', 'movingDuration']), distanceM,
+          strokeCount: firstNumber(length, ['strokeCount', 'strokes']), strokeRate: firstNumber(length, ['strokeRate', 'averageStrokeRate', 'cadence']),
+          swolf: firstNumber(length, ['swolf']), avgHr: firstNumber(length, ['averageHR', 'avgHr']), maxHr: firstNumber(length, ['maxHR', 'maxHr']),
+          isRest, metrics: json(length), rawHash,
+        },
+      );
+    }
+  }
+}
+
+type ActivityQualityRow = {
+  activity_source_id: string;
+  provider: string;
+  raw_object_hash: string | null;
+  sport: string | null;
+  distance_m: number | null;
+  moving_s: number | null;
+  elapsed_s: number | null;
+  metrics_json: unknown;
+};
+
+async function addActivityQualityFlag(database: CatenceDatabase, activitySourceId: string, code: string, severity: 'info' | 'warning', details: JsonObject, rawHash: string | null): Promise<void> {
+  await database.run(
+    `INSERT INTO activity_quality_flags (activity_source_id, flag_code, severity, details_json, raw_object_hash)
+     VALUES ($activitySourceId, $code, $severity, $details, $rawHash)
+     ON CONFLICT (activity_source_id, flag_code) DO UPDATE SET
+       severity = excluded.severity, details_json = excluded.details_json, raw_object_hash = excluded.raw_object_hash`,
+    { activitySourceId, code, severity, details: json(details), rawHash },
+  );
+}
+
+/** Re-evaluate source quality whenever an activity is imported or linked. */
+export async function refreshActivityQuality(database: CatenceDatabase, activityId: string): Promise<void> {
+  const sources = await database.rows<ActivityQualityRow>(`
+    SELECT source.activity_source_id, source.provider, source.raw_object_hash, activity.sport,
+      summary.distance_m, summary.moving_s, summary.elapsed_s, summary.metrics_json
+    FROM activity_sources AS source
+    JOIN activities AS activity USING (activity_id)
+    LEFT JOIN activity_summaries AS summary USING (activity_source_id)
+    WHERE source.activity_id = $activityId
+  `, { activityId });
+  if (sources.length === 0) return;
+  await database.run('DELETE FROM activity_quality_flags WHERE activity_source_id IN (SELECT activity_source_id FROM activity_sources WHERE activity_id = $activityId)', { activityId });
+
+  for (const source of sources) {
+    if (source.provider !== 'garmin' || source.sport?.toLowerCase() !== 'lap_swimming') continue;
+    const metrics = objectFromJson(source.metrics_json);
+    const poolLengthM = garminPoolLengthM(metrics);
+    if (poolLengthM !== null && (poolLengthM < 15 || poolLengthM > 100)) {
+      await addActivityQualityFlag(database, source.activity_source_id, 'pool_length_implausible', 'warning', { poolLengthM }, source.raw_object_hash);
+    }
+    const averageSpeedMps = firstNumber(metrics, ['averageSpeed']);
+    const strokeCadenceSpm = firstNumber(metrics, ['averageSwimCadenceInStrokesPerMinute']);
+    const durationS = Math.max(source.moving_s ?? 0, source.elapsed_s ?? 0);
+    if (durationS >= 900 && averageSpeedMps === 0 && strokeCadenceSpm === 0) {
+      await addActivityQualityFlag(database, source.activity_source_id, 'zero_swim_speed_and_cadence', 'warning', {
+        averageSpeedMps, strokeCadenceSpm, durationS,
+      }, source.raw_object_hash);
+    }
+    const activeLengths = firstNumber(metrics, ['activeLengths']);
+    if (poolLengthM !== null && activeLengths !== null && activeLengths > 0 && source.distance_m !== null && source.distance_m > 0) {
+      const expectedDistanceM = activeLengths * poolLengthM;
+      if (Math.abs(expectedDistanceM - source.distance_m) > Math.max(poolLengthM, expectedDistanceM * 0.02)) {
+        await addActivityQualityFlag(database, source.activity_source_id, 'active_lengths_distance_mismatch', 'warning', {
+          activeLengths, poolLengthM, expectedDistanceM, summaryDistanceM: source.distance_m,
+        }, source.raw_object_hash);
+      }
+    }
+    const lengths = await database.rows<{ count: number | bigint }>('SELECT count(*) AS count FROM swim_lengths WHERE activity_source_id = $activitySourceId', { activitySourceId: source.activity_source_id });
+    if (Number(lengths[0]?.count ?? 0) === 0) {
+      await addActivityQualityFlag(database, source.activity_source_id, 'swim_length_data_unavailable', 'info', {
+        reason: 'No explicit provider-supplied per-length records were imported.',
+      }, source.raw_object_hash);
+    }
+  }
+
+  const garmin = sources.find((source) => source.provider === 'garmin' && source.distance_m !== null);
+  const intervals = sources.find((source) => source.provider === 'intervals' && source.distance_m !== null);
+  if (!garmin || !intervals || garmin.distance_m === null || intervals.distance_m === null) return;
+  const differenceM = Math.abs(garmin.distance_m - intervals.distance_m);
+  const toleranceM = Math.max(50, garmin.distance_m * 0.05);
+  if (differenceM <= toleranceM) return;
+  for (const source of [garmin, intervals]) {
+    await addActivityQualityFlag(database, source.activity_source_id, 'provider_distance_disagreement', 'warning', {
+      garminDistanceM: garmin.distance_m, intervalsDistanceM: intervals.distance_m, differenceM, toleranceM,
+    }, source.raw_object_hash);
+  }
 }
 
 async function importGarminDailyDetails(database: CatenceDatabase, remoteId: string, metricDate: string, payload: JsonObject, rawHash: string | null): Promise<void> {

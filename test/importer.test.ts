@@ -247,6 +247,88 @@ describe('normalization importer', () => {
     }
   });
 
+  it('normalizes Garmin split summaries and Intervals auto swim blocks without inventing lengths', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('garmin', '2026-08-04');
+    try {
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity', remoteId: 'swim-1', parentRemoteId: null,
+        occurredOn: '2026-08-04', sourceUpdatedAt: null, rawObjectHash: 'swim-summary', extension: {},
+        payload: {
+          activityId: 'swim-1', startTimeGMT: '2026-08-04T10:00:00Z', activityType: 'lap_swimming', activityName: 'Pool set',
+          distance: 100, duration: 120, poolLength: 2500, activeLengths: 4, averageSpeed: 0.8, averageSwimCadenceInStrokesPerMinute: 22,
+        },
+      });
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity_interval', remoteId: 'swim-1', parentRemoteId: 'swim-1',
+        occurredOn: '2026-08-04', sourceUpdatedAt: null, rawObjectHash: 'swim-splits', extension: {},
+        payload: { splitSummaries: [{ splitType: 'INTERVAL_ACTIVE', noOfSplits: 2, distance: 100, duration: 120, movingDuration: 110, averageHR: 160, maxHR: 170 }] },
+      });
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'intervals', entityType: 'activity', remoteId: 'intervals-swim-1', parentRemoteId: null,
+        occurredOn: '2026-08-04', sourceUpdatedAt: null, rawObjectHash: 'intervals-swim', extension: {},
+        payload: { id: 'intervals-swim-1', external_id: 'swim-1', start_date: '2026-08-04T10:00:00Z', type: 'Swimming', distance: 100, interval_summary: ['2x 25m 155bpm'] },
+      });
+      const [intervals, sets, lengths] = await Promise.all([
+        database.rows<{ source_type: string; label: string; distance_m: number; duration_s: number; moving_s: number; avg_hr: number }>(`
+          SELECT source_type, label, distance_m, duration_s, moving_s, avg_hr
+          FROM activity_interval_facts WHERE activity_source_id = 'garmin:swim-1'
+        `),
+        database.rows<{ source_type: string; label: string; reps: number; rep_distance_m: number | null; total_distance_m: number; work_s: number | null; avg_hr: number | null }>(`
+          SELECT source_type, label, reps, rep_distance_m, total_distance_m, work_s, avg_hr
+          FROM swim_set_facts ORDER BY source_type
+        `),
+        database.rows<{ count: number }>("SELECT count(*)::INTEGER AS count FROM swim_lengths WHERE activity_source_id = 'garmin:swim-1'"),
+      ]);
+      expect(intervals).toEqual([{ source_type: 'garmin_detected', label: 'INTERVAL_ACTIVE', distance_m: 100, duration_s: 120, moving_s: 110, avg_hr: 160 }]);
+      expect(sets).toEqual([
+        { source_type: 'garmin_detected', label: 'INTERVAL_ACTIVE', reps: 2, rep_distance_m: null, total_distance_m: 100, work_s: 110, avg_hr: 160 },
+        { source_type: 'intervals_auto', label: '2x 25m 155bpm', reps: 2, rep_distance_m: 25, total_distance_m: 50, work_s: null, avg_hr: 155 },
+      ]);
+      expect(lengths[0]?.count).toBe(0);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('flags implausible pool data and exposes provider distance precedence without suppressing either source', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('garmin', '2026-07-19');
+    try {
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity', remoteId: 'bad-swim', parentRemoteId: null,
+        occurredOn: '2026-07-19', sourceUpdatedAt: null, rawObjectHash: 'bad-garmin', extension: {},
+        payload: {
+          activityId: 'bad-swim', startTimeGMT: '2026-07-19T17:00:00Z', activityType: 'lap_swimming', distance: 266, duration: 3131,
+          poolLength: 1400, activeLengths: 19, averageSpeed: 0, averageSwimCadenceInStrokesPerMinute: 0,
+        },
+      });
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'intervals', entityType: 'activity', remoteId: 'bad-intervals', parentRemoteId: null,
+        occurredOn: '2026-07-19', sourceUpdatedAt: null, rawObjectHash: 'bad-intervals', extension: {},
+        payload: { id: 'bad-intervals', external_id: 'bad-swim', start_date: '2026-07-19T17:00:00Z', type: 'Swimming', distance: 180 },
+      });
+      const flags = await database.rows<{ activity_source_id: string; flag_code: string }>(`
+        SELECT activity_source_id, flag_code FROM activity_quality_flag_facts ORDER BY activity_source_id, flag_code
+      `);
+      const canonical = await database.rows<{ garmin_distance_m: number; intervals_distance_m: number; resolved_distance_m: number; distance_source: string; provider_distance_difference_m: number; quality_flags: unknown }>(`
+        SELECT garmin_distance_m, intervals_distance_m, resolved_distance_m, distance_source, provider_distance_difference_m, quality_flags
+        FROM canonical_activity_facts WHERE activity_id = 'garmin:bad-swim'
+      `);
+      expect(flags).toEqual(expect.arrayContaining([
+        { activity_source_id: 'garmin:bad-swim', flag_code: 'pool_length_implausible' },
+        { activity_source_id: 'garmin:bad-swim', flag_code: 'zero_swim_speed_and_cadence' },
+        { activity_source_id: 'garmin:bad-swim', flag_code: 'provider_distance_disagreement' },
+        { activity_source_id: 'intervals:bad-intervals', flag_code: 'provider_distance_disagreement' },
+      ]));
+      expect(canonical).toEqual([expect.objectContaining({
+        garmin_distance_m: 266, intervals_distance_m: 180, resolved_distance_m: 266, distance_source: 'garmin', provider_distance_difference_m: 86,
+      })]);
+    } finally {
+      await database.close();
+    }
+  });
+
   it('records extraction errors without blocking independent records', async () => {
     const { database } = await temporaryDatabase();
     const runId = await database.beginRun('intervals', '2025-07-29');

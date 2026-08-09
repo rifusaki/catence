@@ -4,7 +4,7 @@ import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import type { CatenceDatabase } from '../storage/database.js';
 import { stagingRecordSchema, type StagingRecord } from '../../contracts/staging.js';
-import { importSourceEntity } from '../normalization/normalizers.js';
+import { importSourceEntity, refreshActivityQuality } from '../normalization/normalizers.js';
 import { normalizeStravaEntity } from '../normalization/segments/strava-normalizer.js';
 import { reconcileActivityLink } from '../normalization/activities/linking.js';
 import { json } from '../storage/sql.js';
@@ -29,7 +29,15 @@ export async function importRecord(database: CatenceDatabase, runId: string, rec
   if (record.kind === 'source_entity') {
     if (record.provider === 'strava') await normalizeStravaEntity(database, record);
     else await importSourceEntity(database, record);
-    if (record.entityType === 'activity') await reconcileActivityLink(database, record.provider + ':' + record.remoteId);
+    if (record.entityType === 'activity') {
+      await reconcileActivityLink(database, record.provider + ':' + record.remoteId);
+      const activity = await database.rows<{ activity_id: string }>('SELECT activity_id FROM activity_sources WHERE activity_source_id = $activitySourceId', { activitySourceId: record.provider + ':' + record.remoteId });
+      if (activity[0]?.activity_id) await refreshActivityQuality(database, activity[0].activity_id);
+    }
+    if (record.provider === 'garmin' && ['activity_detail', 'activity_interval', 'activity_exercise_set'].includes(record.entityType) && record.parentRemoteId) {
+      const activity = await database.rows<{ activity_id: string }>('SELECT activity_id FROM activity_sources WHERE activity_source_id = $activitySourceId', { activitySourceId: `garmin:${record.parentRemoteId}` });
+      if (activity[0]?.activity_id) await refreshActivityQuality(database, activity[0].activity_id);
+    }
     return;
   }
   if (record.kind === 'stream_manifest') {

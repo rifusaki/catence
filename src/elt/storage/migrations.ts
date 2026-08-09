@@ -502,5 +502,340 @@ const garminLactateThresholdMetricsMigration: Migration = {
   `,
 };
 
-export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration];
+const swimFactsAndQualityMigration: Migration = {
+  version: 13,
+  name: 'swim_facts_quality_and_canonical_provenance',
+  sql: `
+    -- Explicit length records are intentionally separate from generic samples.
+    -- A sample stream without a provider-supplied length boundary must never be
+    -- expanded into artificial 25 m (or similar) laps.
+    CREATE TABLE IF NOT EXISTS swim_lengths (
+      activity_source_id VARCHAR NOT NULL,
+      source VARCHAR NOT NULL,
+      length_index INTEGER NOT NULL,
+      lap_index INTEGER,
+      pool_length_m DOUBLE,
+      start_time TIMESTAMPTZ,
+      duration_s DOUBLE,
+      active_duration_s DOUBLE,
+      distance_m DOUBLE,
+      stroke_count DOUBLE,
+      stroke_rate DOUBLE,
+      swolf DOUBLE,
+      avg_hr DOUBLE,
+      max_hr DOUBLE,
+      is_rest BOOLEAN,
+      confidence VARCHAR NOT NULL,
+      metrics_json JSON NOT NULL DEFAULT '{}',
+      raw_object_hash VARCHAR,
+      PRIMARY KEY (activity_source_id, source, length_index)
+    );
+    CREATE INDEX IF NOT EXISTS swim_lengths_source_idx ON swim_lengths (activity_source_id, source, length_index);
+
+    -- Sets preserve the provider's grouping rather than turning a detected
+    -- "12 x 52 m" block into a user-authored 12 x 50 m workout.
+    CREATE TABLE IF NOT EXISTS swim_sets (
+      activity_source_id VARCHAR NOT NULL,
+      source_type VARCHAR NOT NULL,
+      set_index INTEGER NOT NULL,
+      label VARCHAR,
+      reps INTEGER,
+      rep_distance_m DOUBLE,
+      total_distance_m DOUBLE,
+      work_s DOUBLE,
+      rest_s DOUBLE,
+      avg_pace DOUBLE,
+      avg_hr DOUBLE,
+      max_hr DOUBLE,
+      stroke_rate DOUBLE,
+      metrics_json JSON NOT NULL DEFAULT '{}',
+      raw_object_hash VARCHAR,
+      PRIMARY KEY (activity_source_id, source_type, set_index)
+    );
+    CREATE INDEX IF NOT EXISTS swim_sets_source_idx ON swim_sets (activity_source_id, source_type, set_index);
+
+    CREATE TABLE IF NOT EXISTS activity_quality_flags (
+      activity_source_id VARCHAR NOT NULL,
+      flag_code VARCHAR NOT NULL,
+      severity VARCHAR NOT NULL,
+      details_json JSON NOT NULL DEFAULT '{}',
+      raw_object_hash VARCHAR,
+      PRIMARY KEY (activity_source_id, flag_code)
+    );
+    CREATE INDEX IF NOT EXISTS activity_quality_flags_source_idx ON activity_quality_flags (activity_source_id, severity);
+
+    ALTER TABLE activity_intervals ADD COLUMN IF NOT EXISTS duration_s DOUBLE;
+    ALTER TABLE activity_intervals ADD COLUMN IF NOT EXISTS moving_s DOUBLE;
+    ALTER TABLE activity_intervals ADD COLUMN IF NOT EXISTS source_type VARCHAR;
+    -- DuckDB binds SELECT intervals.* at view-creation time, so refresh this
+    -- projection after extending the underlying interval table.
+    CREATE OR REPLACE VIEW activity_interval_facts AS
+    SELECT intervals.*, source.activity_id, source.provider,
+      activity.started_at_utc, activity.sport, activity.name
+    FROM activity_intervals AS intervals
+    JOIN activity_sources AS source USING (activity_source_id)
+    JOIN activities AS activity USING (activity_id);
+
+    -- Older Garmin imports retained the useful split summaries in one raw
+    -- payload, then tried to read interval fields from its wrapper object.  A
+    -- row per provider summary restores the supplied duration/HR/distance
+    -- without manufacturing chronology or per-length splits.
+    DELETE FROM activity_intervals AS interval
+    USING activity_sources AS source, source_entities AS entity
+    WHERE interval.activity_source_id = source.activity_source_id
+      AND source.provider = 'garmin'
+      AND entity.provider = 'garmin'
+      AND entity.entity_type = 'activity_interval'
+      AND entity.parent_remote_id = source.remote_activity_id
+      AND interval.interval_key = entity.remote_id
+      AND json_type(entity.payload_json, '$.splitSummaries') = 'ARRAY';
+    -- Some Garmin detail endpoints supplied a wrapper with no interval fields
+    -- at all. Those rows are neither a split nor a useful no-distance segment;
+    -- remove only that entirely-null legacy shape before adding the supplied
+    -- split summaries below.
+    DELETE FROM activity_intervals AS interval
+    USING activity_sources AS source
+    WHERE interval.activity_source_id = source.activity_source_id
+      AND source.provider = 'garmin'
+      AND interval.source_type IS NULL
+      AND interval.start_s IS NULL AND interval.end_s IS NULL AND interval.duration_s IS NULL AND interval.moving_s IS NULL
+      AND interval.distance_m IS NULL AND interval.avg_power IS NULL AND interval.avg_hr IS NULL
+      AND interval.avg_pace IS NULL AND interval.intensity IS NULL;
+
+    INSERT INTO activity_intervals
+      (activity_source_id, interval_key, label, start_s, end_s, distance_m, avg_power, avg_hr, avg_pace, intensity, metrics_json, duration_s, moving_s, source_type)
+    SELECT source.activity_source_id,
+      'garmin:split_summary:' || entry.key,
+      json_extract_string(entry.value, '$.splitType'),
+      NULL, NULL,
+      try_cast(json_extract_string(entry.value, '$.distance') AS DOUBLE),
+      NULL,
+      try_cast(json_extract_string(entry.value, '$.averageHR') AS DOUBLE),
+      NULL, NULL,
+      json_object('splitSummary', entry.value),
+      try_cast(json_extract_string(entry.value, '$.duration') AS DOUBLE),
+      try_cast(json_extract_string(entry.value, '$.movingDuration') AS DOUBLE),
+      'garmin_detected'
+    FROM source_entities AS entity
+    JOIN activity_sources AS source
+      ON source.provider = 'garmin' AND source.remote_activity_id = entity.parent_remote_id
+    CROSS JOIN json_each(entity.payload_json, '$.splitSummaries') AS entry
+    WHERE entity.provider = 'garmin' AND entity.entity_type = 'activity_interval'
+    ON CONFLICT (activity_source_id, interval_key) DO UPDATE SET
+      label = excluded.label, start_s = excluded.start_s, end_s = excluded.end_s,
+      distance_m = excluded.distance_m, avg_power = excluded.avg_power, avg_hr = excluded.avg_hr,
+      avg_pace = excluded.avg_pace, intensity = excluded.intensity, metrics_json = excluded.metrics_json,
+      duration_s = excluded.duration_s, moving_s = excluded.moving_s, source_type = excluded.source_type;
+
+    INSERT INTO swim_sets
+      (activity_source_id, source_type, set_index, label, reps, rep_distance_m, total_distance_m, work_s, rest_s, avg_pace, avg_hr, max_hr, stroke_rate, metrics_json, raw_object_hash)
+    SELECT source.activity_source_id, 'garmin_detected', try_cast(entry.key AS INTEGER),
+      json_extract_string(entry.value, '$.splitType'),
+      try_cast(json_extract_string(entry.value, '$.noOfSplits') AS INTEGER),
+      NULL,
+      try_cast(json_extract_string(entry.value, '$.distance') AS DOUBLE),
+      try_cast(json_extract_string(entry.value, '$.movingDuration') AS DOUBLE),
+      NULL, NULL,
+      try_cast(json_extract_string(entry.value, '$.averageHR') AS DOUBLE),
+      try_cast(json_extract_string(entry.value, '$.maxHR') AS DOUBLE),
+      NULL,
+      json_object('splitSummary', entry.value), entity.raw_object_hash
+    FROM source_entities AS entity
+    JOIN activity_sources AS source
+      ON source.provider = 'garmin' AND source.remote_activity_id = entity.parent_remote_id
+    CROSS JOIN json_each(entity.payload_json, '$.splitSummaries') AS entry
+    WHERE entity.provider = 'garmin' AND entity.entity_type = 'activity_interval'
+    ON CONFLICT (activity_source_id, source_type, set_index) DO UPDATE SET
+      label = excluded.label, reps = excluded.reps, rep_distance_m = excluded.rep_distance_m,
+      total_distance_m = excluded.total_distance_m, work_s = excluded.work_s, rest_s = excluded.rest_s,
+      avg_pace = excluded.avg_pace, avg_hr = excluded.avg_hr, max_hr = excluded.max_hr,
+      stroke_rate = excluded.stroke_rate, metrics_json = excluded.metrics_json,
+      raw_object_hash = excluded.raw_object_hash;
+
+    -- Intervals.icu exposes its swim blocks on the activity summary.  Parse
+    -- only its documented compact labels; duration and pace stay null because
+    -- that payload does not supply them reliably.
+    WITH blocks AS (
+      SELECT source.activity_source_id, source.raw_object_hash, try_cast(entry.key AS INTEGER) AS set_index,
+        json_extract_string(entry.value, '$') AS raw_label,
+        regexp_extract(json_extract_string(entry.value, '$'), '^\\s*(\\d+)\\s*x\\s*(\\d+(?:\\.\\d+)?)\\s*m(?:\\s+(\\d+(?:\\.\\d+)?)\\s*bpm)?\\s*$', 1) AS reps_text,
+        regexp_extract(json_extract_string(entry.value, '$'), '^\\s*(\\d+)\\s*x\\s*(\\d+(?:\\.\\d+)?)\\s*m(?:\\s+(\\d+(?:\\.\\d+)?)\\s*bpm)?\\s*$', 2) AS distance_text,
+        regexp_extract(json_extract_string(entry.value, '$'), '^\\s*(\\d+)\\s*x\\s*(\\d+(?:\\.\\d+)?)\\s*m(?:\\s+(\\d+(?:\\.\\d+)?)\\s*bpm)?\\s*$', 3) AS hr_text
+      FROM source_entities AS entity
+      JOIN activity_sources AS source
+        ON source.provider = 'intervals' AND source.remote_activity_id = entity.remote_id
+      CROSS JOIN json_each(entity.payload_json, '$.interval_summary') AS entry
+      WHERE entity.provider = 'intervals' AND entity.entity_type = 'activity'
+    )
+    INSERT INTO swim_sets
+      (activity_source_id, source_type, set_index, label, reps, rep_distance_m, total_distance_m, work_s, rest_s, avg_pace, avg_hr, max_hr, stroke_rate, metrics_json, raw_object_hash)
+    SELECT activity_source_id, 'intervals_auto', set_index, raw_label,
+      try_cast(reps_text AS INTEGER), try_cast(distance_text AS DOUBLE),
+      try_cast(reps_text AS DOUBLE) * try_cast(distance_text AS DOUBLE),
+      NULL, NULL, NULL, try_cast(nullif(hr_text, '') AS DOUBLE), NULL, NULL,
+      json_object('rawLabel', raw_label, 'providerGrouping', 'intervals_auto'), raw_object_hash
+    FROM blocks
+    WHERE reps_text <> '' AND distance_text <> ''
+    ON CONFLICT (activity_source_id, source_type, set_index) DO UPDATE SET
+      label = excluded.label, reps = excluded.reps, rep_distance_m = excluded.rep_distance_m,
+      total_distance_m = excluded.total_distance_m, work_s = excluded.work_s, rest_s = excluded.rest_s,
+      avg_pace = excluded.avg_pace, avg_hr = excluded.avg_hr, max_hr = excluded.max_hr,
+      stroke_rate = excluded.stroke_rate, metrics_json = excluded.metrics_json,
+      raw_object_hash = excluded.raw_object_hash;
+
+    INSERT INTO activity_intervals
+      (activity_source_id, interval_key, label, start_s, end_s, distance_m, avg_power, avg_hr, avg_pace, intensity, metrics_json, duration_s, moving_s, source_type)
+    SELECT activity_source_id, 'intervals:auto:' || set_index, label,
+      NULL, NULL, total_distance_m, NULL, avg_hr, NULL, NULL,
+      metrics_json, NULL, NULL, 'intervals_auto'
+    FROM swim_sets
+    WHERE source_type = 'intervals_auto'
+    ON CONFLICT (activity_source_id, interval_key) DO UPDATE SET
+      label = excluded.label, start_s = excluded.start_s, end_s = excluded.end_s,
+      distance_m = excluded.distance_m, avg_power = excluded.avg_power, avg_hr = excluded.avg_hr,
+      avg_pace = excluded.avg_pace, intensity = excluded.intensity, metrics_json = excluded.metrics_json,
+      duration_s = excluded.duration_s, moving_s = excluded.moving_s, source_type = excluded.source_type;
+
+    -- Quality flags are source facts.  They make the data limitation visible
+    -- without suppressing the original provider summary.
+    INSERT INTO activity_quality_flags (activity_source_id, flag_code, severity, details_json, raw_object_hash)
+    SELECT source.activity_source_id, 'pool_length_implausible', 'warning',
+      json_object('poolLengthM', CASE WHEN pool_length >= 100 THEN pool_length / 100 ELSE pool_length END), source.raw_object_hash
+    FROM activity_sources AS source
+    JOIN activities AS activity USING (activity_id)
+    JOIN activity_summaries AS summary USING (activity_source_id)
+    CROSS JOIN LATERAL (SELECT try_cast(json_extract_string(summary.metrics_json, '$.poolLength') AS DOUBLE) AS pool_length) AS values
+    WHERE source.provider = 'garmin' AND lower(activity.sport) = 'lap_swimming'
+      AND pool_length IS NOT NULL
+      AND (CASE WHEN pool_length >= 100 THEN pool_length / 100 ELSE pool_length END) NOT BETWEEN 15 AND 100
+    ON CONFLICT (activity_source_id, flag_code) DO UPDATE SET severity = excluded.severity, details_json = excluded.details_json, raw_object_hash = excluded.raw_object_hash;
+
+    INSERT INTO activity_quality_flags (activity_source_id, flag_code, severity, details_json, raw_object_hash)
+    SELECT source.activity_source_id, 'zero_swim_speed_and_cadence', 'warning',
+      json_object('averageSpeedMps', average_speed, 'strokeCadenceSpm', cadence, 'durationS', greatest(coalesce(summary.moving_s, 0), coalesce(summary.elapsed_s, 0))), source.raw_object_hash
+    FROM activity_sources AS source
+    JOIN activities AS activity USING (activity_id)
+    JOIN activity_summaries AS summary USING (activity_source_id)
+    CROSS JOIN LATERAL (
+      SELECT try_cast(json_extract_string(summary.metrics_json, '$.averageSpeed') AS DOUBLE) AS average_speed,
+        try_cast(json_extract_string(summary.metrics_json, '$.averageSwimCadenceInStrokesPerMinute') AS DOUBLE) AS cadence
+    ) AS values
+    WHERE source.provider = 'garmin' AND lower(activity.sport) = 'lap_swimming'
+      AND greatest(coalesce(summary.moving_s, 0), coalesce(summary.elapsed_s, 0)) >= 900
+      AND average_speed = 0 AND cadence = 0
+    ON CONFLICT (activity_source_id, flag_code) DO UPDATE SET severity = excluded.severity, details_json = excluded.details_json, raw_object_hash = excluded.raw_object_hash;
+
+    INSERT INTO activity_quality_flags (activity_source_id, flag_code, severity, details_json, raw_object_hash)
+    SELECT source.activity_source_id, 'active_lengths_distance_mismatch', 'warning',
+      json_object('activeLengths', active_lengths, 'poolLengthM', pool_length_m, 'expectedDistanceM', active_lengths * pool_length_m, 'summaryDistanceM', summary.distance_m), source.raw_object_hash
+    FROM activity_sources AS source
+    JOIN activities AS activity USING (activity_id)
+    JOIN activity_summaries AS summary USING (activity_source_id)
+    CROSS JOIN LATERAL (
+      SELECT try_cast(json_extract_string(summary.metrics_json, '$.activeLengths') AS DOUBLE) AS active_lengths,
+        try_cast(json_extract_string(summary.metrics_json, '$.poolLength') AS DOUBLE) AS raw_pool_length
+    ) AS raw_values
+    CROSS JOIN LATERAL (SELECT CASE WHEN raw_pool_length >= 100 THEN raw_pool_length / 100 ELSE raw_pool_length END AS pool_length_m) AS values
+    WHERE source.provider = 'garmin' AND lower(activity.sport) = 'lap_swimming'
+      AND active_lengths > 0 AND pool_length_m > 0 AND summary.distance_m > 0
+      AND abs(active_lengths * pool_length_m - summary.distance_m) > greatest(pool_length_m, active_lengths * pool_length_m * 0.02)
+    ON CONFLICT (activity_source_id, flag_code) DO UPDATE SET severity = excluded.severity, details_json = excluded.details_json, raw_object_hash = excluded.raw_object_hash;
+
+    INSERT INTO activity_quality_flags (activity_source_id, flag_code, severity, details_json, raw_object_hash)
+    SELECT source.activity_source_id, 'swim_length_data_unavailable', 'info',
+      json_object('reason', 'No explicit provider-supplied per-length records were imported.'), source.raw_object_hash
+    FROM activity_sources AS source
+    JOIN activities AS activity USING (activity_id)
+    WHERE source.provider = 'garmin' AND lower(activity.sport) = 'lap_swimming'
+      AND NOT EXISTS (SELECT 1 FROM swim_lengths AS length WHERE length.activity_source_id = source.activity_source_id)
+    ON CONFLICT (activity_source_id, flag_code) DO UPDATE SET severity = excluded.severity, details_json = excluded.details_json, raw_object_hash = excluded.raw_object_hash;
+
+    WITH comparisons AS (
+      SELECT activity_id,
+        max(activity_source_id) FILTER (WHERE provider = 'garmin') AS garmin_source_id,
+        max(distance_m) FILTER (WHERE provider = 'garmin') AS garmin_distance_m,
+        max(activity_source_id) FILTER (WHERE provider = 'intervals') AS intervals_source_id,
+        max(distance_m) FILTER (WHERE provider = 'intervals') AS intervals_distance_m
+      FROM activity_summary_facts
+      GROUP BY activity_id
+    )
+    INSERT INTO activity_quality_flags (activity_source_id, flag_code, severity, details_json, raw_object_hash)
+    SELECT source.activity_source_id, 'provider_distance_disagreement', 'warning',
+      json_object('garminDistanceM', comparison.garmin_distance_m, 'intervalsDistanceM', comparison.intervals_distance_m,
+        'differenceM', abs(comparison.garmin_distance_m - comparison.intervals_distance_m), 'toleranceM', greatest(50, comparison.garmin_distance_m * 0.05)),
+      source.raw_object_hash
+    FROM comparisons AS comparison
+    JOIN activity_sources AS source ON source.activity_id = comparison.activity_id AND source.provider IN ('garmin', 'intervals')
+    WHERE comparison.garmin_distance_m IS NOT NULL AND comparison.intervals_distance_m IS NOT NULL
+      AND abs(comparison.garmin_distance_m - comparison.intervals_distance_m) > greatest(50, comparison.garmin_distance_m * 0.05)
+    ON CONFLICT (activity_source_id, flag_code) DO UPDATE SET severity = excluded.severity, details_json = excluded.details_json, raw_object_hash = excluded.raw_object_hash;
+
+    CREATE OR REPLACE VIEW swim_length_facts AS
+    SELECT length.*, source.activity_id, source.provider, activity.started_at_utc, activity.sport, activity.name
+    FROM swim_lengths AS length
+    JOIN activity_sources AS source USING (activity_source_id)
+    JOIN activities AS activity USING (activity_id);
+
+    CREATE OR REPLACE VIEW swim_set_facts AS
+    SELECT swim_set.*, source.activity_id, source.provider, activity.started_at_utc, activity.sport, activity.name
+    FROM swim_sets AS swim_set
+    JOIN activity_sources AS source USING (activity_source_id)
+    JOIN activities AS activity USING (activity_id);
+
+    CREATE OR REPLACE VIEW activity_quality_flag_facts AS
+    SELECT flag.*, source.activity_id, source.provider, activity.started_at_utc, activity.sport, activity.name
+    FROM activity_quality_flags AS flag
+    JOIN activity_sources AS source USING (activity_source_id)
+    JOIN activities AS activity USING (activity_id);
+
+    CREATE OR REPLACE VIEW canonical_activity_facts AS
+    WITH source_metrics AS (
+      SELECT source.activity_id, source.activity_source_id, source.provider,
+        summary.distance_m, summary.moving_s, summary.elapsed_s, summary.avg_hr
+      FROM activity_sources AS source
+      LEFT JOIN activity_summaries AS summary USING (activity_source_id)
+    ), per_activity AS (
+      SELECT activity_id,
+        max(activity_source_id) FILTER (WHERE provider = 'garmin') AS garmin_activity_source_id,
+        max(distance_m) FILTER (WHERE provider = 'garmin') AS garmin_distance_m,
+        max(moving_s) FILTER (WHERE provider = 'garmin') AS garmin_moving_s,
+        max(elapsed_s) FILTER (WHERE provider = 'garmin') AS garmin_elapsed_s,
+        max(avg_hr) FILTER (WHERE provider = 'garmin') AS garmin_avg_hr,
+        max(activity_source_id) FILTER (WHERE provider = 'intervals') AS intervals_activity_source_id,
+        max(distance_m) FILTER (WHERE provider = 'intervals') AS intervals_distance_m,
+        max(moving_s) FILTER (WHERE provider = 'intervals') AS intervals_moving_s,
+        max(elapsed_s) FILTER (WHERE provider = 'intervals') AS intervals_elapsed_s,
+        max(avg_hr) FILTER (WHERE provider = 'intervals') AS intervals_avg_hr
+      FROM source_metrics GROUP BY activity_id
+    ), flag_rollup AS (
+      SELECT source.activity_id,
+        json_group_array(json_object('activitySourceId', flag.activity_source_id, 'code', flag.flag_code,
+          'severity', flag.severity, 'details', flag.details_json)) AS quality_flags
+      FROM activity_quality_flags AS flag
+      JOIN activity_sources AS source USING (activity_source_id)
+      GROUP BY source.activity_id
+    )
+    SELECT activity.activity_id, activity.started_at_utc, activity.started_at_local, activity.timezone, activity.sport, activity.name, activity.link_state,
+      per_activity.garmin_activity_source_id, per_activity.garmin_distance_m, per_activity.garmin_moving_s, per_activity.garmin_elapsed_s, per_activity.garmin_avg_hr,
+      per_activity.intervals_activity_source_id, per_activity.intervals_distance_m, per_activity.intervals_moving_s, per_activity.intervals_elapsed_s, per_activity.intervals_avg_hr,
+      coalesce(per_activity.garmin_distance_m, per_activity.intervals_distance_m) AS resolved_distance_m,
+      CASE WHEN per_activity.garmin_distance_m IS NOT NULL THEN 'garmin' WHEN per_activity.intervals_distance_m IS NOT NULL THEN 'intervals' ELSE NULL END AS distance_source,
+      coalesce(per_activity.garmin_moving_s, per_activity.intervals_moving_s) AS resolved_moving_s,
+      CASE WHEN per_activity.garmin_moving_s IS NOT NULL THEN 'garmin' WHEN per_activity.intervals_moving_s IS NOT NULL THEN 'intervals' ELSE NULL END AS moving_s_source,
+      coalesce(per_activity.garmin_elapsed_s, per_activity.intervals_elapsed_s) AS resolved_elapsed_s,
+      CASE WHEN per_activity.garmin_elapsed_s IS NOT NULL THEN 'garmin' WHEN per_activity.intervals_elapsed_s IS NOT NULL THEN 'intervals' ELSE NULL END AS elapsed_s_source,
+      coalesce(per_activity.garmin_avg_hr, per_activity.intervals_avg_hr) AS resolved_avg_hr,
+      CASE WHEN per_activity.garmin_avg_hr IS NOT NULL THEN 'garmin' WHEN per_activity.intervals_avg_hr IS NOT NULL THEN 'intervals' ELSE NULL END AS avg_hr_source,
+      CASE WHEN per_activity.garmin_distance_m IS NOT NULL AND per_activity.intervals_distance_m IS NOT NULL
+        THEN abs(per_activity.garmin_distance_m - per_activity.intervals_distance_m) ELSE NULL END AS provider_distance_difference_m,
+      coalesce(flag_rollup.quality_flags, cast('[]' AS JSON)) AS quality_flags
+    FROM activities AS activity
+    LEFT JOIN per_activity USING (activity_id)
+    LEFT JOIN flag_rollup USING (activity_id);
+
+    UPDATE retrieval_index_state SET status = 'stale' WHERE index_name = 'context';
+  `,
+};
+
+export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration];
 export type { Migration };

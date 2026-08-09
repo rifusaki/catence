@@ -74,6 +74,39 @@ not zero. `metrics_json` remains the source-specific escape hatch.
 `distance_m`, `heart_rate_bpm`, and other nullable sensor fields. It cannot
 be used to introduce an arbitrary Parquet path.
 
+## Swim facts and tools
+
+`swim_length_facts` contains only explicit provider-supplied length records.
+Catence does not infer a 25 m/50 m length boundary, rest, or pace from Garmin
+sample points when distance disappears after the opening sample. An empty
+length result therefore means *not supplied*, not no lengths swum.
+
+`swim_set_facts` retains source-specific grouped work:
+
+- `garmin_detected` comes from Garmin split summaries and may have a supplied
+  duration/HR but no usable distance;
+- `intervals_auto` parses Intervals.icu labels such as `12x 52m 154bpm` into
+  `reps`, `rep_distance_m`, total distance, and mean HR. It remains an
+  auto-detected block, not a manually pressed set, and pace/work/rest stay
+  null unless supplied.
+
+`activity_interval_facts` now includes `duration_s`, `moving_s`, and
+`source_type` for those source rows. `canonical_activity_facts` exposes the
+unmodified Garmin and Intervals values beside each selected field, the source
+that won precedence, their distance difference, and quality flags.
+
+Use `get_swim_laps({ activityId, provider? })` for one source or linked
+activity. A source ID is resolved exactly; a logical activity ID returns all
+linked swim sources. Use `swim_progress_report({ startDate, endDate,
+poolLengthM? })` for Garmin-native summary comparisons. The report never
+creates a pace trend from `moving_s / distance_m`, and it returns
+data-completeness notes for per-length pace.
+
+Ingestion flags implausible pool settings, zero speed/cadence long pool
+sessions, active-length/distance mismatches, linked-provider distance
+disagreements, and missing explicit length records. Flags are caveats; they
+never overwrite or discard a provider's source values.
+
 ## Current investigation procedure
 
 Use this procedure until the endpoints below exist.

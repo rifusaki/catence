@@ -10,6 +10,7 @@ import { AnalyticsService, type DataFilter } from '../../core/query/analytics.js
 import { ActivityDiscoveryService } from '../../core/query/activity-discovery.js';
 import { getDataset, QueryValidationError } from '../../core/query/catalog.js';
 import { FitnessService } from '../../core/query/fitness.js';
+import { SwimmingService } from '../../core/query/swimming.js';
 import { jsonSafe, ReadOnlyRepository } from '../../core/query/repository.js';
 import { queryReadOnlyData } from '../../core/query/sql-guard.js';
 
@@ -235,6 +236,18 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
       sort: z.enum(['date_desc', 'date_asc']).optional(), limit: z.number().int().min(1).max(100).optional(), cursor: z.string().min(1).optional(),
     },
   }, tool('find_activities', async (input) => useRepository(paths, (repository) => new ActivityDiscoveryService(repository).findActivities(input))));
+
+  server.registerTool('get_swim_laps', {
+    title: 'Read explicit swim lengths and grouped sets',
+    description: 'Return source-aware swim lengths when a provider actually supplied them, plus Garmin detected and Intervals.icu auto-detected sets. A missing length list is reported as unavailable; laps are never reconstructed from samples.',
+    inputSchema: { activityId: z.string().min(1), provider: z.enum(['garmin', 'intervals']).optional() },
+  }, tool('get_swim_laps', async (input) => useRepository(paths, (repository) => new SwimmingService(repository).swimLaps(input))));
+
+  server.registerTool('swim_progress_report', {
+    title: 'Build a source-aware swim progress report',
+    description: 'Compare Garmin swimming summaries and data completeness over a date range, optionally within one pool length. It does not derive pace trends from moving time divided by distance.',
+    inputSchema: { startDate: z.string().date().optional(), endDate: z.string().date().optional(), poolLengthM: z.number().positive().max(200).optional() },
+  }, tool('swim_progress_report', async (input) => useRepository(paths, (repository) => new SwimmingService(repository).swimProgressReport(input))));
 
   server.registerTool('get_activity_segments', {
     title: 'Hydrate and read an activity’s Strava segments',
