@@ -1,15 +1,10 @@
 # MCP activity retrieval contract
 
-This document is the implementation contract for answering questions such as
-“what was my latest activity?”, “show me its laps”, and “how did it compare
-with recent swims?”. It records the current data behaviour and the dedicated
-MCP endpoints that should replace repeated ad-hoc SQL. It is deliberately
-source-aware: an agent must not turn plausible Garmin/Intervals coincidences
-into asserted facts.
+This document is the implementation contract for answering questions. It records the current data behaviour and the dedicated MCP endpoints that should replace repeated ad-hoc SQL.
 
-> The only mutation exception is targeted Strava activity, serial activity-batch, or segment-history hydration. It acquires the shared data-directory lock, calls only the Strava GET allowlist, archives responses before normalization, and returns a retryable busy result if another writer owns the lock.
+The only mutation exception is targeted Strava activity, serial activity-batch, or segment-history hydration. It acquires the shared data-directory lock, calls only the Strava GET allowlist, archives responses before normalization, and returns a retryable busy result if another writer owns the lock.
 
-## Non-negotiable rules
+## Basics
 
 - The MCP server is a local, stdio-only consumer of DuckDB and
   registered Parquet files. These endpoints must not call Garmin or

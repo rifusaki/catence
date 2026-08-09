@@ -1,6 +1,7 @@
-# Catence
+# Catence architecture
 
-This is the first design document for Catence, a local MCP server for AI agents to interact with health and fitness data.
+This document records the architecture and design rationale for Catence, a
+local MCP server for AI agents to interact with health and fitness data.
 
 Even though a great deal of code is written by an agent, the base architecture remains human-driven. However, since I am quite a beginner this means it may actually be somewhat less efficient, but as IBM famously said (somewhere), machine can't make decisions.
 
@@ -171,24 +172,3 @@ Dedicated tools should be added gradually only when recurring questions have
 stable semantics and cannot be expressed clearly by these primitives. They must
 call the same repository/analytics services, preserving provenance and the
 read-only boundary.
-
-### Distribution MVP and future web hosts
-
-The public npm distribution is named `catence`. It exports two commands:
-`catence`, the direct stdio-only server, and `catence-data`, the management CLI. Both accept an explicit
-data directory; the server never initializes or runs a general sync. Ordinary queries never write, while the declared Strava hydration tools use the shared locked writer path.
-This makes one local data snapshot usable by multiple agents without relying on
-their current working directory or sharing provider credentials.
-
-The package includes the Python Garmin and Strava workers and its `uv` project metadata so
-the management CLI remains functional after installation. Its Python virtual
-environment belongs under the selected data directory, rather than the npm
-installation directory.
-
-Streamable HTTP is deliberately not part of this MVP. An Open WebUI-style
-integration must be a separately authenticated hosting adapter that assigns an
-isolated data directory per user and retains all existing query/path guards.
-It must preserve the local server narrow writer contract, provider GET allowlist, and no-arbitrary-filesystem rule.
-
-The source-aware contract for activity discovery, details, laps/segments, and
-sample streams is documented in [MCP activity retrieval](mcp-activity-retrieval.md).
