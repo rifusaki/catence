@@ -27,6 +27,11 @@ into asserted facts.
   `data_sync_in_progress`, `data_unavailable`, and `invalid_request`.
 - Source values are retained alongside derived values. Derived fields must name
   their formula and must never overwrite a provider field.
+- For a selected activity’s Strava segments, climbs, per-segment grades, or
+  KOM/PRs, call `get_activity_segments`. It hydrates the matching Strava
+  activity before reading its efforts. Do not report segments as absent unless
+  that hydration result is `not_found`, `ambiguous`, unauthorised, throttled,
+  or failed—and report that result rather than guessing.
 
 ## What exists today
 
@@ -41,6 +46,7 @@ rather than embedding their own DuckDB connection or SQL guard.
 | Read provider summary metrics | `aggregate_data` or `query_read_only_data` on `activity_summaries` | `activity_source_id` |
 | Read structured interval chunks | `query_read_only_data` on `activity_interval_facts` | `activity_source_id` |
 | Inspect sample-level HR/distance/etc. | `read_series` with `dataset: "activity_samples"` | `activity_source_id` |
+| Read an activity’s Strava segments/climbs | `get_activity_segments` | canonical `activity_id` or `activity_source_id` |
 | Locate relevant activity text | `search_context` | returned entity/activity identifiers |
 
 `activity_summary_facts` is the provider-specific summary view. It includes
@@ -116,6 +122,9 @@ only after their shared service methods and fixture tests exist.
 - `describe_dataset(dataset)` returns one cataloged schema and its coverage. `training_metric_observations` also reports its observed sports, metric names, units, and source types.
 - `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, and `power_coverage_report` read normalized, source-aware fitness facts. Power tools require an explicit sport or sport family, use `power_bests`/`power_best_facts` for FIT-derived duration values, and do not treat sparse `avg_power` summaries as coverage. `get_vo2max_history` does not default to cycling: omission returns available sports and requires an explicit choice; Garmin running VO₂max may be labelled `generic`.
 - `find_activities` is implemented for compact, canonical, paginated activity/race discovery by sport, distance, name, and date. Its race flags are transparent heuristics, not provider-confirmed race metadata.
+- `get_activity_segments` is the required segment/climb path. It performs the
+  targeted Strava hydration before returning the persisted effort and segment
+  facts; an empty result must be interpreted alongside its hydration status.
 - `latest_cycling_activities` returns Garmin source records to avoid silently double-counting linked Intervals summaries; optional multisport parents are explicitly flagged.
 - `cycling_progress_report` composes the preceding read-only outputs with monthly canonical volume/load. It is descriptive, not a physiological model.
 - `hydrate_recent_strava_activities` accepts an explicit list or a bounded date/sport window and awaits each write in sequence. Its unmatched output includes the exact Strava search window and safe-match rejection diagnostics.

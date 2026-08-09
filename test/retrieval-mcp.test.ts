@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { importRecord } from '../src/elt/ingestion/importer.js';
@@ -29,6 +29,13 @@ async function fixture() {
   await importRecord(setup.database, runId, {
     kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity', remoteId: 'garmin-ride-1', parentRemoteId: null, occurredOn: '2026-01-07', sourceUpdatedAt: null, rawObjectHash: 'garmin-raw',
     payload: { activityId: 'garmin-ride-1', startTimeGMT: '2026-01-07T10:00:00Z', activityType: 'road_biking', activityName: 'Road ride', distance: 42_000, duration: 6_300, maxFtp: 250 }, extension: {},
+  });
+  await importRecord(setup.database, runId, {
+    kind: 'source_entity', schemaVersion: 1, provider: 'strava', entityType: 'activity', remoteId: 'strava-ride-1', parentRemoteId: null, occurredOn: '2026-01-07', sourceUpdatedAt: null, rawObjectHash: 'strava-raw',
+    payload: {
+      id: 'strava-ride-1', start_date: '2026-01-07T10:00:00Z', start_date_local: '2026-01-07T05:00:00', type: 'Ride', name: 'Road ride', distance: 42_000, moving_time: 6_300,
+      segment_efforts: [{ id: 'strava-effort-1', elapsed_time: 600, moving_time: 590, distance: 3_500, average_watts: 280, average_heartrate: 160, pr_rank: 2, segment: { id: 'segment-1', name: 'Test climb', distance: 3_500, average_grade: 5.5, maximum_grade: 10.2, climb_category: 2 } }],
+    }, extension: {},
   });
   await importRecord(setup.database, runId, {
     kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity', remoteId: 'garmin-run-1', parentRemoteId: null, occurredOn: '2026-01-06', sourceUpdatedAt: null, rawObjectHash: 'garmin-run-raw',
@@ -143,14 +150,16 @@ describe('read-only retrieval and analytics', () => {
 
   it('serves the catalog and analytical tools through MCP transport', async () => {
     const paths = await fixture();
-    const server = createCatenceMcpServer(paths);
+    const hydrateStravaActivity = vi.fn(async () => ({ status: 'completed', stravaActivityId: 'strava-ride-1' }));
+    const server = createCatenceMcpServer(paths, { hydrateStravaActivity });
     const client = new Client({ name: 'catence-test-client', version: '0.1.0' });
     const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     try {
       const tools = await client.listTools();
-      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['catence_status', 'describe_dataset', 'read_series', 'query_read_only_data', 'search_context', 'get_ftp_history', 'get_vo2max_history', 'find_activities', 'power_curve_trend', 'power_coverage_report', 'latest_cycling_activities', 'cycling_progress_report', 'hydrate_recent_strava_activities']));
+      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['catence_status', 'describe_dataset', 'read_series', 'query_read_only_data', 'search_context', 'get_ftp_history', 'get_vo2max_history', 'find_activities', 'get_activity_segments', 'power_curve_trend', 'power_coverage_report', 'latest_cycling_activities', 'cycling_progress_report', 'hydrate_recent_strava_activities']));
+      expect(client.getInstructions()).toContain('call get_activity_segments');
       const result = await client.callTool({ name: 'read_series', arguments: { dataset: 'daily_health', metrics: ['hrv_ms'], startDate: '2026-01-01', endDate: '2026-01-08', resolution: 'day' } });
       const payload = JSON.parse(((result as { content: Array<{ text: string }> }).content[0]).text) as { data: unknown[] };
       expect(payload.data).toHaveLength(8);
@@ -161,6 +170,10 @@ describe('read-only retrieval and analytics', () => {
       const datasetPayload = JSON.parse(((datasetResult as { content: Array<{ text: string }> }).content[0]).text) as { data: { dataset: { name: string }; coverage: { row_count: number } | null } };
       expect(datasetPayload.data.dataset.name).toBe('training_metric_observations');
       expect(datasetPayload.data.coverage?.row_count).toBeGreaterThan(0);
+      const segmentResult = await client.callTool({ name: 'get_activity_segments', arguments: { activityId: 'garmin:garmin-ride-1' } });
+      const segmentPayload = JSON.parse(((segmentResult as { content: Array<{ text: string }> }).content[0]).text) as { data: { segments: Array<{ segment_id: string; segment_name: string }> } };
+      expect(hydrateStravaActivity).toHaveBeenCalledWith(paths, 'garmin:garmin-ride-1', false);
+      expect(segmentPayload.data.segments).toEqual([expect.objectContaining({ segment_id: 'segment-1', segment_name: 'Test climb' })]);
       const resource = await client.readResource({ uri: 'catence://summary/2026-01-01/2026-01-08' });
       expect(resource.contents[0]?.mimeType).toBe('application/json');
     } finally {

@@ -16,7 +16,7 @@ type ActivityRow = {
 function sportFamily(value: string | null): string | null {
   if (!value) return null;
   const normalized = value.toLowerCase().replaceAll(/[^a-z]/g, '');
-  if (normalized.includes('ride') || normalized.includes('cycling')) return 'ride';
+  if (normalized.includes('ride') || normalized.includes('cycling') || normalized.includes('bik')) return 'ride';
   if (normalized.includes('run')) return 'run';
   if (normalized.includes('swim')) return 'swim';
   return normalized || null;
@@ -143,15 +143,24 @@ export async function reconcileActivityLink(database: CatenceDatabase, activityS
     startCeiling: new Date(timestamp(source.started_at_utc)! + 90_000).toISOString(),
   });
   const matched = candidates.map((candidate) => ({ candidate, result: qualifies(source, candidate) })).filter((item): item is { candidate: ActivityRow; result: { score: number; evidence: Record<string, unknown> } } => item.result !== null);
-  if (matched.length !== 1) {
+  // A provider may already be strongly linked alongside a second source (for
+  // example Garmin plus Intervals). Those are one logical candidate, not an
+  // ambiguity that should prevent a matching Strava source from joining it.
+  const logicalMatches = new Map<string, typeof matched[number]>();
+  for (const match of matched) {
+    const previous = logicalMatches.get(match.candidate.activity_id);
+    if (!previous || match.result.score > previous.result.score) logicalMatches.set(match.candidate.activity_id, match);
+  }
+  const uniqueMatches = [...logicalMatches.values()];
+  if (uniqueMatches.length !== 1) {
     await database.run(
       `INSERT INTO activity_links VALUES ($activitySourceId, $activityId, 'source', NULL, $evidence, now())
        ON CONFLICT (activity_source_id) DO UPDATE SET activity_id = excluded.activity_id, method = excluded.method, confidence = excluded.confidence, evidence_json = excluded.evidence_json, linked_at = now()`,
-      { activitySourceId, activityId: source.activity_id, evidence: json({ candidates: matched.length, reason: matched.length ? 'ambiguous' : 'no_qualifying_candidate' }) },
+      { activitySourceId, activityId: source.activity_id, evidence: json({ candidates: uniqueMatches.length, matchingSources: matched.length, reason: uniqueMatches.length ? 'ambiguous' : 'no_qualifying_candidate' }) },
     );
     return;
   }
-  const { candidate, result } = matched[0]!;
+  const { candidate, result } = uniqueMatches[0]!;
   const oldActivityId = source.activity_id;
   await database.run('UPDATE activity_sources SET activity_id = $activityId WHERE activity_source_id = $activitySourceId', { activityId: candidate.activity_id, activitySourceId });
   await database.run(`UPDATE activities SET link_state = 'fuzzy_high_confidence' WHERE activity_id = $activityId`, { activityId: candidate.activity_id });

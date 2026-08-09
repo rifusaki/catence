@@ -45,6 +45,22 @@ describe('activity linking', () => {
     }
   });
 
+  it('treats already-linked Garmin and Intervals sources as one Strava match candidate', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('strava', '2026-02-01');
+    try {
+      await importRecord(database, runId, { ...envelope, provider: 'garmin', remoteId: 'g1', payload: { activityId: 'g1', startTimeGMT: '2026-02-01T10:00:00Z', activityType: 'road_biking', distance: 40_000, duration: 7_200 } });
+      await importRecord(database, runId, { ...envelope, provider: 'intervals', remoteId: 'i1', payload: { id: 'i1', external_id: 'g1', start_date: '2026-02-01T10:00:00Z', type: 'Ride', distance: 40_000, moving_time: 7_200 } });
+      await importRecord(database, runId, { ...envelope, provider: 'strava', remoteId: 's1', payload: { id: 's1', start_date: '2026-02-01T10:00:06Z', start_date_local: '2026-02-01T05:00:06', type: 'Ride', distance: 40_010, moving_time: 7_195 } });
+      const strava = await database.rows<{ activity_id: string }>(`SELECT activity_id FROM activity_sources WHERE activity_source_id = 'strava:s1'`);
+      const link = await database.rows<{ method: string }>(`SELECT method FROM activity_links WHERE activity_source_id = 'strava:s1'`);
+      expect(strava[0]).toEqual({ activity_id: 'garmin:g1' });
+      expect(link[0]).toEqual({ method: 'fuzzy_high_confidence' });
+    } finally {
+      await database.close();
+    }
+  });
+
   it('does not link a near match with incompatible virtual or indoor status and supports a manual correction', async () => {
     const { database } = await temporaryDatabase();
     const runId = await database.beginRun('garmin', '2026-02-01');

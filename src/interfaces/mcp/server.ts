@@ -32,6 +32,17 @@ const seriesInput = {
 };
 
 type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean };
+type StravaActivityHydrator = typeof hydrateStravaActivity;
+
+type McpDependencies = {
+  hydrateStravaActivity?: StravaActivityHydrator;
+};
+
+const MCP_INSTRUCTIONS = [
+  'For a selected activity\'s Strava segments, climb segments, grade by segment, KOM/PR, or per-segment analysis, call get_activity_segments after identifying the activity.',
+  'That tool performs the targeted Strava hydration itself. Do not say segment data is unavailable before it returns; if it reports not_found, ambiguous, authorization, throttling, or an error, report that exact outcome instead.',
+  'Aggregate elevation alone cannot support an individual-climb conclusion. Use source-specific facts and their stated coverage.',
+].join(' ');
 
 function textResult(value: unknown): ToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(jsonSafe(value), null, 2) }] };
@@ -72,8 +83,53 @@ function resource(uri: URL, value: unknown) {
   return { contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(jsonSafe(value), null, 2) }] };
 }
 
-export function createCatenceMcpServer(paths = resolvePaths()): McpServer {
-  const server = new McpServer({ name: 'catence', version: '0.1.0' });
+function stravaActivityIds(hydration: unknown): string[] {
+  const identifiers = new Set<string>();
+  const collect = (value: unknown) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    const record = value as Record<string, unknown>;
+    if (typeof record.stravaActivityId === 'string' && record.stravaActivityId) identifiers.add(record.stravaActivityId);
+    if (Array.isArray(record.childOutcomes)) {
+      for (const outcome of record.childOutcomes) {
+        if (outcome && typeof outcome === 'object' && !Array.isArray(outcome)) collect((outcome as Record<string, unknown>).result);
+      }
+    }
+  };
+  collect(hydration);
+  return [...identifiers];
+}
+
+async function activitySegments(repository: ReadOnlyRepository, activityId: string, hydratedStravaActivityIds: string[], limit: number): Promise<Array<Record<string, unknown>>> {
+  const hydratedSourceClause = hydratedStravaActivityIds.length
+    ? ` OR source.activity_source_id IN (${hydratedStravaActivityIds.map((_, index) => `$hydratedSource${index}`).join(', ')})`
+    : '';
+  const values: Record<string, unknown> = { activityId, limit };
+  for (const [index, stravaActivityId] of hydratedStravaActivityIds.entries()) values[`hydratedSource${index}`] = `strava:${stravaActivityId}`;
+  return repository.rows(`
+    WITH selected_activity AS (
+      SELECT activity_id FROM activity_sources WHERE activity_source_id = $activityId
+      UNION
+      SELECT activity_id FROM activities WHERE activity_id = $activityId
+    )
+    SELECT effort.activity_source_id, effort.effort_id, effort.segment_id,
+      segment.name AS segment_name, segment.average_grade_pct, segment.maximum_grade_pct,
+      segment.climb_category, segment.total_elevation_gain_m,
+      effort.elapsed_s, effort.moving_s, effort.distance_m, effort.average_watts,
+      effort.average_hr, effort.max_hr, effort.average_cadence, effort.device_watts,
+      effort.pr_rank, effort.kom_rank, cast(effort.started_at AS VARCHAR) AS started_at,
+      effort.raw_object_hash
+    FROM activity_segments AS effort
+    JOIN activity_sources AS source USING (activity_source_id)
+    LEFT JOIN strava_segments AS segment USING (segment_id)
+    WHERE (source.activity_id IN (SELECT activity_id FROM selected_activity)${hydratedSourceClause})
+    ORDER BY effort.started_at ASC NULLS LAST, effort.effort_id ASC
+    LIMIT $limit
+  `, values);
+}
+
+export function createCatenceMcpServer(paths = resolvePaths(), dependencies: McpDependencies = {}): McpServer {
+  const server = new McpServer({ name: 'catence', version: '0.1.0' }, { instructions: MCP_INSTRUCTIONS });
+  const hydrateActivity = dependencies.hydrateStravaActivity ?? hydrateStravaActivity;
   const configPromise = loadCatenceConfig(paths);
   const limiter = new SlidingWindowLimiter();
   const tool = <T>(name: string, fn: (input: T) => Promise<unknown>) => async (input: T): Promise<ToolResult> => {
@@ -180,6 +236,25 @@ export function createCatenceMcpServer(paths = resolvePaths()): McpServer {
     },
   }, tool('find_activities', async (input) => useRepository(paths, (repository) => new ActivityDiscoveryService(repository).findActivities(input))));
 
+  server.registerTool('get_activity_segments', {
+    title: 'Hydrate and read an activity’s Strava segments',
+    description: 'For a selected activity’s segments, climbs, KOM/PRs, or per-segment analysis: automatically hydrate the matching Strava activity before returning its persisted segment efforts. Use this before saying segment data is unavailable.',
+    inputSchema: { activityId: z.string().min(1), refresh: z.boolean().optional(), limit: z.number().int().min(1).max(500).optional() },
+  }, tool('get_activity_segments', async (input) => {
+    const hydration = await hydrateActivity(paths, input.activityId, input.refresh ?? false);
+    const hydratedStravaActivityIds = stravaActivityIds(hydration);
+    const segments = await useRepository(paths, (repository) => activitySegments(repository, input.activityId, hydratedStravaActivityIds, input.limit ?? 200));
+    return {
+      data: { hydration, hydratedStravaActivityIds, segments },
+      provenance: { provider: 'strava', relations: ['activity_segments', 'strava_segments'], operation: 'targeted_activity_hydration_then_read' },
+      query: { ...input, refresh: input.refresh ?? false, limit: input.limit ?? 200 },
+      caveats: [
+        'Strava hydration is attempted before these rows are read. If segments is empty, inspect the hydration status and match diagnostics before treating segment data as unavailable.',
+        'Segment verification is unavailable from Strava public segment data and is never inferred.',
+      ],
+    };
+  }));
+
   server.registerTool('power_curve_trend', {
     title: 'Read labelled power-curve trends',
     description: 'Return monthly bests for selected power durations from an explicit sport or sport family, including the supporting activity and source type. Read-only.',
@@ -216,10 +291,10 @@ export function createCatenceMcpServer(paths = resolvePaths()): McpServer {
 
   server.registerTool('hydrate_strava_activity', {
     title: 'Hydrate one activity from Strava',
-    description: 'Write-only targeted enrichment. Safely matches exactly one Catence activity/source to Strava, then archives and persists its activity detail, gear assignment, and segment efforts.',
+    description: 'Write-only targeted enrichment. Safely matches exactly one Catence activity/source to Strava, then archives and persists its activity detail, gear assignment, and segment efforts. For a segment/climb request, prefer get_activity_segments, which invokes this prerequisite automatically.',
     inputSchema: { activityId: z.string().min(1), refresh: z.boolean().optional() },
   }, tool('hydrate_strava_activity', async (input) => {
-    const data = await hydrateStravaActivity(paths, input.activityId, input.refresh ?? false);
+    const data = await hydrateActivity(paths, input.activityId, input.refresh ?? false);
     return { data, coverage: await useRepository(paths, (repository) => repository.coverage()), provenance: { provider: 'strava', operation: 'activity_detail', archivedBeforeNormalization: true }, caveats: ['Segment verification is unavailable from Strava public segment data and is never inferred.'] };
   }));
 
