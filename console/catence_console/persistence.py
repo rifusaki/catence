@@ -1,9 +1,14 @@
-"""Local SQLite persistence for Catence Console chat threads."""
+"""Local SQLite persistence for Catence Console chat threads and tool context."""
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 
 # Chainlit persists every key returned by ``Step.to_dict``. Keep this list
@@ -14,9 +19,147 @@ _STEP_COLUMN_MIGRATIONS = {
     "autoCollapse": "BOOLEAN NOT NULL DEFAULT 0",
 }
 
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SavedToolCall:
+    """One durable tool invocation that can be shown to a later model turn."""
+
+    call_id: str
+    name: str
+    arguments: dict[str, Any]
+    result: dict[str, Any] | None
+    is_error: bool
+    created_at: str
+
 
 def _database_path(data_directory: Path) -> Path:
     return data_directory / "console" / "chat-history.sqlite3"
+
+
+class ToolCallStore:
+    """A compact, queryable tool-call ledger alongside Chainlit's step history.
+
+    Chainlit stores visual tool steps, but its resumed ``chat_context`` contains
+    only user and assistant messages. This ledger makes the prior calls
+    available to the next model turn without eagerly adding every old result to
+    the provider prompt.
+    """
+
+    def __init__(self, data_directory: Path):
+        self.database_path = _database_path(data_directory)
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=5)
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+
+    def record(
+        self,
+        *,
+        thread_id: str,
+        call_id: str,
+        name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        created_at = datetime.now(UTC).isoformat()
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO tool_calls (
+                        thread_id, call_id, name, arguments, result, is_error, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(thread_id, call_id) DO UPDATE SET
+                        name = excluded.name,
+                        arguments = excluded.arguments,
+                        result = excluded.result,
+                        is_error = excluded.is_error
+                    """,
+                    (
+                        thread_id,
+                        call_id,
+                        name,
+                        json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str),
+                        json.dumps(result, ensure_ascii=False, default=str),
+                        bool(result.get("isError")),
+                        created_at,
+                    ),
+                )
+        except sqlite3.Error:
+            logger.exception("Could not persist Console tool call %s for thread %s", name, thread_id)
+
+    def list(self, thread_id: str, *, limit: int = 24) -> list[SavedToolCall]:
+        """Return the newest saved calls in chronological order."""
+
+        if limit < 1:
+            return []
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT call_id, name, arguments, result, is_error, created_at
+                    FROM tool_calls
+                    WHERE thread_id = ?
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (thread_id, limit),
+                ).fetchall()
+        except sqlite3.Error:
+            logger.exception("Could not load Console tool calls for thread %s", thread_id)
+            return []
+        return [
+            SavedToolCall(
+                call_id=row[0],
+                name=row[1],
+                arguments=_json_object(row[2]),
+                result=_json_object_or_none(row[3]),
+                is_error=bool(row[4]),
+                created_at=row[5],
+            )
+            for row in reversed(rows)
+        ]
+
+    def result(self, thread_id: str, call_id: str) -> dict[str, Any] | None:
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT result FROM tool_calls
+                    WHERE thread_id = ? AND call_id = ?
+                    """,
+                    (thread_id, call_id),
+                ).fetchone()
+        except sqlite3.Error:
+            logger.exception("Could not load saved result %s for thread %s", call_id, thread_id)
+            return None
+        return _json_object_or_none(row[0]) if row else None
+
+    def delete_thread(self, thread_id: str) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute("DELETE FROM tool_calls WHERE thread_id = ?", (thread_id,))
+        except sqlite3.Error:
+            logger.exception("Could not delete saved tool calls for thread %s", thread_id)
+
+
+def _json_object(value: str | None) -> dict[str, Any]:
+    parsed = _json_object_or_none(value)
+    return parsed if parsed is not None else {}
+
+
+def _json_object_or_none(value: str | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _initialize_schema(database_path: Path) -> None:
@@ -91,6 +234,18 @@ def _initialize_schema(database_path: Path) -> None:
                 "value" INTEGER NOT NULL,
                 "comment" TEXT
             );
+            CREATE TABLE IF NOT EXISTS tool_calls (
+                "thread_id" TEXT NOT NULL,
+                "call_id" TEXT NOT NULL,
+                "name" TEXT NOT NULL,
+                "arguments" TEXT NOT NULL,
+                "result" TEXT,
+                "is_error" BOOLEAN NOT NULL DEFAULT 0,
+                "created_at" TEXT NOT NULL,
+                PRIMARY KEY ("thread_id", "call_id")
+            );
+            CREATE INDEX IF NOT EXISTS tool_calls_thread_created_idx
+              ON tool_calls (thread_id, created_at DESC);
             """
         )
 
@@ -116,4 +271,17 @@ def local_data_layer(data_directory: Path):
 
     database_path = _database_path(data_directory)
     _initialize_schema(database_path)
-    return SQLAlchemyDataLayer(f"sqlite+aiosqlite:///{database_path}")
+
+    class CatenceConsoleDataLayer(SQLAlchemyDataLayer):
+        async def delete_thread(self, thread_id: str):
+            await super().delete_thread(thread_id)
+            ToolCallStore(data_directory).delete_thread(thread_id)
+
+    return CatenceConsoleDataLayer(f"sqlite+aiosqlite:///{database_path}")
+
+
+def tool_call_store(data_directory: Path) -> ToolCallStore:
+    """Return the durable tool-call ledger used by the agent loop."""
+
+    _initialize_schema(_database_path(data_directory))
+    return ToolCallStore(data_directory)

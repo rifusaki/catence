@@ -4,7 +4,7 @@ import sqlite3
 from chainlit.types import Pagination, ThreadFilter
 from chainlit.user import User
 
-from catence_console.persistence import local_data_layer
+from catence_console.persistence import local_data_layer, tool_call_store
 
 
 def test_local_data_layer_persists_a_user_owned_thread(tmp_path):
@@ -65,3 +65,31 @@ def test_local_data_layer_upgrades_existing_steps_table(tmp_path):
             await data_layer.close()
 
     asyncio.run(check())
+
+
+def test_tool_call_store_keeps_thread_scoped_calls_and_deletes_them_with_the_thread(tmp_path):
+    store = tool_call_store(tmp_path)
+    store.record(
+        thread_id="thread-1",
+        call_id="call-1",
+        name="get_activity_segments",
+        arguments={"activityId": "strava:123"},
+        result={"content": [{"type": "text", "text": "evidence"}]},
+    )
+
+    calls = store.list("thread-1")
+    assert len(calls) == 1
+    assert calls[0].name == "get_activity_segments"
+    assert calls[0].arguments == {"activityId": "strava:123"}
+    assert store.result("thread-1", "call-1") == {"content": [{"type": "text", "text": "evidence"}]}
+
+    async def check() -> None:
+        data_layer = local_data_layer(tmp_path)
+        try:
+            await data_layer.update_thread("thread-1")
+            await data_layer.delete_thread("thread-1")
+        finally:
+            await data_layer.close()
+
+    asyncio.run(check())
+    assert store.list("thread-1") == []

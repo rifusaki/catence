@@ -12,6 +12,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 from .config import DEFAULT_TOOL_RESULT_CHARACTER_LIMIT, DEFAULT_TOOL_ROUND_LIMIT, ProviderProfile
+from .persistence import SavedToolCall, ToolCallStore
 
 SYSTEM_PROMPT = """You are Catence, a careful endurance-training data assistant.
 Use Catence MCP tools for athlete-specific facts. Start with a named review tool
@@ -20,7 +21,18 @@ follow-up tool only when it would change the recommendation. Never invent data
 or clinical conclusions. Distinguish a missing measurement from a poor value.
 In every conclusion, name the dates and metrics returned by the tools so the
 athlete can trace the evidence. Catence's data is personal and local: do not
-ask for credentials or expose configuration values."""
+ask for credentials or expose configuration values.
+
+Follow the catalog contract before using the advanced SQL fallback: never
+query information_schema or other DuckDB system tables. If a dataset, field,
+or identifier is uncertain, call describe_data or describe_dataset first.
+read_series accepts numeric metrics only; use string identifiers as filters.
+For a selected activity's Strava segments, climbs, grades, KOMs, or PRs, call
+get_activity_segments before querying tables or claiming data is unavailable."""
+
+_RECALL_SAVED_TOOL_RESULT = "recall_saved_tool_result"
+_TOOL_HISTORY_LIMIT = 24
+_TOOL_ARGUMENT_PREVIEW_CHARACTERS = 1_600
 
 def _as_json(value: Any) -> Any:
     if hasattr(value, "model_dump"):
@@ -46,6 +58,26 @@ def _tool_definitions(tools: list[Any]) -> list[dict[str, Any]]:
                 },
             }
         )
+    definitions.append(
+        {
+            "type": "function",
+            "function": {
+                "name": _RECALL_SAVED_TOOL_RESULT,
+                "description": "Load the stored result for one earlier tool call in this chat. Use only when the compact prior-tool-call record is insufficient; otherwise call the authoritative Catence tool again if fresh data is needed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "callId": {
+                            "type": "string",
+                            "description": "The callId listed in prior tool-call context.",
+                        }
+                    },
+                    "required": ["callId"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    )
     return definitions
 
 
@@ -81,15 +113,64 @@ def _tool_result_payload(result: Any, maximum_characters: int) -> dict[str, Any]
     }
 
 
+def _tool_history_message(calls: list[SavedToolCall]) -> str | None:
+    """Produce small, result-free context for a resumed or later turn."""
+
+    if not calls:
+        return None
+    records = []
+    for call in calls[-_TOOL_HISTORY_LIMIT:]:
+        encoded_arguments = json.dumps(call.arguments, ensure_ascii=False, sort_keys=True, default=str)
+        if len(encoded_arguments) > _TOOL_ARGUMENT_PREVIEW_CHARACTERS:
+            encoded_arguments = f"{encoded_arguments[:_TOOL_ARGUMENT_PREVIEW_CHARACTERS]}…"
+        records.append(
+            {
+                "callId": call.call_id,
+                "tool": call.name,
+                "arguments": encoded_arguments,
+                "resultAvailable": call.result is not None,
+                "isError": call.is_error,
+                "calledAt": call.created_at,
+            }
+        )
+    return (
+        "Prior tool calls in this chat are persisted below. They identify what was already fetched, "
+        "but do not assert that the data is still current. Use recall_saved_tool_result only when "
+        "the prior result itself matters; otherwise make a fresh authoritative call.\n"
+        + json.dumps(records, ensure_ascii=False)
+    )
+
+
+def _saved_result_payload(store: ToolCallStore | None, thread_id: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
+    call_id = arguments.get("callId")
+    if not isinstance(call_id, str) or not call_id:
+        return {"isError": True, "error": {"message": "recall_saved_tool_result requires a non-empty callId."}}
+    if store is None or not thread_id:
+        return {"isError": True, "error": {"message": "No persisted tool-call context is available for this chat."}}
+    result = store.result(thread_id, call_id)
+    if result is None:
+        return {"isError": True, "error": {"message": f"No saved result exists for tool call {call_id}."}}
+    return result
+
+
 async def _invoke_tool(
-    session: ClientSession, name: str, arguments: dict[str, Any], maximum_characters: int
+    session: ClientSession,
+    name: str,
+    arguments: dict[str, Any],
+    maximum_characters: int,
+    *,
+    tool_call_store: ToolCallStore | None = None,
+    thread_id: str | None = None,
 ) -> dict[str, Any]:
     step = cl.Step(name=f"Catence · {name}", type="tool", default_open=False)
     step.input = arguments
     await step.send()
     try:
-        result = await session.call_tool(name, arguments)
-        payload = _tool_result_payload(result, maximum_characters)
+        if name == _RECALL_SAVED_TOOL_RESULT:
+            payload = _saved_result_payload(tool_call_store, thread_id, arguments)
+        else:
+            result = await session.call_tool(name, arguments)
+            payload = _tool_result_payload(result, maximum_characters)
         step.output = payload
         step.is_error = bool(payload.get("isError"))
         await step.update()
@@ -111,6 +192,8 @@ async def respond(
     mcp_url: str,
     tool_round_limit: int = DEFAULT_TOOL_ROUND_LIMIT,
     tool_result_character_limit: int = DEFAULT_TOOL_RESULT_CHARACTER_LIMIT,
+    tool_call_store: ToolCallStore | None = None,
+    thread_id: str | None = None,
     complete: Callable[..., Awaitable[Any]] = acompletion,
 ) -> str:
     """Run one bounded Chat turn, displaying each evidence-producing MCP call."""
@@ -118,10 +201,18 @@ async def respond(
     async with streamablehttp_client(mcp_url) as transport:
         read_stream, write_stream = transport[:2]
         async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
+            initialized = await session.initialize()
             listed_tools = await session.list_tools()
             tools = _tool_definitions(list(listed_tools.tools))
             messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+            initialized_raw = _as_json(initialized)
+            server_instructions = initialized_raw.get("instructions") if isinstance(initialized_raw, dict) else None
+            if isinstance(server_instructions, str) and server_instructions.strip():
+                messages.insert(1, {"role": "system", "content": f"Catence MCP server instructions:\n{server_instructions}"})
+            if tool_call_store is not None and thread_id:
+                tool_history = _tool_history_message(tool_call_store.list(thread_id, limit=_TOOL_HISTORY_LIMIT))
+                if tool_history:
+                    messages.insert(1, {"role": "system", "content": tool_history})
 
             for _ in range(tool_round_limit):
                 options: dict[str, Any] = {
@@ -148,7 +239,22 @@ async def respond(
                 )
                 for tool_call in tool_calls:
                     call_id, name, arguments = _tool_call_parts(tool_call)
-                    payload = await _invoke_tool(session, name, arguments, tool_result_character_limit)
+                    payload = await _invoke_tool(
+                        session,
+                        name,
+                        arguments,
+                        tool_result_character_limit,
+                        tool_call_store=tool_call_store,
+                        thread_id=thread_id,
+                    )
+                    if tool_call_store is not None and thread_id and name != _RECALL_SAVED_TOOL_RESULT:
+                        tool_call_store.record(
+                            thread_id=thread_id,
+                            call_id=call_id,
+                            name=name,
+                            arguments=arguments,
+                            result=payload,
+                        )
                     messages.append(
                         {
                             "role": "tool",

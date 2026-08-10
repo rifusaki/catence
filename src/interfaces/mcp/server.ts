@@ -285,7 +285,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
   })));
 
   server.registerTool('read_series', {
-    title: 'Read a bounded time series', description: 'Read cataloged numeric series with deterministic cursor pagination and automatic stream downsampling.', inputSchema: seriesInput,
+    title: 'Read a bounded time series', description: 'Read cataloged numeric series with deterministic cursor pagination and automatic stream downsampling. metrics must be numeric catalog columns; place identifiers and other strings in filters. Call describe_dataset first if the fields are uncertain.', inputSchema: seriesInput,
   }, tool('read_series', async (input) => useRepository(paths, (repository) => new AnalyticsService(repository).readSeries({ ...input, filters: input.filters as DataFilter[] | undefined }))));
 
   server.registerTool('aggregate_data', {
@@ -387,7 +387,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
   }, tool('cycling_progress_report', async (input) => useRepository(paths, (repository) => new FitnessService(repository).cyclingProgressReport(input))));
 
   server.registerTool('query_read_only_data', {
-    title: 'Query cataloged read-only data', description: 'Advanced fallback: one parameterized SELECT or WITH … SELECT over cataloged views only. Results use deterministic cursor pagination and always report whether they are incomplete. Filesystem access, extensions, DDL, and mutation are rejected.',
+    title: 'Query cataloged read-only data', description: 'Advanced fallback after describe_data/describe_dataset: one parameterized SELECT or WITH … SELECT over cataloged views only. Do not query information_schema, DuckDB system tables, or uncataloged physical relations. Results use deterministic cursor pagination and always report whether they are incomplete. Filesystem access, extensions, DDL, and mutation are rejected.',
     inputSchema: { sql: z.string().min(1).max(20_000), values: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).refine((value) => Object.keys(value).length <= 100, 'At most 100 bind values are allowed.').optional(), cursor: z.string().min(1).optional(), pageSize: z.number().int().min(1).max(500).optional() },
   }, tool('query_read_only_data', async (input) => useRepository(paths, (repository) => queryReadOnlyData(repository, input))));
 

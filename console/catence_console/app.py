@@ -24,7 +24,7 @@ from catence_console.config import (
     missing_environment,
     write_provider_setup,
 )
-from catence_console.persistence import local_data_layer
+from catence_console.persistence import local_data_layer, tool_call_store
 
 DATA_DIRECTORY = Path(os.environ.get("CATENCE_DATA_DIR", ".catence")).expanduser().resolve()
 MCP_URL = os.environ.get("CATENCE_MCP_URL", "http://127.0.0.1:8787/mcp")
@@ -327,6 +327,8 @@ async def on_message(message: cl.Message) -> None:
             mcp_url=MCP_URL,
             tool_round_limit=tool_round_limit,
             tool_result_character_limit=tool_result_character_limit,
+            tool_call_store=tool_call_store(DATA_DIRECTORY),
+            thread_id=cl.context.session.thread_id,
         )
     except Exception as error:
         logger.exception("Catence model request failed for profile %s and model %s", profile.id, model_id)

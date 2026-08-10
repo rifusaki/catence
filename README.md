@@ -296,9 +296,13 @@ and Catence health; it never prints credential values or calls a model.
 ### Local chat history
 
 Console chats, messages, tool steps, and thread metadata are persisted at
-`<data-dir>/console/chat-history.sqlite3`. The history sidebar lets the local
-Console user resume, rename, and delete threads. This storage is separate from
-the fitness DuckDB/Parquet store and does not contain provider credentials.
+`<data-dir>/console/chat-history.sqlite3`. Each MCP invocation is also written
+to a durable, thread-scoped tool-call ledger in that database. A later turn
+receives a compact list of prior calls (not their results); it can lazily load
+one saved result when it is material, or repeat the authoritative call for
+fresh data. The history sidebar lets the local Console user resume, rename,
+and delete threads. This storage is separate from the fitness DuckDB/Parquet
+store and does not contain provider credentials.
 
 ## Add Catence to an MCP client
 
