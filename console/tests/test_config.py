@@ -3,7 +3,7 @@ import json
 import pytest
 
 from catence_console.config import ConsoleConfigurationError, load_console_configuration, write_provider_setup
-from catence_console.app import _limit_setting
+from catence_console.app import _limit_setting, _session_settings
 
 
 def write_config(tmp_path, console):
@@ -116,3 +116,23 @@ def test_normalizes_number_input_values_for_per_chat_limits():
     assert _limit_setting("48000", 1_000, 250_000) == 48_000
     assert _limit_setting("999999", 1_000, 250_000) == 250_000
     assert _limit_setting("nope", 1_000, 250_000) is None
+
+
+def test_resumed_chat_falls_back_when_its_saved_model_was_removed(tmp_path, monkeypatch):
+    write_config(
+        tmp_path,
+        {
+            "defaultProfile": "openai",
+            "profiles": {"openai": {"model": "openai/gpt-5-mini"}},
+        },
+    )
+    configuration = load_console_configuration(tmp_path)
+
+    from catence_console import app
+
+    monkeypatch.setattr(app.cl.user_session, "get", lambda key: "removed:model" if key == "catence_model" else None)
+    profile_id, model_id, reasoning_effort, tool_rounds, tool_result_characters = _session_settings(configuration)
+
+    assert (profile_id, model_id, reasoning_effort) == ("openai", "default", None)
+    assert tool_rounds == configuration.limits.tool_rounds
+    assert tool_result_characters == configuration.limits.tool_result_characters

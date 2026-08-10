@@ -55,14 +55,28 @@ def _limit_setting(value: Any, minimum: int, maximum: int) -> int | None:
     return max(minimum, min(int(value), maximum))
 
 
-def _selected_settings() -> tuple[str, str, str | None, int, int]:
-    configuration = _configuration()
+def _session_settings(
+    configuration: ConsoleConfiguration,
+) -> tuple[str, str, str | None, int, int]:
+    """Return the current chat's safe, valid settings.
+
+    The same values are restored from a thread's metadata on resume. Falling
+    back to the configured defaults also lets an older chat resume after its
+    model has been removed from config.json.
+    """
+
     model_choice = cl.user_session.get("catence_model")
-    if not isinstance(model_choice, str):
+    if isinstance(model_choice, str):
+        try:
+            profile, model_id = configuration.selected_model(model_choice)
+        except ConsoleConfigurationError:
+            model_choice = configuration.default_model_choice()
+            profile, model_id = configuration.selected_model(model_choice)
+    else:
         model_choice = configuration.default_model_choice()
-    profile, model_id = configuration.selected_model(model_choice)
+        profile, model_id = configuration.selected_model(model_choice)
     reasoning_effort = cl.user_session.get("catence_reasoning_effort")
-    if not isinstance(reasoning_effort, str):
+    if reasoning_effort not in {"default", "minimal", "low", "medium", "high", "xhigh"}:
         reasoning_effort = profile.default_reasoning_effort
     if reasoning_effort == "default":
         reasoning_effort = None
@@ -78,6 +92,58 @@ def _selected_settings() -> tuple[str, str, str | None, int, int]:
         min(tool_result_characters, MAX_TOOL_RESULT_CHARACTER_LIMIT),
     )
     return profile.id, model_id, reasoning_effort, tool_rounds, tool_result_characters
+
+
+def _selected_settings() -> tuple[str, str, str | None, int, int]:
+    return _session_settings(_configuration())
+
+
+def _chat_settings(
+    configuration: ConsoleConfiguration,
+    *,
+    model_choice: str,
+    reasoning_effort: str | None,
+    tool_rounds: int,
+    tool_result_characters: int,
+) -> cl.ChatSettings:
+    return cl.ChatSettings(
+        [
+            Select(
+                id="model",
+                label="Model",
+                items=configuration.model_choices(),
+                initial_value=model_choice,
+                description="Choose a deployment. Credentials stay in the Console process environment.",
+            ),
+            Select(
+                id="reasoningEffort",
+                label="Thinking effort",
+                items={
+                    "Provider default": "default",
+                    **{effort.title(): effort for effort in ("minimal", "low", "medium", "high", "xhigh")},
+                },
+                initial_value=reasoning_effort or "default",
+                description="Passed to models that support OpenAI reasoning effort.",
+            ),
+            NumberInput(
+                id="toolRounds",
+                label="Tool-call rounds",
+                initial=tool_rounds,
+                placeholder=str(DEFAULT_TOOL_ROUND_LIMIT),
+                description=f"Maximum model → tool → model rounds for this chat ({MIN_TOOL_ROUND_LIMIT}–{MAX_TOOL_ROUND_LIMIT}).",
+            ),
+            NumberInput(
+                id="toolResultCharacters",
+                label="Evidence per tool result",
+                initial=tool_result_characters,
+                placeholder=str(DEFAULT_TOOL_RESULT_CHARACTER_LIMIT),
+                description=(
+                    "Maximum characters of each tool result passed to the model "
+                    f"({MIN_TOOL_RESULT_CHARACTER_LIMIT:,}–{MAX_TOOL_RESULT_CHARACTER_LIMIT:,})."
+                ),
+            ),
+        ]
+    )
 
 
 async def _ask_setup_question(content: str) -> str | None:
@@ -126,46 +192,14 @@ async def _setup_wizard() -> ConsoleConfiguration | None:
 async def _initialize_chat(configuration: ConsoleConfiguration) -> None:
     """Send configurable widgets and the current readiness message."""
 
-
     default_profile = configuration.profile(configuration.default_profile)
     default_model_choice = configuration.default_model_choice()
-    await cl.ChatSettings(
-        [
-            Select(
-                id="model",
-                label="Model",
-                items=configuration.model_choices(),
-                initial_value=default_model_choice,
-                description="Choose a deployment. Credentials stay in the Console process environment.",
-            ),
-            Select(
-                id="reasoningEffort",
-                label="Thinking effort",
-                items={
-                    "Provider default": "default",
-                    **{effort.title(): effort for effort in ("minimal", "low", "medium", "high", "xhigh")},
-                },
-                initial_value=default_profile.default_reasoning_effort or "default",
-                description="Passed to models that support OpenAI reasoning effort.",
-            ),
-            NumberInput(
-                id="toolRounds",
-                label="Tool-call rounds",
-                initial=configuration.limits.tool_rounds,
-                placeholder=str(DEFAULT_TOOL_ROUND_LIMIT),
-                description=f"Maximum model → tool → model rounds for this chat ({MIN_TOOL_ROUND_LIMIT}–{MAX_TOOL_ROUND_LIMIT}).",
-            ),
-            NumberInput(
-                id="toolResultCharacters",
-                label="Evidence per tool result",
-                initial=configuration.limits.tool_result_characters,
-                placeholder=str(DEFAULT_TOOL_RESULT_CHARACTER_LIMIT),
-                description=(
-                    "Maximum characters of each tool result passed to the model "
-                    f"({MIN_TOOL_RESULT_CHARACTER_LIMIT:,}–{MAX_TOOL_RESULT_CHARACTER_LIMIT:,})."
-                ),
-            ),
-        ]
+    await _chat_settings(
+        configuration,
+        model_choice=default_model_choice,
+        reasoning_effort=default_profile.default_reasoning_effort,
+        tool_rounds=configuration.limits.tool_rounds,
+        tool_result_characters=configuration.limits.tool_result_characters,
     ).send()
     cl.user_session.set("catence_model", default_model_choice)
     cl.user_session.set("catence_reasoning_effort", default_profile.default_reasoning_effort or "default")
@@ -204,6 +238,30 @@ async def start() -> None:
             ).send()
             return
     await _initialize_chat(configuration)
+
+
+@cl.on_chat_resume
+async def resume(_thread: dict[str, Any]) -> None:
+    """Make a persisted local thread live again without changing its history."""
+
+    try:
+        configuration = _configuration()
+        profile_id, model_id, reasoning_effort, tool_rounds, tool_result_characters = _session_settings(
+            configuration
+        )
+        profile = configuration.profile(profile_id)
+        model_choice = f"{profile.id}:{model_id}"
+        await _chat_settings(
+            configuration,
+            model_choice=model_choice,
+            reasoning_effort=reasoning_effort,
+            tool_rounds=tool_rounds,
+            tool_result_characters=tool_result_characters,
+        ).refresh()
+    except ConsoleConfigurationError as error:
+        # The thread itself remains readable; a following message will show
+        # the same actionable configuration error as a new chat would.
+        logger.warning("Could not restore Catence Console settings for a resumed chat: %s", error)
 
 
 @cl.on_settings_update
