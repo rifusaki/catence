@@ -6,12 +6,21 @@ import sqlite3
 from pathlib import Path
 
 
+# Chainlit persists every key returned by ``Step.to_dict``. Keep this list
+# separate from the initial CREATE TABLE statement so an existing local
+# database can be upgraded without discarding a user's saved conversations.
+_STEP_COLUMN_MIGRATIONS = {
+    "defaultOpen": "BOOLEAN NOT NULL DEFAULT 0",
+    "autoCollapse": "BOOLEAN NOT NULL DEFAULT 0",
+}
+
+
 def _database_path(data_directory: Path) -> Path:
     return data_directory / "console" / "chat-history.sqlite3"
 
 
 def _initialize_schema(database_path: Path) -> None:
-    """Create the subset of Chainlit's SQLAlchemy schema needed by local chats."""
+    """Create and safely upgrade the Chainlit schema used by local chats."""
 
     database_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(database_path) as connection:
@@ -52,6 +61,8 @@ def _initialize_schema(database_path: Path) -> None:
                 "end" TEXT,
                 "generation" TEXT,
                 "showInput" TEXT,
+                "defaultOpen" BOOLEAN NOT NULL DEFAULT 0,
+                "autoCollapse" BOOLEAN NOT NULL DEFAULT 0,
                 "language" TEXT,
                 "indent" INTEGER
             );
@@ -82,6 +93,20 @@ def _initialize_schema(database_path: Path) -> None:
             );
             """
         )
+
+        # ``CREATE TABLE IF NOT EXISTS`` intentionally leaves an existing
+        # database unchanged. Earlier Console builds created ``steps`` before
+        # Chainlit started persisting these display-state fields, which made
+        # every subsequent step insert fail. Add columns in place instead of
+        # asking the user to delete chat-history.sqlite3 and lose their chats.
+        existing_step_columns = {
+            row[1] for row in connection.execute('PRAGMA table_info("steps")')
+        }
+        for column, definition in _STEP_COLUMN_MIGRATIONS.items():
+            if column not in existing_step_columns:
+                connection.execute(
+                    f'ALTER TABLE "steps" ADD COLUMN "{column}" {definition}'
+                )
 
 
 def local_data_layer(data_directory: Path):
