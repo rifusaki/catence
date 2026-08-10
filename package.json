@@ -41,6 +41,8 @@
     "test:watch": "vitest",
     "catence-data": "tsx src/interfaces/cli/main.ts",
     "mcp": "tsx src/interfaces/mcp/main.ts",
+    "console": "uv run --project console catence-console serve",
+    "console:doctor": "uv run --project console catence-console doctor",
     "prepack": "npm run build",
     "prepublishOnly": "npm run check && npm test"
   },

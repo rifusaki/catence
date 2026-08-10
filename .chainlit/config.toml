@@ -1,0 +1,18 @@
+[project]
+allow_origins = ["http://127.0.0.1:8000", "http://localhost:8000"]
+cache = false
+
+[features]
+unsafe_allow_html = false
+
+[UI]
+name = "Catence"
+description = "Local evidence-first endurance training reviews"
+layout = "wide"
+default_sidebar_state = "closed"
+chat_settings_location = "sidebar"
+cot = "tool_call"
+custom_build = "../catence-ui/frontend/dist"
+
+[meta]
+generated_by = "2.11.1"

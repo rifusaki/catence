@@ -138,6 +138,86 @@ Catence requests `read`, `activity:read_all`, and `read_all`. To remove the stor
 npm run catence-data -- disconnect strava
 ```
 
+## Run the local Console MVP
+
+The Console is the Catence-owned agent runtime with the sibling `catence-ui`
+Chainlit fork as its frontend module. It retains Catence's existing DuckDB and
+Parquet data model: chats and model-provider secrets are not written into the
+fitness store. The Console sends model calls through LiteLLM in-process and
+calls the same Catence Streamable HTTP MCP tools that a coding agent uses.
+
+This source-checkout MVP expects this sibling layout:
+
+```text
+personal/
+  catence/
+  catence-ui/
+```
+
+Add a `console` section to `<data-dir>/config.json`. It defines named providers and deployments
+and environment-variable *names*, never credential values. The complete shape
+is in [`config.example.json`](config.example.json); a compact Azure Foundry
+profile looks like this:
+
+```json
+{
+  "console": {
+    "defaultProfile": "azure-foundry",
+    "profiles": {
+      "azure-foundry": {
+        "label": "Azure Foundry",
+        "defaultModel": "terra",
+        "defaultReasoningEffort": "medium",
+        "models": {
+          "terra": { "label": "GPT-5.6 Terra", "model": "azure_ai/gpt-5.6-terra" },
+          "luna": { "label": "GPT-5.6 Luna", "model": "azure_ai/gpt-5.6-luna" },
+          "sol": { "label": "GPT-5.6 Sol", "model": "azure_ai/gpt-5.6-sol" }
+        },
+        "apiKeyEnv": "AZURE_API_KEY",
+        "apiBaseEnv": "AZURE_API_BASE",
+        "apiVersionEnv": "AZURE_API_VERSION"
+      }
+    }
+  }
+}
+```
+
+The Console shows all configured deployments in its **Model** selector and sends
+the selected **Thinking effort** to LiteLLM as `reasoning_effort`. Choose only
+efforts supported by the selected deployment. Existing profiles with a single
+`model` remain supported. For an OpenAI-compatible provider such as OpenCode, use a model such as
+`openai/your-model` and set its `apiBaseEnv` and, if needed, `apiKeyEnv`.
+LiteLLM handles the provider normalization; Catence does not carry a proxy or
+store the values.
+
+Set the referenced variables in the terminal that will run the Console, then
+launch everything on loopback with one command:
+
+```sh
+npm run console -- --data-dir /absolute/path/to/catence-data
+```
+
+On its first normal launch this builds the forked frontend, starts Catence at
+`http://127.0.0.1:8787`, permits only the local Console origins, and serves the
+chat and dashboard at `http://127.0.0.1:8000`. Stop it with `Ctrl-C`; the
+launcher closes both child services. The dashboard uses Catence's
+`/api/v1/dashboard` endpoint directly—there is no Grafana or InfluxDB runtime
+in this MVP.
+
+To preflight a profile and an already-running Catence HTTP server, use:
+
+```sh
+npm run console:doctor -- \
+  --data-dir /absolute/path/to/catence-data \
+  --mcp-url http://127.0.0.1:8787/mcp
+```
+
+`doctor` reports only profile IDs, models, missing environment-variable names,
+and Catence health; it never prints credential values or calls a model. Chat
+history stays in the active Chainlit process for this MVP. Durable chat/tool
+audit persistence is a later DuckDB addition, rather than a parallel frontend
+database.
+
 ## Add Catence to an MCP client
 
 First complete the setup and at least one sync. Each client should start the same source-checkout command, pointing at the same absolute data directory:

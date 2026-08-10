@@ -21,5 +21,29 @@
         "readRequestsPerDay": 800
       }
     }
+  },
+  "console": {
+    "defaultProfile": "azure-foundry",
+    "profiles": {
+      "azure-foundry": {
+        "label": "Azure Foundry",
+        "defaultModel": "terra",
+        "defaultReasoningEffort": "medium",
+        "models": {
+          "terra": { "label": "GPT-5.6 Terra", "model": "azure_ai/gpt-5.6-terra" },
+          "luna": { "label": "GPT-5.6 Luna", "model": "azure_ai/gpt-5.6-luna" },
+          "sol": { "label": "GPT-5.6 Sol", "model": "azure_ai/gpt-5.6-sol" }
+        },
+        "apiKeyEnv": "AZURE_API_KEY",
+        "apiBaseEnv": "AZURE_API_BASE",
+        "apiVersionEnv": "AZURE_API_VERSION"
+      },
+      "opencode": {
+        "label": "OpenCode-compatible",
+        "model": "openai/your-model-name",
+        "apiKeyEnv": "OPENCODE_API_KEY",
+        "apiBaseEnv": "OPENCODE_API_BASE"
+      }
+    }
   }
 }

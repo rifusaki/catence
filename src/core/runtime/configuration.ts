@@ -39,6 +39,31 @@ export function requireIntervalsConfig(): { apiKey: string; athleteId: string } 
 
 const rateLimitSchema = z.object({ requests: z.number().int().positive(), windowSeconds: z.number().int().positive() }).strict();
 const nullableRateLimitSchema = rateLimitSchema.nullable();
+const environmentVariableSchema = z.string().regex(/^[A-Z][A-Z0-9_]*$/, 'must be an uppercase environment-variable name');
+const consoleModelSchema = z.object({
+  label: z.string().min(1).optional(),
+  model: z.string().min(1),
+}).strict();
+const consoleProfileSchema = z.object({
+  label: z.string().min(1).optional(),
+  model: z.string().min(1).optional(),
+  models: z.record(z.string().min(1), consoleModelSchema).optional(),
+  defaultModel: z.string().min(1).optional(),
+  defaultReasoningEffort: z.enum(['minimal', 'low', 'medium', 'high', 'xhigh']).optional(),
+  apiKeyEnv: environmentVariableSchema.optional(),
+  apiBaseEnv: environmentVariableSchema.optional(),
+  apiVersionEnv: environmentVariableSchema.optional(),
+}).strict().superRefine((profile, context) => {
+  if (Boolean(profile.model) === Boolean(profile.models)) {
+    context.addIssue({ code: 'custom', message: 'must define exactly one of model or models' });
+  }
+  if (profile.defaultModel && !profile.models) {
+    context.addIssue({ code: 'custom', path: ['defaultModel'], message: 'requires models' });
+  }
+  if (profile.models && profile.defaultModel && !Object.hasOwn(profile.models, profile.defaultModel)) {
+    context.addIssue({ code: 'custom', path: ['defaultModel'], message: 'must name one of models' });
+  }
+});
 const catenceConfigSchema = z.object({
   mcp: z.object({
     rateLimits: z.object({
@@ -55,6 +80,10 @@ const catenceConfigSchema = z.object({
         readRequestsPerDay: z.number().int().positive().nullable().optional(),
       }).strict().optional(),
     }).strict().optional(),
+  }).strict().optional(),
+  console: z.object({
+    defaultProfile: z.string().min(1).optional(),
+    profiles: z.record(z.string().min(1), consoleProfileSchema).optional(),
   }).strict().optional(),
 }).strict();
 
