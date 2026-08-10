@@ -34,6 +34,16 @@ class SavedToolCall:
     created_at: str
 
 
+@dataclass(frozen=True)
+class SavedConsolePreferences:
+    """The local Console user's durable non-secret model preferences."""
+
+    model_choice: str
+    reasoning_effort: str
+    tool_rounds: int
+    tool_result_characters: int
+
+
 def _database_path(data_directory: Path) -> Path:
     return data_directory / "console" / "chat-history.sqlite3"
 
@@ -147,6 +157,78 @@ class ToolCallStore:
             logger.exception("Could not delete saved tool calls for thread %s", thread_id)
 
 
+class ConsolePreferencesStore:
+    """Store one local, user-scoped Console preference set in chat history."""
+
+    def __init__(self, data_directory: Path):
+        self.database_path = _database_path(data_directory)
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=5)
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+
+    def load(self, user_identifier: str) -> SavedConsolePreferences | None:
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT model_choice, reasoning_effort, tool_rounds, tool_result_characters
+                    FROM console_preferences WHERE user_identifier = ?
+                    """,
+                    (user_identifier,),
+                ).fetchone()
+        except sqlite3.Error:
+            logger.exception("Could not load Console preferences for %s", user_identifier)
+            return None
+        if not row:
+            return None
+        return SavedConsolePreferences(
+            model_choice=row[0],
+            reasoning_effort=row[1],
+            tool_rounds=row[2],
+            tool_result_characters=row[3],
+        )
+
+    def save(self, user_identifier: str, preferences: SavedConsolePreferences) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO console_preferences (
+                        user_identifier, model_choice, reasoning_effort, tool_rounds,
+                        tool_result_characters, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_identifier) DO UPDATE SET
+                        model_choice = excluded.model_choice,
+                        reasoning_effort = excluded.reasoning_effort,
+                        tool_rounds = excluded.tool_rounds,
+                        tool_result_characters = excluded.tool_result_characters,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        user_identifier,
+                        preferences.model_choice,
+                        preferences.reasoning_effort,
+                        preferences.tool_rounds,
+                        preferences.tool_result_characters,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+        except sqlite3.Error:
+            logger.exception("Could not save Console preferences for %s", user_identifier)
+
+    def delete(self, user_identifier: str) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "DELETE FROM console_preferences WHERE user_identifier = ?",
+                    (user_identifier,),
+                )
+        except sqlite3.Error:
+            logger.exception("Could not reset Console preferences for %s", user_identifier)
+
+
 def _json_object(value: str | None) -> dict[str, Any]:
     parsed = _json_object_or_none(value)
     return parsed if parsed is not None else {}
@@ -246,6 +328,14 @@ def _initialize_schema(database_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS tool_calls_thread_created_idx
               ON tool_calls (thread_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS console_preferences (
+                "user_identifier" TEXT PRIMARY KEY,
+                "model_choice" TEXT NOT NULL,
+                "reasoning_effort" TEXT NOT NULL,
+                "tool_rounds" INTEGER NOT NULL,
+                "tool_result_characters" INTEGER NOT NULL,
+                "updated_at" TEXT NOT NULL
+            );
             """
         )
 
@@ -285,3 +375,10 @@ def tool_call_store(data_directory: Path) -> ToolCallStore:
 
     _initialize_schema(_database_path(data_directory))
     return ToolCallStore(data_directory)
+
+
+def console_preferences_store(data_directory: Path) -> ConsolePreferencesStore:
+    """Return the local user-preferences store used by Console settings."""
+
+    _initialize_schema(_database_path(data_directory))
+    return ConsolePreferencesStore(data_directory)

@@ -42,6 +42,7 @@ type McpDependencies = {
 const MCP_INSTRUCTIONS = [
   'For a selected activity\'s Strava segments, climb segments, grade by segment, KOM/PR, or per-segment analysis, call get_activity_segments after identifying the activity.',
   'That tool performs the targeted Strava hydration itself. Do not say segment data is unavailable before it returns; if it reports not_found, ambiguous, authorization, throttling, or an error, report that exact outcome instead.',
+  'For Garmin running VO₂max, call get_vo2max_history with sport: running. Garmin stores the source value as generic; returned rows preserve that source label.',
   'Aggregate elevation alone cannot support an individual-climb conclusion. Use source-specific facts and their stated coverage.',
 ].join(' ');
 
@@ -289,7 +290,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
   }, tool('read_series', async (input) => useRepository(paths, (repository) => new AnalyticsService(repository).readSeries({ ...input, filters: input.filters as DataFilter[] | undefined }))));
 
   server.registerTool('aggregate_data', {
-    title: 'Aggregate cataloged data', description: 'Declarative aggregation over one cataloged dataset. No joins, arbitrary expressions, or file paths.',
+    title: 'Aggregate cataloged data', description: 'Declarative aggregation over one cataloged dataset. A timeBucket adds a time_bucket field, which can be used in orderBy. No joins, arbitrary expressions, or file paths.',
     inputSchema: {
       dataset: z.string().min(1),
       metrics: z.array(z.object({ column: z.string().min(1), operation: z.enum(['count', 'sum', 'mean', 'min', 'max', 'percentile']), percentile: z.number().gt(0).lt(1).optional(), as: z.string().min(1).max(64).optional() })).min(1).max(12),
@@ -315,7 +316,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
 
   server.registerTool('get_vo2max_history', {
     title: 'Get sport-specific VO₂max history',
-    description: 'Return normalized Garmin VO₂max observations for exactly one sport; generic and cycling values remain separate. Read-only.',
+    description: 'Return normalized Garmin VO₂max observations for exactly one sport. For running, pass sport: running (or run): Garmin supplies that series with raw sport generic, which is preserved in each row. Cycling remains separate. Omit sport only to inspect available source labels. Read-only.',
     inputSchema: { sport: z.string().min(1).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional() },
   }, tool('get_vo2max_history', async (input) => useRepository(paths, (repository) => new FitnessService(repository).vo2MaxHistory(input))));
 

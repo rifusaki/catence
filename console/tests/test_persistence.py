@@ -4,7 +4,12 @@ import sqlite3
 from chainlit.types import Pagination, ThreadFilter
 from chainlit.user import User
 
-from catence_console.persistence import local_data_layer, tool_call_store
+from catence_console.persistence import (
+    SavedConsolePreferences,
+    console_preferences_store,
+    local_data_layer,
+    tool_call_store,
+)
 
 
 def test_local_data_layer_persists_a_user_owned_thread(tmp_path):
@@ -93,3 +98,20 @@ def test_tool_call_store_keeps_thread_scoped_calls_and_deletes_them_with_the_thr
 
     asyncio.run(check())
     assert store.list("thread-1") == []
+
+
+def test_console_preferences_are_user_scoped_and_removable(tmp_path):
+    store = console_preferences_store(tmp_path)
+    preferences = SavedConsolePreferences(
+        model_choice="azure:terra",
+        reasoning_effort="high",
+        tool_rounds=12,
+        tool_result_characters=48_000,
+    )
+
+    store.save("athlete-a", preferences)
+
+    assert store.load("athlete-a") == preferences
+    assert store.load("athlete-b") is None
+    store.delete("athlete-a")
+    assert store.load("athlete-a") is None

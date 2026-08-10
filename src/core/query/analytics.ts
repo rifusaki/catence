@@ -246,7 +246,7 @@ export class AnalyticsService {
     if (request.timeBucket) {
       if (!dataset.dateColumn) throw new QueryValidationError(`${dataset.name} cannot be time-bucketed.`);
       const bucket = `date_trunc('${request.timeBucket}', ${timestampExpression(dataset)})`;
-      selections.unshift(`${bucket} AS bucket`);
+      selections.unshift(`${bucket} AS time_bucket`);
       groups.unshift(bucket);
     }
     for (const [index, metric] of request.metrics.entries()) {
@@ -266,9 +266,13 @@ export class AnalyticsService {
       } else if (metric.operation === 'count') selections.push(`count(${quoteIdentifier(metric.column)}) AS ${quoteIdentifier(outputName)}`);
       else selections.push(`${({ sum: 'sum', mean: 'avg', min: 'min', max: 'max' } as const)[metric.operation]}(${quoteIdentifier(metric.column)}) AS ${quoteIdentifier(outputName)}`);
     }
-    const orderBy = request.orderBy?.column;
+    // ``timeBucket`` produces the public ``time_bucket`` field. Keep ``bucket``
+    // as an ordering-only compatibility alias for calls made before that name
+    // was standardized.
+    const requestedOrderBy = request.orderBy?.column;
+    const orderBy = requestedOrderBy === 'bucket' && request.timeBucket ? 'time_bucket' : requestedOrderBy;
     const aliases = selections.map((selection) => selection.match(/AS "?([A-Za-z_][A-Za-z0-9_]*)"?$/i)?.[1]).filter(Boolean) as string[];
-    if (orderBy && !aliases.includes(orderBy) && orderBy !== 'bucket' && !dimensions.includes(orderBy)) throw new QueryValidationError('orderBy must name a selected dimension, bucket, or aggregation alias.');
+    if (orderBy && !aliases.includes(orderBy) && !dimensions.includes(orderBy)) throw new QueryValidationError('orderBy must name a selected dimension, time_bucket, or aggregation alias.');
     values.limit = Math.min(Math.max(request.limit ?? 100, 1), 500);
     const rows = await this.repository.rows(`SELECT ${selections.join(', ')} FROM ${source} AS source ${where}${groups.length ? ` GROUP BY ${groups.join(', ')}` : ''}${orderBy ? ` ORDER BY ${quoteIdentifier(orderBy)} ${request.orderBy?.direction === 'asc' ? 'ASC' : 'DESC'}` : ''} LIMIT $limit`, values);
     return jsonSafe({ data: rows, provenance: { dataset: dataset.name, columns: dataset.provenanceColumns }, query: request, caveats: [] });

@@ -148,7 +148,7 @@ only after their shared service methods and fixture tests exist.
 ## Implemented fitness and hydration endpoints
 
 - `describe_dataset(dataset)` returns one cataloged schema and its coverage. `training_metric_observations` also reports its observed sports, metric names, units, and source types.
-- `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, and `power_coverage_report` read normalized, source-aware fitness facts. Power tools require an explicit sport or sport family, use `power_bests`/`power_best_facts` for FIT-derived duration values, and do not treat sparse `avg_power` summaries as coverage. `get_vo2max_history` does not default to cycling: omission returns available sports and requires an explicit choice; Garmin running VO₂max may be labelled `generic`.
+- `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, and `power_coverage_report` read normalized, source-aware fitness facts. Power tools require an explicit sport or sport family, use `power_bests`/`power_best_facts` for FIT-derived duration values, and do not treat sparse `avg_power` summaries as coverage. `get_vo2max_history` does not default to cycling: omission returns available source labels and requires an explicit choice. For Garmin running VO₂max, request `sport: "running"`; the tool reads the raw `generic` source series and preserves that label on returned observations.
 - `find_activities` is implemented for compact, canonical, paginated activity/race discovery by sport, distance, name, and date. Its race flags are transparent heuristics, not provider-confirmed race metadata.
 - `get_activity_segments` is the required segment/climb path. It performs the
   targeted Strava hydration before returning the persisted effort and segment

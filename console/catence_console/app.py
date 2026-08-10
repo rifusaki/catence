@@ -24,7 +24,12 @@ from catence_console.config import (
     missing_environment,
     write_provider_setup,
 )
-from catence_console.persistence import local_data_layer, tool_call_store
+from catence_console.persistence import (
+    SavedConsolePreferences,
+    console_preferences_store,
+    local_data_layer,
+    tool_call_store,
+)
 
 DATA_DIRECTORY = Path(os.environ.get("CATENCE_DATA_DIR", ".catence")).expanduser().resolve()
 MCP_URL = os.environ.get("CATENCE_MCP_URL", "http://127.0.0.1:8787/mcp")
@@ -60,9 +65,9 @@ def _session_settings(
 ) -> tuple[str, str, str | None, int, int]:
     """Return the current chat's safe, valid settings.
 
-    The same values are restored from a thread's metadata on resume. Falling
-    back to the configured defaults also lets an older chat resume after its
-    model has been removed from config.json.
+    Startup and resume apply the local user's durable preferences before this
+    function runs. Falling back to configured defaults also lets a chat remain
+    usable after its saved model has been removed from config.json.
     """
 
     model_choice = cl.user_session.get("catence_model")
@@ -98,6 +103,67 @@ def _selected_settings() -> tuple[str, str, str | None, int, int]:
     return _session_settings(_configuration())
 
 
+def _configured_preferences(configuration: ConsoleConfiguration) -> SavedConsolePreferences:
+    profile = configuration.profile(configuration.default_profile)
+    return SavedConsolePreferences(
+        model_choice=configuration.default_model_choice(),
+        reasoning_effort=profile.default_reasoning_effort or "default",
+        tool_rounds=configuration.limits.tool_rounds,
+        tool_result_characters=configuration.limits.tool_result_characters,
+    )
+
+
+def _user_identifier() -> str:
+    user = cl.user_session.get("user")
+    identifier = getattr(user, "identifier", None)
+    return identifier if isinstance(identifier, str) and identifier else os.environ.get("CHAINLIT_LOCAL_USER", "catence-local")
+
+
+def _normalized_preferences(
+    configuration: ConsoleConfiguration, preferences: SavedConsolePreferences
+) -> SavedConsolePreferences:
+    default = _configured_preferences(configuration)
+    try:
+        configuration.selected_model(preferences.model_choice)
+        model_choice = preferences.model_choice
+    except ConsoleConfigurationError:
+        model_choice = default.model_choice
+    reasoning_effort = preferences.reasoning_effort
+    if reasoning_effort not in {"default", "minimal", "low", "medium", "high", "xhigh"}:
+        reasoning_effort = default.reasoning_effort
+    return SavedConsolePreferences(
+        model_choice=model_choice,
+        reasoning_effort=reasoning_effort,
+        tool_rounds=max(MIN_TOOL_ROUND_LIMIT, min(preferences.tool_rounds, MAX_TOOL_ROUND_LIMIT)),
+        tool_result_characters=max(
+            MIN_TOOL_RESULT_CHARACTER_LIMIT,
+            min(preferences.tool_result_characters, MAX_TOOL_RESULT_CHARACTER_LIMIT),
+        ),
+    )
+
+
+def _apply_preferences(preferences: SavedConsolePreferences) -> None:
+    cl.user_session.set("catence_model", preferences.model_choice)
+    cl.user_session.set("catence_reasoning_effort", preferences.reasoning_effort)
+    cl.user_session.set("catence_tool_rounds", preferences.tool_rounds)
+    cl.user_session.set("catence_tool_result_characters", preferences.tool_result_characters)
+
+
+def _restore_preferences(configuration: ConsoleConfiguration) -> SavedConsolePreferences:
+    saved = console_preferences_store(DATA_DIRECTORY).load(_user_identifier())
+    preferences = _normalized_preferences(configuration, saved or _configured_preferences(configuration))
+    _apply_preferences(preferences)
+    return preferences
+
+
+def _persist_preferences(configuration: ConsoleConfiguration, preferences: SavedConsolePreferences) -> None:
+    store = console_preferences_store(DATA_DIRECTORY)
+    if preferences == _configured_preferences(configuration):
+        store.delete(_user_identifier())
+    else:
+        store.save(_user_identifier(), preferences)
+
+
 def _chat_settings(
     configuration: ConsoleConfiguration,
     *,
@@ -106,6 +172,7 @@ def _chat_settings(
     tool_rounds: int,
     tool_result_characters: int,
 ) -> cl.ChatSettings:
+    defaults = _configured_preferences(configuration)
     return cl.ChatSettings(
         [
             Select(
@@ -113,6 +180,7 @@ def _chat_settings(
                 label="Model",
                 items=configuration.model_choices(),
                 initial_value=model_choice,
+                reset_value=defaults.model_choice,
                 description="Choose a deployment. Credentials stay in the Console process environment.",
             ),
             Select(
@@ -123,12 +191,14 @@ def _chat_settings(
                     **{effort.title(): effort for effort in ("minimal", "low", "medium", "high", "xhigh")},
                 },
                 initial_value=reasoning_effort or "default",
+                reset_value=defaults.reasoning_effort,
                 description="Passed to models that support OpenAI reasoning effort.",
             ),
             NumberInput(
                 id="toolRounds",
                 label="Tool-call rounds",
                 initial=tool_rounds,
+                reset_value=defaults.tool_rounds,
                 placeholder=str(DEFAULT_TOOL_ROUND_LIMIT),
                 description=f"Maximum model → tool → model rounds for this chat ({MIN_TOOL_ROUND_LIMIT}–{MAX_TOOL_ROUND_LIMIT}).",
             ),
@@ -136,6 +206,7 @@ def _chat_settings(
                 id="toolResultCharacters",
                 label="Evidence per tool result",
                 initial=tool_result_characters,
+                reset_value=defaults.tool_result_characters,
                 placeholder=str(DEFAULT_TOOL_RESULT_CHARACTER_LIMIT),
                 description=(
                     "Maximum characters of each tool result passed to the model "
@@ -192,28 +263,24 @@ async def _setup_wizard() -> ConsoleConfiguration | None:
 async def _initialize_chat(configuration: ConsoleConfiguration) -> None:
     """Send configurable widgets and the current readiness message."""
 
-    default_profile = configuration.profile(configuration.default_profile)
-    default_model_choice = configuration.default_model_choice()
+    preferences = _restore_preferences(configuration)
+    profile, model_id = configuration.selected_model(preferences.model_choice)
     await _chat_settings(
         configuration,
-        model_choice=default_model_choice,
-        reasoning_effort=default_profile.default_reasoning_effort,
-        tool_rounds=configuration.limits.tool_rounds,
-        tool_result_characters=configuration.limits.tool_result_characters,
+        model_choice=preferences.model_choice,
+        reasoning_effort=None if preferences.reasoning_effort == "default" else preferences.reasoning_effort,
+        tool_rounds=preferences.tool_rounds,
+        tool_result_characters=preferences.tool_result_characters,
     ).send()
-    cl.user_session.set("catence_model", default_model_choice)
-    cl.user_session.set("catence_reasoning_effort", default_profile.default_reasoning_effort or "default")
-    cl.user_session.set("catence_tool_rounds", configuration.limits.tool_rounds)
-    cl.user_session.set("catence_tool_result_characters", configuration.limits.tool_result_characters)
 
-    missing = missing_environment(default_profile)
+    missing = missing_environment(profile)
     readiness = "ready" if not missing else f"missing environment variables: {', '.join(missing)}"
-    default_model = default_profile.model_option(default_profile.default_model)
-    default_effort = default_profile.default_reasoning_effort or "provider default"
+    selected_model = profile.model_option(model_id)
+    selected_effort = None if preferences.reasoning_effort == "default" else preferences.reasoning_effort
     await cl.Message(
         content=(
-            f"Catence Console is {readiness}. Using **{default_model.label}** with **{default_effort}** thinking, "
-            f"up to **{configuration.limits.tool_rounds}** tool rounds and **{configuration.limits.tool_result_characters:,}** evidence characters per result. "
+            f"Catence Console is {readiness}. Using **{selected_model.label}** with **{selected_effort or 'provider default'}** thinking, "
+            f"up to **{preferences.tool_rounds}** tool rounds and **{preferences.tool_result_characters:,}** evidence characters per result. "
             "I can use the same local MCP tools as your coding agent. "
             "Try a recovery review, training-load check, or a question about a recent activity."
         )
@@ -246,17 +313,13 @@ async def resume(_thread: dict[str, Any]) -> None:
 
     try:
         configuration = _configuration()
-        profile_id, model_id, reasoning_effort, tool_rounds, tool_result_characters = _session_settings(
-            configuration
-        )
-        profile = configuration.profile(profile_id)
-        model_choice = f"{profile.id}:{model_id}"
+        preferences = _restore_preferences(configuration)
         await _chat_settings(
             configuration,
-            model_choice=model_choice,
-            reasoning_effort=reasoning_effort,
-            tool_rounds=tool_rounds,
-            tool_result_characters=tool_result_characters,
+            model_choice=preferences.model_choice,
+            reasoning_effort=None if preferences.reasoning_effort == "default" else preferences.reasoning_effort,
+            tool_rounds=preferences.tool_rounds,
+            tool_result_characters=preferences.tool_result_characters,
         ).refresh()
     except ConsoleConfigurationError as error:
         # The thread itself remains readable; a following message will show
@@ -267,38 +330,39 @@ async def resume(_thread: dict[str, Any]) -> None:
 @cl.on_settings_update
 async def update_settings(settings: dict[str, Any]) -> None:
     configuration = _configuration()
-    model_choice = settings.get("model", configuration.default_model_choice())
-    selected_profile = None
-    selected_model_id = None
-    if isinstance(model_choice, str):
-        try:
-            selected_profile, selected_model_id = configuration.selected_model(model_choice)
-        except ConsoleConfigurationError:
-            pass
-        else:
-            cl.user_session.set("catence_model", model_choice)
-    reasoning_effort = settings.get("reasoningEffort")
-    if reasoning_effort in {"default", "minimal", "low", "medium", "high", "xhigh"}:
-        cl.user_session.set("catence_reasoning_effort", reasoning_effort)
-    tool_rounds = settings.get("toolRounds")
-    if normalized_rounds := _limit_setting(tool_rounds, MIN_TOOL_ROUND_LIMIT, MAX_TOOL_ROUND_LIMIT):
-        cl.user_session.set("catence_tool_rounds", normalized_rounds)
-    tool_result_characters = settings.get("toolResultCharacters")
-    if normalized_characters := _limit_setting(
-        tool_result_characters, MIN_TOOL_RESULT_CHARACTER_LIMIT, MAX_TOOL_RESULT_CHARACTER_LIMIT
-    ):
-        cl.user_session.set("catence_tool_result_characters", normalized_characters)
-    if selected_profile is not None and selected_model_id is not None:
-        selected_model = selected_profile.model_option(selected_model_id)
-        effort_label = reasoning_effort if isinstance(reasoning_effort, str) else selected_profile.default_reasoning_effort
-        rounds = cl.user_session.get("catence_tool_rounds", configuration.limits.tool_rounds)
-        characters = cl.user_session.get("catence_tool_result_characters", configuration.limits.tool_result_characters)
-        await cl.Message(
-            content=(
-                f"Settings applied: **{selected_model.label}** with **{effort_label or 'provider default'}** thinking, "
-                f"**{rounds}** tool rounds, and **{characters:,}** evidence characters per result."
-            )
-        ).send()
+    current = _restore_preferences(configuration)
+    model_choice = settings.get("model", current.model_choice)
+    if not isinstance(model_choice, str):
+        model_choice = current.model_choice
+    try:
+        profile, model_id = configuration.selected_model(model_choice)
+    except ConsoleConfigurationError:
+        profile, model_id = configuration.selected_model(current.model_choice)
+        model_choice = current.model_choice
+    reasoning_effort = settings.get("reasoningEffort", current.reasoning_effort)
+    if reasoning_effort not in {"default", "minimal", "low", "medium", "high", "xhigh"}:
+        reasoning_effort = current.reasoning_effort
+    tool_rounds = _limit_setting(settings.get("toolRounds"), MIN_TOOL_ROUND_LIMIT, MAX_TOOL_ROUND_LIMIT)
+    tool_result_characters = _limit_setting(
+        settings.get("toolResultCharacters"), MIN_TOOL_RESULT_CHARACTER_LIMIT, MAX_TOOL_RESULT_CHARACTER_LIMIT
+    )
+    preferences = SavedConsolePreferences(
+        model_choice=model_choice,
+        reasoning_effort=reasoning_effort,
+        tool_rounds=tool_rounds if tool_rounds is not None else current.tool_rounds,
+        tool_result_characters=(
+            tool_result_characters if tool_result_characters is not None else current.tool_result_characters
+        ),
+    )
+    _apply_preferences(preferences)
+    _persist_preferences(configuration, preferences)
+    selected_model = profile.model_option(model_id)
+    await cl.Message(
+        content=(
+            f"Settings applied: **{selected_model.label}** with **{preferences.reasoning_effort if preferences.reasoning_effort != 'default' else 'provider default'}** thinking, "
+            f"**{preferences.tool_rounds}** tool rounds, and **{preferences.tool_result_characters:,}** evidence characters per result."
+        )
+    ).send()
 
 
 @cl.on_message

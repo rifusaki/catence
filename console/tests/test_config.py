@@ -1,9 +1,12 @@
+import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from catence_console.config import ConsoleConfigurationError, load_console_configuration, write_provider_setup
-from catence_console.app import _limit_setting, _session_settings
+from catence_console.app import _chat_settings, _configured_preferences, _limit_setting, _normalized_preferences, _session_settings
+from catence_console.persistence import SavedConsolePreferences
 
 
 def write_config(tmp_path, console):
@@ -136,3 +139,117 @@ def test_resumed_chat_falls_back_when_its_saved_model_was_removed(tmp_path, monk
     assert (profile_id, model_id, reasoning_effort) == ("openai", "default", None)
     assert tool_rounds == configuration.limits.tool_rounds
     assert tool_result_characters == configuration.limits.tool_result_characters
+
+
+def test_persistent_preferences_are_normalized_and_settings_expose_configured_reset_values(tmp_path):
+    write_config(
+        tmp_path,
+        {
+            "defaultProfile": "azure",
+            "limits": {"toolRounds": 8, "toolResultCharacters": 24_000},
+            "profiles": {
+                "azure": {
+                    "models": {
+                        "terra": {"model": "azure/gpt-5.6-terra"},
+                        "luna": {"model": "azure/gpt-5.6-luna"},
+                    },
+                    "defaultModel": "terra",
+                }
+            },
+        },
+    )
+    configuration = load_console_configuration(tmp_path)
+    saved = SavedConsolePreferences(
+        model_choice="azure:luna",
+        reasoning_effort="high",
+        tool_rounds=12,
+        tool_result_characters=48_000,
+    )
+
+    normalized = _normalized_preferences(configuration, saved)
+
+    assert normalized == saved
+    assert _configured_preferences(configuration) == SavedConsolePreferences(
+        model_choice="azure:terra",
+        reasoning_effort="default",
+        tool_rounds=8,
+        tool_result_characters=24_000,
+    )
+    settings = _chat_settings(
+        configuration,
+        model_choice=normalized.model_choice,
+        reasoning_effort=normalized.reasoning_effort,
+        tool_rounds=normalized.tool_rounds,
+        tool_result_characters=normalized.tool_result_characters,
+    )
+    values = {input["id"]: input for input in settings._inputs_as_dicts()}
+    assert values["model"]["initial"] == "azure:luna"
+    assert values["model"]["resetValue"] == "azure:terra"
+    assert values["reasoningEffort"]["initial"] == "high"
+    assert values["reasoningEffort"]["resetValue"] == "default"
+    assert values["toolRounds"]["resetValue"] == 8
+    assert values["toolResultCharacters"]["resetValue"] == 24_000
+
+
+def test_confirming_custom_settings_persists_them_and_confirming_reset_clears_them(tmp_path, monkeypatch):
+    write_config(
+        tmp_path,
+        {
+            "defaultProfile": "azure",
+            "limits": {"toolRounds": 8, "toolResultCharacters": 24_000},
+            "profiles": {
+                "azure": {
+                    "models": {
+                        "terra": {"model": "azure/gpt-5.6-terra"},
+                        "luna": {"model": "azure/gpt-5.6-luna"},
+                    },
+                    "defaultModel": "terra",
+                }
+            },
+        },
+    )
+    from catence_console import app
+
+    session = {"user": SimpleNamespace(identifier="athlete-a")}
+    monkeypatch.setattr(app, "DATA_DIRECTORY", tmp_path)
+    monkeypatch.setattr(app.cl.user_session, "get", lambda key, default=None: session.get(key, default))
+    monkeypatch.setattr(app.cl.user_session, "set", lambda key, value: session.__setitem__(key, value))
+
+    class FakeMessage:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def send(self):
+            return None
+
+    monkeypatch.setattr(app.cl, "Message", FakeMessage)
+
+    asyncio.run(
+        app.update_settings(
+            {
+                "model": "azure:luna",
+                "reasoningEffort": "high",
+                "toolRounds": 12,
+                "toolResultCharacters": 48_000,
+            }
+        )
+    )
+    store = app.console_preferences_store(tmp_path)
+    assert store.load("athlete-a") == SavedConsolePreferences(
+        model_choice="azure:luna",
+        reasoning_effort="high",
+        tool_rounds=12,
+        tool_result_characters=48_000,
+    )
+
+    asyncio.run(
+        app.update_settings(
+            {
+                "model": "azure:terra",
+                "reasoningEffort": "default",
+                "toolRounds": 8,
+                "toolResultCharacters": 24_000,
+            }
+        )
+    )
+    assert store.load("athlete-a") is None

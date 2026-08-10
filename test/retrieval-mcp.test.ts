@@ -111,9 +111,24 @@ describe('read-only retrieval and analytics', () => {
       expect(aliasedSql.data).toEqual(expect.arrayContaining([expect.objectContaining({ activity_source_id: 'garmin:garmin-ride-1' })]));
       const fitness = new FitnessService(repository);
       expect((await fitness.ftpHistory()).data).toEqual(expect.objectContaining({ preferredSeries: expect.arrayContaining([expect.objectContaining({ value_number: 255 })]) }));
-      expect(await fitness.vo2MaxHistory()).toEqual(expect.objectContaining({ data: expect.objectContaining({ availableSports: expect.arrayContaining([expect.objectContaining({ sport: 'cycling', latest: 55.2 })]), actionRequired: 'Choose a sport explicitly.' }) }));
+      expect(await fitness.vo2MaxHistory()).toEqual(expect.objectContaining({ data: expect.objectContaining({
+        availableSports: expect.arrayContaining([expect.objectContaining({ sport: 'cycling', latest: 55.2 })]),
+        sportAliases: [expect.objectContaining({ requestedSport: 'running', sourceSport: 'generic' })],
+        actionRequired: 'Choose a sport explicitly. Use running for Garmin running VO₂max.',
+      }) }));
       expect(await fitness.vo2MaxHistory({ sport: 'cycling' })).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ value_number: 55.2 })]) }));
       expect(await fitness.vo2MaxHistory({ sport: 'generic' })).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ value_number: 58.5 })]) }));
+      expect(await fitness.vo2MaxHistory({ sport: 'running' })).toEqual(expect.objectContaining({
+        data: expect.arrayContaining([expect.objectContaining({ value_number: 58.5, sport: 'generic' })]),
+        provenance: expect.objectContaining({ requestedSport: 'running', sourceSport: 'generic' }),
+      }));
+      const monthlyAggregate = await analytics.aggregate({
+        dataset: 'daily_health',
+        metrics: [{ column: 'hrv_ms', operation: 'mean', as: 'mean_hrv' }],
+        timeBucket: 'month',
+        orderBy: { column: 'time_bucket', direction: 'asc' },
+      });
+      expect(monthlyAggregate.data).toEqual(expect.arrayContaining([expect.objectContaining({ time_bucket: expect.any(String) })]));
       await expect(fitness.powerCurveTrend({ durations: [5, 300] })).rejects.toThrow('require an explicit sport or sportFamily');
       expect(await fitness.powerCurveTrend({ sportFamily: 'running', durations: [5, 300], sourceQuality: 'garmin_fit_derived' })).toEqual(expect.objectContaining({ data: expect.arrayContaining([expect.objectContaining({ durationLabel: '5 s', sport: 'trail_running' })]) }));
       expect(await fitness.powerCoverageReport({ sportFamily: 'running' })).toEqual(expect.objectContaining({

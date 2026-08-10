@@ -28,7 +28,9 @@ query information_schema or other DuckDB system tables. If a dataset, field,
 or identifier is uncertain, call describe_data or describe_dataset first.
 read_series accepts numeric metrics only; use string identifiers as filters.
 For a selected activity's Strava segments, climbs, grades, KOMs, or PRs, call
-get_activity_segments before querying tables or claiming data is unavailable."""
+get_activity_segments before querying tables or claiming data is unavailable.
+For Garmin running VO₂max, call get_vo2max_history with sport set to running;
+Garmin labels its source rows generic, and the tool resolves that safely."""
 
 _RECALL_SAVED_TOOL_RESULT = "recall_saved_tool_result"
 _TOOL_HISTORY_LIMIT = 24

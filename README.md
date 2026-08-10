@@ -255,7 +255,10 @@ values.
 ### Evidence and chat controls
 
 The settings panel controls the selected model, thinking effort, and two
-per-chat evidence limits:
+evidence limits. Confirmed choices are saved for the local Console user in
+the chat-history database and apply to new and resumed chats. **Reset** returns
+the panel to the configured `console` defaults; confirm it to clear the saved
+overrides.
 
 - **Tool-call rounds** defaults to 8 and may be set from 1 to 32. It limits
   model → tool → model loops in a single response.
