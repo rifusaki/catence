@@ -100,6 +100,16 @@ function stravaActivityIds(hydration: unknown): string[] {
   return [...identifiers];
 }
 
+function utcDate(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function subtractDays(date: string, days: number): string {
+  const value = new Date(`${date}T00:00:00.000Z`);
+  value.setUTCDate(value.getUTCDate() - days);
+  return value.toISOString().slice(0, 10);
+}
+
 async function activitySegments(repository: ReadOnlyRepository, activityId: string, hydratedStravaActivityIds: string[], limit: number): Promise<Array<Record<string, unknown>>> {
   const hydratedSourceClause = hydratedStravaActivityIds.length
     ? ` OR source.activity_source_id IN (${hydratedStravaActivityIds.map((_, index) => `$hydratedSource${index}`).join(', ')})`
@@ -150,6 +160,39 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
     } catch (error) { return resource(uri, { error: JSON.parse(errorResult(error).content[0]!.text) }); }
   };
 
+  server.registerPrompt('daily_recovery_load_review', {
+    title: 'Daily recovery and load review',
+    description: 'Ask for a source-cited recovery and training-load review for one date.',
+    argsSchema: { date: z.string().date().optional() },
+  }, ({ date }) => ({
+    messages: [{
+      role: 'user',
+      content: { type: 'text', text: `Run review_daily_recovery_load for ${date ?? utcDate()}. Summarize only returned evidence, name data gaps, and do not present a training prescription as fact.` },
+    }],
+  }));
+
+  server.registerPrompt('weekly_training_review', {
+    title: 'Weekly training review',
+    description: 'Ask for a source-cited seven-day training review ending on an optional date.',
+    argsSchema: { endDate: z.string().date().optional() },
+  }, ({ endDate }) => ({
+    messages: [{
+      role: 'user',
+      content: { type: 'text', text: `Run review_weekly_training ending on ${endDate ?? utcDate()}. Explain volume, load, and recovery evidence with dates and coverage caveats.` },
+    }],
+  }));
+
+  server.registerPrompt('activity_deep_dive', {
+    title: 'Activity deep dive',
+    description: 'Ask for an evidence-first deep dive into one canonical Catence activity.',
+    argsSchema: { activityId: z.string().min(1) },
+  }, ({ activityId }) => ({
+    messages: [{
+      role: 'user',
+      content: { type: 'text', text: `Run review_activity_deep_dive for ${activityId}. Use its source records and intervals first; load read_series only if a specific sampled metric is needed.` },
+    }],
+  }));
+
   server.registerTool('catence_status', {
     title: 'Catence data status',
     description: 'Read sync state, data coverage, entity counts, stream availability, unresolved errors, and retrieval-index freshness. Read-only.',
@@ -157,6 +200,57 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
     data: { ...(await repository.status()), ...(await repository.coverage()) },
     provenance: { database: 'read-only DuckDB snapshot' }, query: {}, caveats: [],
   }))));
+
+  server.registerTool('review_daily_recovery_load', {
+    title: 'Review daily recovery and training load',
+    description: 'Return source-cited daily health, training, and nutrition facts for a recovery/load review. It does not prescribe a training plan.',
+    inputSchema: { date: z.string().date().optional() },
+  }, tool('review_daily_recovery_load', async (input) => {
+    const date = input.date ?? utcDate();
+    return useRepository(paths, async (repository) => ({
+      data: { date, ...(await repository.summary(date, date)) },
+      provenance: { relations: ['daily_health', 'canonical_activity_training', 'nutrition_days'], database: 'read-only DuckDB snapshot' },
+      query: { date },
+      caveats: [
+        'This is an evidence bundle for an LLM or coach to interpret; it is not a generated training prescription.',
+        'Absent health, training, or nutrition rows indicate unavailable source coverage rather than a zero value.',
+      ],
+    }));
+  }));
+
+  server.registerTool('review_weekly_training', {
+    title: 'Review seven days of training',
+    description: 'Return source-cited health, training, and nutrition facts for the seven-day period ending on an optional date. It does not prescribe a training plan.',
+    inputSchema: { endDate: z.string().date().optional() },
+  }, tool('review_weekly_training', async (input) => {
+    const endDate = input.endDate ?? utcDate();
+    const startDate = subtractDays(endDate, 6);
+    return useRepository(paths, async (repository) => ({
+      data: { startDate, endDate, ...(await repository.summary(startDate, endDate)) },
+      provenance: { relations: ['daily_health', 'canonical_activity_training', 'nutrition_days'], database: 'read-only DuckDB snapshot' },
+      query: { startDate, endDate },
+      caveats: [
+        'This is an evidence bundle for an LLM or coach to interpret; it is not a generated training prescription.',
+        'A day without a row is unavailable source coverage, not an inferred rest day.',
+      ],
+    }));
+  }));
+
+  server.registerTool('review_activity_deep_dive', {
+    title: 'Review one activity in depth',
+    description: 'Return canonical activity identity, source summaries, and structured intervals. Call read_series separately only when a specific sampled metric is required.',
+    inputSchema: { activityId: z.string().min(1) },
+  }, tool('review_activity_deep_dive', async (input) => useRepository(paths, async (repository) => {
+    const activity = await repository.activity(input.activityId);
+    return {
+      data: activity,
+      provenance: { relations: ['activities', 'activity_sources', 'activity_summary_facts', 'activity_interval_facts'], database: 'read-only DuckDB snapshot' },
+      query: input,
+      caveats: activity
+        ? ['This workflow does not infer interval structure or sampled metrics that providers did not supply. Use read_series for a bounded requested metric.']
+        : ['No canonical activity matched this activityId. Use find_activities before drawing conclusions.'],
+    };
+  })));
 
   server.registerTool('describe_data', {
     title: 'Describe available Catence datasets',

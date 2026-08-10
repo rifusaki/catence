@@ -147,10 +147,14 @@ question safely, then request a narrower/raw series only when it is useful.
 
 ### 4. Serving and retrieval
 
-The server currently exposes `catence_status`, `describe_data`, `describe_dataset`, `read_series`,
+The server exposes `catence_status`, `describe_data`, `describe_dataset`, `read_series`,
 `aggregate_data`, `analyze_series`, `fit_series_model`,
-`query_read_only_data`, `find_activities`, `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, `power_coverage_report`, `latest_cycling_activities`, `cycling_progress_report`, `search_context`, `hydrate_strava_activity`, `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history`, plus resources for status,
+`query_read_only_data`, `find_activities`, `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, `power_coverage_report`, `latest_cycling_activities`, `cycling_progress_report`, `review_daily_recovery_load`, `review_weekly_training`, `review_activity_deep_dive`, `search_context`, `hydrate_strava_activity`, `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history`, plus resources for status,
 catalog, a single activity, and a date-range summary.
+
+`catence serve` is a loopback-only-by-default Streamable HTTP adapter. It creates a stateless MCP server and transport for each `/mcp` request, so the HTTP and stdio surfaces use the same tool implementation. The same listener serves a small read-only `/api/v1/dashboard` snapshot for the local Console: canonical daily-health rows, weekly canonical activity aggregates, recent canonical activities, status, coverage, and explicit missing-data caveats. Browser access is opt-in per allowed origin; the endpoint never creates a Grafana/Influx mirror or bypasses DuckDB/Parquet provenance.
+
+The named review tools and prompts are intentionally evidence assembly rather than coaching prescription. They combine the relevant canonical facts, provider/source relations, coverage and caveats, then let the calling agent present a bounded, source-aware recovery/load, weekly, or activity review.
 
 `catence-data build-retrieval-index` explicitly generates `retrieval_documents` and
 `retrieval_index_state` in DuckDB. Documents draw from activity labels and key

@@ -158,8 +158,13 @@ describe('read-only retrieval and analytics', () => {
     await client.connect(clientTransport);
     try {
       const tools = await client.listTools();
-      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['catence_status', 'describe_dataset', 'read_series', 'query_read_only_data', 'search_context', 'get_ftp_history', 'get_vo2max_history', 'find_activities', 'get_swim_laps', 'swim_progress_report', 'get_activity_segments', 'power_curve_trend', 'power_coverage_report', 'latest_cycling_activities', 'cycling_progress_report', 'hydrate_recent_strava_activities']));
+      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['catence_status', 'describe_dataset', 'read_series', 'query_read_only_data', 'search_context', 'get_ftp_history', 'get_vo2max_history', 'find_activities', 'get_swim_laps', 'swim_progress_report', 'get_activity_segments', 'power_curve_trend', 'power_coverage_report', 'latest_cycling_activities', 'cycling_progress_report', 'hydrate_recent_strava_activities', 'review_daily_recovery_load', 'review_weekly_training', 'review_activity_deep_dive']));
       expect(client.getInstructions()).toContain('call get_activity_segments');
+      const weeklyReview = await client.callTool({ name: 'review_weekly_training', arguments: { endDate: '2026-01-08' } });
+      const weeklyPayload = JSON.parse(((weeklyReview as { content: Array<{ text: string }> }).content[0]).text) as { data: { startDate: string; endDate: string; health: unknown[]; training: unknown[] } };
+      expect(weeklyPayload.data).toEqual(expect.objectContaining({ startDate: '2026-01-02', endDate: '2026-01-08', health: expect.any(Array), training: expect.any(Array) }));
+      const prompt = await client.getPrompt({ name: 'activity_deep_dive', arguments: { activityId: 'garmin:garmin-ride-1' } });
+      expect(prompt.messages[0]?.content).toEqual(expect.objectContaining({ text: expect.stringContaining('review_activity_deep_dive') }));
       const result = await client.callTool({ name: 'read_series', arguments: { dataset: 'daily_health', metrics: ['hrv_ms'], startDate: '2026-01-01', endDate: '2026-01-08', resolution: 'day' } });
       const payload = JSON.parse(((result as { content: Array<{ text: string }> }).content[0]).text) as { data: unknown[] };
       expect(payload.data).toHaveLength(8);

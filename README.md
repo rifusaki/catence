@@ -15,10 +15,10 @@ Currently a bit limited but I'd like to expand it:
 - [x] Garmin, Intervals.icu, Strava data fetching
 - [x] Data normalization and storage
 - [x] Read-only local MCP server
+- [x] Local Streamable HTTP server
 - [ ] Publish on NPM
 - [ ] Publish on [APM](https://github.com/microsoft/apm)
-- [ ] Local Streamable HTTP server
-- [ ] Open WebUI frontend
+- [ ] Bundled Chainlit Console frontend
 - [ ] Data writing (training sessions, plans)
   - [ ] TrainingPeaks support
 - [ ] Limited multi-user support (see Caveats)
@@ -60,7 +60,7 @@ Priority is assigned per data type. Missing values mean the provider did not sup
 
 ## Set up
 
-Catence is not published to npm yet, so run it from a clone of this repository. It is currently a local, stdio-only MCP server.
+Catence is not published to npm yet, so run it from a clone of this repository. It exposes the same local MCP server over stdio and optional Streamable HTTP.
 
 ### Prerequisites
 
@@ -107,13 +107,25 @@ npm run catence-data -- backfill --provider garmin --from 2026-07-01 --refresh
 npm run catence-data -- build-retrieval-index
 npm run mcp
 npm run mcp -- --data-dir /absolute/path/to/catence-data
+
+# Optional local Streamable HTTP MCP and dashboard API
+npm run mcp -- serve --data-dir /absolute/path/to/catence-data --allow-origin http://127.0.0.1:8000
+npm run mcp -- serve --allow-origin http://127.0.0.1:8000
 ```
 
 The first manual sync uses the previous 12 months only when there is no local normalized coverage. `sync --provider strava` refreshes gear data. Strava activity segments and gear are enriched on demand by the MCP tools.
 
 ### Connect Strava
 
-With `STRAVA_CLIENT_ID` and `STRAVA_CLIENT_SECRET` in `.env`, run the first command and open its returned authorization URL, which contains the authorization code. Pass it to the second command:
+With `STRAVA_CLIENT_ID` and `STRAVA_CLIENT_SECRET` in `.env`, the local callback flow avoids copying a code out of the browser URL. Register `http://127.0.0.1:8765/strava/callback` as the authorization callback in the Strava application, then run:
+
+```sh
+npm run catence-data -- auth strava --callback
+```
+
+The command prints the authorization URL to the terminal, waits up to five minutes for the browser callback, validates OAuth state, and stores the resulting token only in `<data-dir>/secrets/strava.json`.
+
+The existing manual flow remains available for headless use:
 
 ```sh
 npm run catence-data -- auth strava
@@ -134,7 +146,7 @@ First complete the setup and at least one sync. Each client should start the sam
 npm --prefix /absolute/path/to/catence run mcp -- --data-dir /absolute/path/to/catence-data
 ```
 
-The MCP server's ordinary reads are local and read-only. Its explicit Strava hydration tools are the exception; they use the already stored local connection and a shared write lock.
+The MCP server's ordinary reads are local and read-only. Its explicit Strava hydration tools are the exception; they use the already stored local connection and a shared write lock. `catence serve` retains the same tools at `/mcp` and also exposes loopback dashboard data at `/api/v1/dashboard`; browser origins must be allowed explicitly with `--allow-origin`.
 
 ### Codex
 
