@@ -18,10 +18,33 @@ Currently a bit limited but I'd like to expand it:
 - [x] Local Streamable HTTP server
 - [ ] Publish on NPM
 - [ ] Publish on [APM](https://github.com/microsoft/apm)
-- [ ] Bundled Chainlit Console frontend
+- [x] Bundled local Chainlit Console with persisted chat history
 - [ ] Data writing (training sessions, plans)
   - [ ] TrainingPeaks support
 - [ ] Limited multi-user support (see Caveats)
+
+## What Catence can help you do
+
+Catence is most useful when a question benefits from checking several local
+signals instead of reacting to a single score. The Console and MCP tools can
+help you explore questions such as:
+
+- **Recovery and readiness:** “What changed in my sleep, HRV, resting heart
+  rate, stress, and recent load before today’s session?”
+- **Training load:** “Is this week materially harder than my recent baseline,
+  and which sessions contributed most?”
+- **Performance trends:** “How has my threshold pace, cycling power, or
+  swim efficiency changed across the season?”
+- **Session review:** “Compare this long run or interval set with similar
+  recent efforts, including pace/power, heart rate, terrain, and recovery.”
+- **Segments and gear:** “Show my history on this climb,” or “which shoes and
+  bikes have carried the most recent training volume?”
+- **Data-quality review:** “Which recent activities lack streams, power,
+  health context, or a matching provider record?”
+
+Every conclusion should name the dates and measurements it used. Catence is a
+training-data assistant, not medical advice: missing data is reported as
+missing rather than treated as a negative signal.
 
 ## Sources
 
@@ -138,13 +161,12 @@ Catence requests `read`, `activity:read_all`, and `read_all`. To remove the stor
 npm run catence-data -- disconnect strava
 ```
 
-## Run the local Console MVP
+## Run the local Console
 
-The Console is the Catence-owned agent runtime with the sibling `catence-ui`
-Chainlit fork as its frontend module. It retains Catence's existing DuckDB and
-Parquet data model: chats and model-provider secrets are not written into the
-fitness store. The Console sends model calls through LiteLLM in-process and
-calls the same Catence Streamable HTTP MCP tools that a coding agent uses.
+The Console is Catence’s local chat experience. It sends model calls through
+LiteLLM in-process and calls the same Streamable HTTP MCP tools that a coding
+agent uses. Provider keys are never written to Catence configuration or chat
+storage.
 
 This source-checkout MVP expects this sibling layout:
 
@@ -154,15 +176,36 @@ personal/
   catence-ui/
 ```
 
-Add a `console` section to `<data-dir>/config.json`. It defines named providers and deployments
-and environment-variable *names*, never credential values. The complete shape
-is in [`config.example.json`](config.example.json); a compact Azure Foundry
-profile looks like this:
+### First-run setup
+
+Launch the Console once with your selected provider’s environment variables in
+the terminal. If `<data-dir>/config.json` has no Console section, the browser
+walks through provider and model selection (Azure, OpenAI, or Anthropic) and
+writes only non-secret configuration. For example:
+
+```sh
+# Azure OpenAI / Foundry: use the Azure resource root and the Responses API route.
+export AZURE_API_KEY='…'
+export AZURE_API_BASE='https://your-resource.openai.azure.com'
+export AZURE_API_VERSION='preview'
+
+npm run console -- --data-dir /absolute/path/to/catence-data
+```
+
+For an existing configuration or an automated setup, add a `console` section
+to `<data-dir>/config.json`. It defines named providers and deployments and
+environment-variable *names*, never credential values. The complete shape is
+in [`config.example.json`](config.example.json); an Azure provider with several
+deployments looks like this:
 
 ```json
 {
   "console": {
     "defaultProfile": "azure-foundry",
+    "limits": {
+      "toolRounds": 8,
+      "toolResultCharacters": 24000
+    },
     "profiles": {
       "azure-foundry": {
         "label": "Azure Foundry",
@@ -182,13 +225,48 @@ profile looks like this:
 }
 ```
 
-The Console shows all configured deployments in its **Model** selector and sends
-the selected **Thinking effort** to LiteLLM as `reasoning_effort`. Choose only
-efforts supported by the selected deployment. Existing profiles with a single
-`model` remain supported. For an OpenAI-compatible provider such as OpenCode, use a model such as
-`openai/your-model` and set its `apiBaseEnv` and, if needed, `apiKeyEnv`.
-LiteLLM handles the provider normalization; Catence does not carry a proxy or
-store the values.
+The Console shows all configured deployments in its **Model** selector and
+sends the selected **Thinking effort** to LiteLLM as `reasoning_effort`. Choose
+only efforts supported by the selected deployment. Existing profiles with a
+single `model` remain supported.
+
+For the two common direct providers, the minimal profiles are:
+
+```json
+{
+  "openai": {
+    "label": "OpenAI",
+    "model": "openai/gpt-5-mini",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  },
+  "anthropic": {
+    "label": "Anthropic",
+    "model": "anthropic/claude-sonnet-4-5",
+    "apiKeyEnv": "ANTHROPIC_API_KEY"
+  }
+}
+```
+
+An OpenAI-compatible provider such as OpenCode uses a model such as
+`openai/your-model` plus `apiBaseEnv` and, if needed, `apiKeyEnv`. LiteLLM
+handles provider normalization; Catence does not carry a proxy or store the
+values.
+
+### Evidence and chat controls
+
+The settings panel controls the selected model, thinking effort, and two
+per-chat evidence limits:
+
+- **Tool-call rounds** defaults to 8 and may be set from 1 to 32. It limits
+  model → tool → model loops in a single response.
+- **Evidence per tool result** defaults to 24,000 characters and may be set
+  from 1,000 to 250,000. It limits a single result before it is passed to the
+  model.
+
+The defaults can also be set in `console.limits`. Higher limits can answer
+broader historical questions, but increase prompt size, latency, and provider
+cost. A tool result that reaches the cap is marked as truncated so the model
+knows its evidence is incomplete.
 
 Set the referenced variables in the terminal that will run the Console, then
 launch everything on loopback with one command:
@@ -213,10 +291,14 @@ npm run console:doctor -- \
 ```
 
 `doctor` reports only profile IDs, models, missing environment-variable names,
-and Catence health; it never prints credential values or calls a model. Chat
-history stays in the active Chainlit process for this MVP. Durable chat/tool
-audit persistence is a later DuckDB addition, rather than a parallel frontend
-database.
+and Catence health; it never prints credential values or calls a model.
+
+### Local chat history
+
+Console chats, messages, tool steps, and thread metadata are persisted at
+`<data-dir>/console/chat-history.sqlite3`. The history sidebar lets the local
+Console user resume, rename, and delete threads. This storage is separate from
+the fitness DuckDB/Parquet store and does not contain provider credentials.
 
 ## Add Catence to an MCP client
 

@@ -37,6 +37,7 @@ describe('Catence config limits', () => {
     await writeFile(paths.config, JSON.stringify({
       console: {
         defaultProfile: 'azure-foundry',
+        limits: { toolRounds: 12, toolResultCharacters: 48_000 },
         profiles: {
           'azure-foundry': {
             label: 'Azure Foundry',
@@ -49,6 +50,7 @@ describe('Catence config limits', () => {
     }));
     const config = await loadCatenceConfig(paths);
     expect(config.console?.profiles?.['azure-foundry']).toMatchObject({ model: 'azure_ai/catence', apiKeyEnv: 'AZURE_API_KEY' });
+    expect(config.console?.limits).toEqual({ toolRounds: 12, toolResultCharacters: 48_000 });
 
     await writeFile(paths.config, JSON.stringify({ console: { profiles: { unsafe: { model: 'openai/model', apiKeyEnv: 'sk-should-not-be-here' } } } }));
     await expect(loadCatenceConfig(paths)).rejects.toThrow('Invalid Catence config');

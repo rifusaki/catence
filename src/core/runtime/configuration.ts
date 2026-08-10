@@ -64,6 +64,10 @@ const consoleProfileSchema = z.object({
     context.addIssue({ code: 'custom', path: ['defaultModel'], message: 'must name one of models' });
   }
 });
+const consoleLimitsSchema = z.object({
+  toolRounds: z.number().int().min(1).max(32).optional(),
+  toolResultCharacters: z.number().int().min(1_000).max(250_000).optional(),
+}).strict();
 const catenceConfigSchema = z.object({
   mcp: z.object({
     rateLimits: z.object({
@@ -83,6 +87,7 @@ const catenceConfigSchema = z.object({
   }).strict().optional(),
   console: z.object({
     defaultProfile: z.string().min(1).optional(),
+    limits: consoleLimitsSchema.optional(),
     profiles: z.record(z.string().min(1), consoleProfileSchema).optional(),
   }).strict().optional(),
 }).strict();

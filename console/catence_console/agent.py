@@ -11,7 +11,7 @@ from litellm import acompletion
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-from .config import ProviderProfile
+from .config import DEFAULT_TOOL_RESULT_CHARACTER_LIMIT, DEFAULT_TOOL_ROUND_LIMIT, ProviderProfile
 
 SYSTEM_PROMPT = """You are Catence, a careful endurance-training data assistant.
 Use Catence MCP tools for athlete-specific facts. Start with a named review tool
@@ -21,10 +21,6 @@ or clinical conclusions. Distinguish a missing measurement from a poor value.
 In every conclusion, name the dates and metrics returned by the tools so the
 athlete can trace the evidence. Catence's data is personal and local: do not
 ask for credentials or expose configuration values."""
-
-MAX_TOOL_ROUNDS = 8
-MAX_TOOL_RESULT_CHARACTERS = 24_000
-
 
 def _as_json(value: Any) -> Any:
     if hasattr(value, "model_dump"):
@@ -72,26 +68,28 @@ def _tool_call_parts(tool_call: Any) -> tuple[str, str, dict[str, Any]]:
     return call_id, name, arguments
 
 
-def _tool_result_payload(result: Any) -> dict[str, Any]:
+def _tool_result_payload(result: Any, maximum_characters: int) -> dict[str, Any]:
     payload = _as_json(result)
     encoded = json.dumps(payload, ensure_ascii=False, default=str)
-    if len(encoded) <= MAX_TOOL_RESULT_CHARACTERS:
+    if len(encoded) <= maximum_characters:
         return payload
     return {
-        "content": [{"type": "text", "text": encoded[:MAX_TOOL_RESULT_CHARACTERS]}],
+        "content": [{"type": "text", "text": encoded[:maximum_characters]}],
         "isError": True,
         "truncated": True,
-        "message": "Catence returned more evidence than the Console can safely pass to the model in one turn.",
+        "message": f"Catence returned more evidence than this chat permits ({maximum_characters:,} characters per tool result).",
     }
 
 
-async def _invoke_tool(session: ClientSession, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+async def _invoke_tool(
+    session: ClientSession, name: str, arguments: dict[str, Any], maximum_characters: int
+) -> dict[str, Any]:
     step = cl.Step(name=f"Catence · {name}", type="tool", default_open=False)
     step.input = arguments
     await step.send()
     try:
         result = await session.call_tool(name, arguments)
-        payload = _tool_result_payload(result)
+        payload = _tool_result_payload(result, maximum_characters)
         step.output = payload
         step.is_error = bool(payload.get("isError"))
         await step.update()
@@ -111,6 +109,8 @@ async def respond(
     reasoning_effort: str | None,
     history: list[dict[str, Any]],
     mcp_url: str,
+    tool_round_limit: int = DEFAULT_TOOL_ROUND_LIMIT,
+    tool_result_character_limit: int = DEFAULT_TOOL_RESULT_CHARACTER_LIMIT,
     complete: Callable[..., Awaitable[Any]] = acompletion,
 ) -> str:
     """Run one bounded Chat turn, displaying each evidence-producing MCP call."""
@@ -123,7 +123,7 @@ async def respond(
             tools = _tool_definitions(list(listed_tools.tools))
             messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
 
-            for _ in range(MAX_TOOL_ROUNDS):
+            for _ in range(tool_round_limit):
                 options: dict[str, Any] = {
                     **profile.litellm_options(model_id),
                     "messages": messages,
@@ -148,7 +148,7 @@ async def respond(
                 )
                 for tool_call in tool_calls:
                     call_id, name, arguments = _tool_call_parts(tool_call)
-                    payload = await _invoke_tool(session, name, arguments)
+                    payload = await _invoke_tool(session, name, arguments, tool_result_character_limit)
                     messages.append(
                         {
                             "role": "tool",
@@ -157,4 +157,4 @@ async def respond(
                         }
                     )
 
-    return "I stopped after eight Catence tool calls. Please narrow the question or start with a named review."
+    return f"I stopped after {tool_round_limit} Catence tool calls. Please narrow the question or raise the tool-round limit in settings."

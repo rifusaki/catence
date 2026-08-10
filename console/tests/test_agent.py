@@ -72,3 +72,9 @@ def test_respond_normalizes_mcp_tools_for_litellm(monkeypatch):
             },
         }
     ]
+
+
+def test_tool_result_limit_marks_truncated_evidence():
+    payload = agent._tool_result_payload({"content": "x" * 100}, maximum_characters=20)
+    assert payload["truncated"] is True
+    assert "20" in payload["message"]

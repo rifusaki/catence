@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from catence_console.config import ConsoleConfigurationError, load_console_configuration
+from catence_console.config import ConsoleConfigurationError, load_console_configuration, write_provider_setup
+from catence_console.app import _limit_setting
 
 
 def write_config(tmp_path, console):
@@ -89,3 +90,29 @@ def test_loads_multiple_models_and_a_default_reasoning_effort(tmp_path):
     profile, model_id = configuration.selected_model("azure:terra")
     assert profile.litellm_options(model_id) == {"model": "azure/gpt-5.6-terra"}
     assert profile.default_reasoning_effort == "high"
+
+
+def test_loads_configurable_tool_limits_and_writes_a_safe_setup(tmp_path):
+    write_config(
+        tmp_path,
+        {
+            "limits": {"toolRounds": 12, "toolResultCharacters": 48_000},
+            "profiles": {"openai": {"model": "openai/gpt-5-mini"}},
+        },
+    )
+    configuration = load_console_configuration(tmp_path)
+    assert configuration.limits.tool_rounds == 12
+    assert configuration.limits.tool_result_characters == 48_000
+
+    setup = write_provider_setup(tmp_path, "anthropic", "claude-sonnet-4-5")
+    assert setup.default_profile == "anthropic"
+    assert setup.profile("anthropic").litellm_options() == {"model": "anthropic/claude-sonnet-4-5"}
+    assert setup.model_choices() == {"Anthropic · claude-sonnet-4-5": "anthropic:default"}
+    persisted = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert "ANTHROPIC_API_KEY" == persisted["console"]["profiles"]["anthropic"]["apiKeyEnv"]
+
+
+def test_normalizes_number_input_values_for_per_chat_limits():
+    assert _limit_setting("48000", 1_000, 250_000) == 48_000
+    assert _limit_setting("999999", 1_000, 250_000) == 250_000
+    assert _limit_setting("nope", 1_000, 250_000) is None

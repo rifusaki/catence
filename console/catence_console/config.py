@@ -11,6 +11,12 @@ from typing import Any
 
 ENVIRONMENT_VARIABLE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+DEFAULT_TOOL_ROUND_LIMIT = 8
+DEFAULT_TOOL_RESULT_CHARACTER_LIMIT = 24_000
+MIN_TOOL_ROUND_LIMIT = 1
+MAX_TOOL_ROUND_LIMIT = 32
+MIN_TOOL_RESULT_CHARACTER_LIMIT = 1_000
+MAX_TOOL_RESULT_CHARACTER_LIMIT = 250_000
 
 
 class ConsoleConfigurationError(ValueError):
@@ -24,6 +30,14 @@ class ModelOption:
     id: str
     label: str
     model: str
+
+
+@dataclass(frozen=True)
+class ConsoleLimits:
+    """Safety limits for evidence passed to the model in one chat turn."""
+
+    tool_rounds: int = DEFAULT_TOOL_ROUND_LIMIT
+    tool_result_characters: int = DEFAULT_TOOL_RESULT_CHARACTER_LIMIT
 
 
 @dataclass(frozen=True)
@@ -78,6 +92,7 @@ class ProviderProfile:
 class ConsoleConfiguration:
     default_profile: str
     profiles: dict[str, ProviderProfile]
+    limits: ConsoleLimits = ConsoleLimits()
 
     def profile(self, profile_id: str) -> ProviderProfile:
         try:
@@ -125,6 +140,41 @@ def _environment_name(value: Any, field: str, profile_id: str) -> str | None:
     return value
 
 
+def _integer_in_range(value: Any, description: str, minimum: int, maximum: int, default: int) -> int:
+    if value is None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+        raise ConsoleConfigurationError(f"{description} must be an integer between {minimum:,} and {maximum:,}.")
+    return value
+
+
+def _limits(value: Any) -> ConsoleLimits:
+    if value is None:
+        return ConsoleLimits()
+    limits = _object(value, "console.limits")
+    unknown_fields = set(limits) - {"toolRounds", "toolResultCharacters"}
+    if unknown_fields:
+        raise ConsoleConfigurationError(
+            f"console.limits contains unsupported fields: {', '.join(sorted(unknown_fields))}."
+        )
+    return ConsoleLimits(
+        tool_rounds=_integer_in_range(
+            limits.get("toolRounds"),
+            "console.limits.toolRounds",
+            MIN_TOOL_ROUND_LIMIT,
+            MAX_TOOL_ROUND_LIMIT,
+            DEFAULT_TOOL_ROUND_LIMIT,
+        ),
+        tool_result_characters=_integer_in_range(
+            limits.get("toolResultCharacters"),
+            "console.limits.toolResultCharacters",
+            MIN_TOOL_RESULT_CHARACTER_LIMIT,
+            MAX_TOOL_RESULT_CHARACTER_LIMIT,
+            DEFAULT_TOOL_RESULT_CHARACTER_LIMIT,
+        ),
+    )
+
+
 def _model_option(value: Any, profile_id: str, model_id: str) -> ModelOption:
     model = _object(value, f"console.profiles.{profile_id}.models.{model_id}")
     unknown_fields = set(model) - {"label", "model"}
@@ -155,7 +205,7 @@ def load_console_configuration(data_directory: Path) -> ConsoleConfiguration:
         raise ConsoleConfigurationError(f"Invalid JSON in {path}: {error.msg}") from error
 
     console = _object(root.get("console"), "console")
-    unknown_console_fields = set(console) - {"defaultProfile", "profiles"}
+    unknown_console_fields = set(console) - {"defaultProfile", "profiles", "limits"}
     if unknown_console_fields:
         raise ConsoleConfigurationError(
             f"console contains unsupported fields: {', '.join(sorted(unknown_console_fields))}."
@@ -228,8 +278,67 @@ def load_console_configuration(data_directory: Path) -> ConsoleConfiguration:
     default_profile = console.get("defaultProfile", next(iter(profiles)))
     if not isinstance(default_profile, str) or default_profile not in profiles:
         raise ConsoleConfigurationError("console.defaultProfile must name one of console.profiles.")
-    return ConsoleConfiguration(default_profile=default_profile, profiles=profiles)
+    return ConsoleConfiguration(default_profile=default_profile, profiles=profiles, limits=_limits(console.get("limits")))
 
 
 def missing_environment(profile: ProviderProfile) -> tuple[str, ...]:
     return tuple(name for name in profile.required_environment if not os.environ.get(name))
+
+
+def write_provider_setup(data_directory: Path, provider: str, model: str) -> ConsoleConfiguration:
+    """Create a safe first Console profile without storing any credential values."""
+
+    presets = {
+        "azure": {
+            "id": "azure-foundry",
+            "label": "Azure Foundry",
+            "model": f"azure_ai/{model}",
+            "apiKeyEnv": "AZURE_API_KEY",
+            "apiBaseEnv": "AZURE_API_BASE",
+            "apiVersionEnv": "AZURE_API_VERSION",
+            "defaultReasoningEffort": "medium",
+        },
+        "openai": {
+            "id": "openai",
+            "label": "OpenAI",
+            "model": f"openai/{model}",
+            "apiKeyEnv": "OPENAI_API_KEY",
+        },
+        "anthropic": {
+            "id": "anthropic",
+            "label": "Anthropic",
+            "model": f"anthropic/{model}",
+            "apiKeyEnv": "ANTHROPIC_API_KEY",
+        },
+    }
+    try:
+        preset = presets[provider]
+    except KeyError as error:
+        raise ConsoleConfigurationError("Choose Azure, OpenAI, or Anthropic.") from error
+    if not model.strip():
+        raise ConsoleConfigurationError("A model or deployment name is required.")
+
+    path = data_directory / "config.json"
+    try:
+        root = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        root = {}
+    except json.JSONDecodeError as error:
+        raise ConsoleConfigurationError(f"Invalid JSON in {path}: {error.msg}") from error
+    root = _object(root, "Catence config")
+    profile_id = preset["id"]
+    profile = {key: value for key, value in preset.items() if key != "id"}
+    configured_model = profile.pop("model")
+    profile["models"] = {
+        "default": {"label": model, "model": configured_model},
+    }
+    profile["defaultModel"] = "default"
+    root["console"] = {
+        "defaultProfile": profile_id,
+        "profiles": {profile_id: profile},
+    }
+    data_directory.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(root, indent=2) + "\n", encoding="utf-8")
+    temporary_path.replace(path)
+    return load_console_configuration(data_directory)

@@ -134,6 +134,7 @@ def serve(args: argparse.Namespace) -> int:
             "CATENCE_DATA_DIR": str(data_directory),
             "CATENCE_MCP_URL": mcp_url,
             "CHAINLIT_APP_ROOT": str(root),
+            "CHAINLIT_LOCAL_USER": "catence-local",
         }
     )
 
