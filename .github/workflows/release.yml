@@ -123,6 +123,6 @@ jobs:
           pattern: mcpb-*
           path: dist/mcpb
           merge-multiple: true
-      - run: gh release create "$GITHUB_REF_NAME" dist/mcpb/*.mcpb --generate-notes
+      - run: gh release create "$GITHUB_REF_NAME" dist/mcpb/*.mcpb --repo "$GITHUB_REPOSITORY" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
