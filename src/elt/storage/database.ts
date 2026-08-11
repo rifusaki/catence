@@ -252,6 +252,10 @@ function subtractDays(date: string, days: number): string {
  */
 export class ReadOnlyCatenceDatabase {
   private closed = false;
+  // @duckdb/node-api shares prepared-statement state on a connection. Query
+  // services may compose independent reads with Promise.all(), so serialize at
+  // this boundary instead of relying on every caller to remember that detail.
+  private queryTail: Promise<void> = Promise.resolve();
 
   private constructor(
     private readonly instance: DuckDBInstance,
@@ -288,6 +292,7 @@ export class ReadOnlyCatenceDatabase {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    await this.queryTail;
     try {
       this.connection.closeSync();
     } finally {
@@ -296,16 +301,31 @@ export class ReadOnlyCatenceDatabase {
   }
 
   async rows<T extends Record<string, unknown>>(sql: string, values?: QueryBindings): Promise<T[]> {
-    const result = await this.connection.runAndReadAll(sql, values as DuckDBValue[] | Record<string, DuckDBValue> | undefined);
-    return result.getRowObjectsJS() as T[];
+    return this.withConnection(async () => {
+      const result = await this.connection.runAndReadAll(sql, values as DuckDBValue[] | Record<string, DuckDBValue> | undefined);
+      return result.getRowObjectsJS() as T[];
+    });
   }
 
   async tableNames(query: string): Promise<string[]> {
-    return [...this.connection.getTableNames(query, true)];
+    return this.withConnection(async () => [...this.connection.getTableNames(query, true)]);
   }
 
   interrupt(): void {
     this.connection.interrupt();
+  }
+
+  private async withConnection<T>(operation: () => Promise<T>): Promise<T> {
+    let release: (() => void) | undefined;
+    const completed = new Promise<void>((resolve) => { release = resolve; });
+    const previous = this.queryTail;
+    this.queryTail = completed;
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release?.();
+    }
   }
 }
 

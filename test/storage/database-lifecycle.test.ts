@@ -13,6 +13,12 @@ describe('DuckDB database lifecycle', () => {
     const repository = await openReadOnlyRepository(paths);
     try {
       expect(await repository.rows('SELECT count(*) AS count FROM daily_metrics')).toEqual([{ count: 0n }]);
+      const [dailyMetrics, activities] = await Promise.all([
+        repository.rows('SELECT count(*) AS count FROM daily_metrics'),
+        repository.rows('SELECT count(*) AS count FROM activities'),
+      ]);
+      expect(dailyMetrics).toEqual([{ count: 0n }]);
+      expect(activities).toEqual([{ count: 0n }]);
     } finally {
       await repository.close();
     }
