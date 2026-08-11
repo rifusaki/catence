@@ -83,7 +83,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
           cache: npm
       - uses: actions/download-artifact@v4
         with:
@@ -94,6 +93,10 @@ jobs:
         with:
           name: catence-console-wheel
           path: dist/console
+      # npm trusted publishing requires npm 11.5.1 or newer. Do not set
+      # setup-node's registry-url here: it writes a GitHub-token .npmrc that
+      # prevents npm from selecting the GitHub Actions OIDC identity.
+      - run: npm install --global npm@^11.5.1
       - run: npm ci
       - run: npm run release:check
       - run: npm publish --access public --provenance
