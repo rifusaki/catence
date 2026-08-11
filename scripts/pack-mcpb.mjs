@@ -9,8 +9,18 @@ const cache = path.join(root, '.npm-cache');
 const environment = { ...process.env, npm_config_cache: cache };
 
 function run(arguments_) {
-  const result = spawnSync(npm, arguments_, { cwd: root, env: environment, stdio: 'inherit' });
-  if (result.status !== 0) throw new Error(`${npm} ${arguments_.join(' ')} failed with status ${result.status ?? 'unknown'}.`);
+  // npm.cmd is a Windows command shim, not a directly executable binary.
+  // Spawn it through cmd.exe there while retaining direct invocation elsewhere.
+  const result = spawnSync(npm, arguments_, {
+    cwd: root,
+    env: environment,
+    stdio: 'inherit',
+    shell: process.platform === 'win32',
+  });
+  if (result.status !== 0) {
+    const detail = result.error ? `: ${result.error.message}` : '';
+    throw new Error(`${npm} ${arguments_.join(' ')} failed with status ${result.status ?? 'unknown'}${detail}.`);
+  }
 }
 
 await mkdir(path.join(root, 'dist'), { recursive: true });
