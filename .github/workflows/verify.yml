@@ -29,3 +29,5 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install --disable-pip-version-check apm-cli
       - run: mkdir -p /tmp/catence-apm-consumer && apm install --root /tmp/catence-apm-consumer --target codex --dry-run
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build console --wheel

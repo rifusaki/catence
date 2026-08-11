@@ -169,12 +169,45 @@ wheels = [
 ]
 
 [[package]]
+name = "catence-chainlit"
+version = "0.1.0"
+source = { registry = "../../catence-ui/dist" }
+dependencies = [
+    { name = "aiofiles" },
+    { name = "asyncer" },
+    { name = "click" },
+    { name = "dataclasses-json" },
+    { name = "fastapi" },
+    { name = "filetype" },
+    { name = "httpx" },
+    { name = "lazify" },
+    { name = "literalai" },
+    { name = "mcp" },
+    { name = "nest-asyncio" },
+    { name = "packaging" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "pyjwt" },
+    { name = "python-dotenv" },
+    { name = "python-multipart" },
+    { name = "python-socketio" },
+    { name = "starlette" },
+    { name = "syncer" },
+    { name = "tomli" },
+    { name = "uvicorn" },
+    { name = "watchfiles" },
+]
+wheels = [
+    { path = "catence_chainlit-0.1.0-py3-none-any.whl" },
+]
+
+[[package]]
 name = "catence-console"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
-    { name = "chainlit" },
+    { name = "catence-chainlit" },
     { name = "greenlet" },
     { name = "litellm" },
     { name = "sqlalchemy" },
@@ -188,7 +221,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20.0,<1.0.0" },
-    { name = "chainlit", editable = "../../catence-ui/backend" },
+    { name = "catence-chainlit", specifier = "==0.1.0" },
     { name = "greenlet", specifier = ">=3.0.0,<4.0.0" },
     { name = "litellm", specifier = ">=1.80.0,<2.0.0" },
     { name = "sqlalchemy", specifier = ">=2.0.28,<3.0.0" },
@@ -241,99 +274,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/70/ea/839b50531021a647fb5e929f72cf97bc1ff702b5472166164b5b6e76b851/cffi-2.1.1-cp313-cp313-win32.whl", hash = "sha256:334644fbac4eff73d985a17a91226df55d0f394160c4cfb880e084c8f7161cac", size = 175263, upload-time = "2026-08-03T21:20:13.559Z" },
     { url = "https://files.pythonhosted.org/packages/60/a6/8b149b2c3f2e11aaa1618ef64500b45f50f22c57a977a4dff1aff1f91042/cffi-2.1.1-cp313-cp313-win_amd64.whl", hash = "sha256:1aa5645c30469b09530c4ebca77ebf8f17618293c58f8549cb1a543a50236e7d", size = 185688, upload-time = "2026-08-03T21:20:14.69Z" },
     { url = "https://files.pythonhosted.org/packages/01/9a/11f687cb39d6a3504060d5242f04f48c735afb4d3d533958a20594890cb2/cffi-2.1.1-cp313-cp313-win_arm64.whl", hash = "sha256:63bbfd5ded17c4840ac07cd8f1c21ba9d9708141f840b324f422f41b207e3973", size = 180078, upload-time = "2026-08-03T21:20:15.917Z" },
-]
-
-[[package]]
-name = "chainlit"
-source = { editable = "../../catence-ui/backend" }
-dependencies = [
-    { name = "aiofiles" },
-    { name = "asyncer" },
-    { name = "click" },
-    { name = "dataclasses-json" },
-    { name = "fastapi" },
-    { name = "filetype" },
-    { name = "httpx" },
-    { name = "lazify" },
-    { name = "literalai" },
-    { name = "mcp" },
-    { name = "nest-asyncio" },
-    { name = "packaging" },
-    { name = "pydantic" },
-    { name = "pydantic-settings" },
-    { name = "pyjwt" },
-    { name = "python-dotenv" },
-    { name = "python-multipart" },
-    { name = "python-socketio" },
-    { name = "starlette" },
-    { name = "syncer" },
-    { name = "tomli" },
-    { name = "uvicorn" },
-    { name = "watchfiles" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiofiles", specifier = ">=23.1.0" },
-    { name = "aiosqlite", marker = "extra == 'tests'", specifier = ">=0.20.0,<1.0.0" },
-    { name = "asyncer", specifier = ">=0.0.8,<0.1.0" },
-    { name = "asyncpg", marker = "extra == 'custom-data'", specifier = ">=0.30.0,<1.0.0" },
-    { name = "azure-identity", marker = "extra == 'custom-data'", specifier = ">=1.14.1,<2.0.0" },
-    { name = "azure-storage-blob", marker = "extra == 'custom-data'", specifier = ">=12.24.0,<13.0.0" },
-    { name = "azure-storage-file-datalake", marker = "extra == 'custom-data'", specifier = ">=12.14.0,<13.0.0" },
-    { name = "botbuilder-core", marker = "extra == 'tests'", specifier = ">=4.15.0,<5.0.0" },
-    { name = "boto3", marker = "extra == 'custom-data'", specifier = ">=1.34.73,<2.0.0" },
-    { name = "click", specifier = ">=8.1.3,<9.0.0" },
-    { name = "dataclasses-json", specifier = ">=0.6.7,<0.7.0" },
-    { name = "discord", marker = "extra == 'tests'", specifier = ">=2.3.2,<3.0.0" },
-    { name = "fastapi", specifier = ">=0.116.1" },
-    { name = "filetype", specifier = ">=1.2.0,<2.0.0" },
-    { name = "google-cloud-storage", marker = "extra == 'custom-data'", specifier = ">=2.19.0,<4.0.0" },
-    { name = "httpx", specifier = ">=0.23.0" },
-    { name = "langchain", marker = "extra == 'tests'", specifier = ">=1.0.0" },
-    { name = "lazify", specifier = ">=0.4.0,<0.5.0" },
-    { name = "literalai", specifier = "==0.1.201" },
-    { name = "llama-index", marker = "extra == 'tests'", specifier = ">=0.13.0,<1.0.0" },
-    { name = "matplotlib", marker = "extra == 'tests'", specifier = ">=3.7.1,<4.0.0" },
-    { name = "mcp", specifier = ">=1.11.0,<2.0.0" },
-    { name = "moto", marker = "extra == 'tests'", specifier = ">=5.0.14,<6.0.0" },
-    { name = "mypy", marker = "extra == 'mypy'", specifier = ">=1.13,<2.0.0" },
-    { name = "mypy-boto3-dynamodb", marker = "extra == 'mypy'", specifier = ">=1.34.113,<2.0.0" },
-    { name = "nest-asyncio", specifier = ">=1.6.0,<2.0.0" },
-    { name = "openai", marker = "extra == 'tests'", specifier = ">=2.0.0,<3.0.0" },
-    { name = "packaging", specifier = ">=23.1" },
-    { name = "pandas", marker = "extra == 'tests'", specifier = ">=2.2.2,<4.0.0" },
-    { name = "pandas-stubs", marker = "python_full_version >= '3.9' and extra == 'mypy'", specifier = ">=2.2.2,<4.0.0" },
-    { name = "plotly", marker = "extra == 'tests'", specifier = ">=5.3.0,<7.0.0" },
-    { name = "polars", marker = "extra == 'tests'", specifier = ">=1.0.0,<2.0.0" },
-    { name = "pydantic", specifier = ">=2.7.2,<3" },
-    { name = "pydantic-settings", specifier = ">=2.10.1" },
-    { name = "pyjwt", specifier = ">=2.8.0,<3.0.0" },
-    { name = "pytest", marker = "extra == 'tests'", specifier = ">=8.3.2,<10.0.0" },
-    { name = "pytest-asyncio", marker = "extra == 'tests'", specifier = ">=1.0.0,<2.0.0" },
-    { name = "pytest-cov", marker = "extra == 'tests'", specifier = ">=6.0.0,<7.0.0" },
-    { name = "python-dotenv", specifier = ">=1.0.0,<2.0.0" },
-    { name = "python-multipart", specifier = ">=0.0.18,<1.0.0" },
-    { name = "python-socketio", specifier = ">=5.11.0,<6.0.0" },
-    { name = "semantic-kernel", marker = "extra == 'tests'", specifier = ">=1.24.0,<2.0.0" },
-    { name = "slack-bolt", marker = "extra == 'tests'", specifier = ">=1.18.1,<2.0.0" },
-    { name = "sqlalchemy", marker = "extra == 'custom-data'", specifier = ">=2.0.28,<3.0.0" },
-    { name = "starlette", specifier = ">=0.47.2" },
-    { name = "syncer", specifier = ">=2.0.3,<3.0.0" },
-    { name = "tenacity", marker = "extra == 'tests'", specifier = ">=9.0.0,<10.0.0" },
-    { name = "tomli", specifier = ">=2.0.1,<3.0.0" },
-    { name = "transformers", marker = "extra == 'tests'", specifier = ">=5.0,<6.0" },
-    { name = "types-aiofiles", marker = "extra == 'mypy'", specifier = ">=23.1.0.5,<26.0.0" },
-    { name = "types-requests", marker = "extra == 'mypy'", specifier = ">=2.31.0.2,<3.0.0" },
-    { name = "uvicorn", specifier = ">=0.35.0" },
-    { name = "watchfiles", specifier = ">=1.1.1,<2.0.0" },
-]
-provides-extras = ["custom-data", "mypy", "tests"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "hatchling" },
-    { name = "ruff", specifier = ">=0.13.3,<1.0.0" },
 ]
 
 [[package]]

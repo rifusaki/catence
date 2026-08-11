@@ -1,20 +1,34 @@
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { configuredMcpRateLimit, loadCatenceConfig, resolvePaths, type CatencePaths } from '../../core/runtime/configuration.js';
-import { SlidingWindowLimiter } from '../../core/runtime/limiter.js';
-import { demoStoreMetadata } from '../../elt/application/demo.js';
-import { DataWriteBusyError } from '../../elt/storage/write-lock.js';
-import { hydrateStravaActivity, hydrateStravaSegmentHistory, StravaEnrichmentError, StravaRateLimitError } from '../../elt/ingestion/providers/strava/service.js';
-import { openReadOnlyRepository, ReadOnlyDatabaseError } from '../../elt/storage/database.js';
-import { searchContext } from '../../core/retrieval/index.js';
-import { AnalyticsService, type DataFilter } from '../../core/query/analytics.js';
-import { ActivityDiscoveryService } from '../../core/query/activity-discovery.js';
-import { getDataset, QueryValidationError } from '../../core/query/catalog.js';
-import { FitnessService } from '../../core/query/fitness.js';
-import { SwimmingService } from '../../core/query/swimming.js';
-import { WELLNESS_METRICS, WellnessService } from '../../core/query/wellness.js';
-import { jsonSafe, ReadOnlyRepository } from '../../core/query/repository.js';
-import { queryReadOnlyData } from '../../core/query/sql-guard.js';
+import {
+  ActivityDiscoveryService,
+  AnalyticsService,
+  configuredMcpRateLimit,
+  DataWriteBusyError,
+  DATASET_CATALOG,
+  demoStoreMetadata,
+  FitnessService,
+  getDataset,
+  hydrateStravaActivity,
+  hydrateStravaSegmentHistory,
+  jsonSafe,
+  loadCatenceConfig,
+  openReadOnlyRepository,
+  queryReadOnlyData,
+  QueryValidationError,
+  ReadOnlyDatabaseError,
+  ReadOnlyRepository,
+  resolvePaths,
+  searchContext,
+  SlidingWindowLimiter,
+  StravaEnrichmentError,
+  StravaRateLimitError,
+  SwimmingService,
+  type CatencePaths,
+  type DataFilter,
+  WELLNESS_METRICS,
+  WellnessService,
+} from '../../runtime/index.js';
 
 const filterSchema = z.object({
   column: z.string().min(1),
@@ -525,7 +539,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
     const limited = await resourceLimit('status', uri); if (limited) return limited;
     try { return resource(uri, await useRepository(paths, (repository) => repository.status())); } catch (error) { return resource(uri, { error: errorResult(error).content[0].text }); }
   });
-  server.registerResource('catalog', 'catence://catalog', { title: 'Catence catalog', mimeType: 'application/json' }, async (uri) => { const limited = await resourceLimit('catalog', uri); if (limited) return limited; return resource(uri, { datasets: Object.values((await import('../../core/query/catalog.js')).DATASET_CATALOG) }); });
+  server.registerResource('catalog', 'catence://catalog', { title: 'Catence catalog', mimeType: 'application/json' }, async (uri) => { const limited = await resourceLimit('catalog', uri); if (limited) return limited; return resource(uri, { datasets: Object.values(DATASET_CATALOG) }); });
   server.registerResource('activity', new ResourceTemplate('catence://activity/{activityId}', { list: undefined }), { title: 'Activity detail', mimeType: 'application/json' }, async (uri, variables) => {
     const limited = await resourceLimit('activity', uri); if (limited) return limited;
     try { return resource(uri, await useRepository(paths, (repository) => repository.activity(variable(variables.activityId)))); } catch (error) { return resource(uri, { error: errorResult(error).content[0].text }); }

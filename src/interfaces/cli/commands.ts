@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { resolvePaths, type CatencePaths } from '../../core/runtime/configuration.js';
-import { connectStrava, connectStravaWithCallback, dataStatus, disconnectStravaAccount, initializeDataStore, linkActivity, rebuildRetrievalIndex, retryDataSync, syncData, type ProviderChoice, unlinkActivity } from '../../elt/application/management.js';
-import { createDemoStore } from '../../elt/application/demo.js';
+import { connectStrava, connectStravaWithCallback, createDemoStore, dataStatus, disconnectStravaAccount, initializeDataStore, linkActivity, rebuildRetrievalIndex, resolvePaths, retryDataSync, syncData, type CatencePaths, type ProviderChoice, unlinkActivity } from '../../runtime/index.js';
 
 const program = new Command()
   .name('catence-data')

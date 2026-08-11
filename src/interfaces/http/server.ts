@@ -1,9 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { resolvePaths, type CatencePaths } from '../../core/runtime/configuration.js';
-import { DashboardSnapshotService } from '../../core/dashboard/snapshot.js';
-import { jsonSafe } from '../../core/query/repository.js';
-import { openReadOnlyRepository } from '../../elt/storage/database.js';
+import { catenceRuntimeHealth, DashboardSnapshotService, jsonSafe, openReadOnlyRepository, resolvePaths, type CatencePaths } from '../../runtime/index.js';
 import { createCatenceMcpServer } from '../mcp/server.js';
 
 const MAX_REQUEST_BYTES = 1_000_000;
@@ -152,7 +149,7 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       }
 
       if (pathname === '/health' && request.method === 'GET') {
-        json(response, 200, { status: 'ok', service: 'catence' });
+        json(response, 200, catenceRuntimeHealth());
         return;
       }
 

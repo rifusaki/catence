@@ -51,8 +51,31 @@ jobs:
           path: dist/*.mcpb
           if-no-files-found: error
 
+  console:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: astral-sh/setup-uv@v6
+      - name: Verify the matching Catence Chainlit wheel exists
+        run: |
+          version=$(node -p "require('./release/manifest.json').version")
+          uv pip install --system "catence-chainlit==$version"
+      - run: uv build console --wheel --out-dir dist/console
+      - uses: actions/upload-artifact@v4
+        with:
+          name: catence-console-wheel
+          path: dist/console/*.whl
+          if-no-files-found: error
+
   publish:
-    needs: [verify, mcpb]
+    needs: [verify, mcpb, console]
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -67,11 +90,38 @@ jobs:
           pattern: mcpb-*
           path: dist/mcpb
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: catence-console-wheel
+          path: dist/console
       - run: npm ci
       - run: npm run release:check
       - run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-console:
+    needs: [publish, console]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: catence-console-wheel
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: [publish, publish-console]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mcpb-*
+          path: dist/mcpb
+          merge-multiple: true
       - run: gh release create "$GITHUB_REF_NAME" dist/mcpb/*.mcpb --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

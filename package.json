@@ -48,8 +48,8 @@
   ],
   "scripts": {
     "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\" && tsc -p tsconfig.build.json",
-    "check": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
+    "check": "node scripts/check-runtime-boundaries.mjs && tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.config.ts",
     "test:watch": "vitest",
     "catence-data": "tsx src/interfaces/cli/main.ts",
     "mcp": "tsx src/interfaces/mcp/main.ts",

@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { resolvePaths } from '../../core/runtime/configuration.js';
-import { createDemoStore } from '../../elt/application/demo.js';
+import { createDemoStore, resolvePaths } from '../../runtime/index.js';
 import { parseServeCliOptions, SERVE_USAGE } from '../http/cli-options.js';
 import { createCatenceHttpServer } from '../http/server.js';
 import { MCP_USAGE, parseMcpCliOptions } from './cli-options.js';

@@ -33,7 +33,13 @@ describe('Catence Streamable HTTP server', () => {
 
     const health = await fetch(`${origin}/health`);
     expect(health.status).toBe(200);
-    await expect(health.json()).resolves.toEqual({ status: 'ok', service: 'catence' });
+    await expect(health.json()).resolves.toEqual({
+      status: 'ok',
+      service: 'catence',
+      runtimeVersion: '0.1.0',
+      protocolVersion: 1,
+      capabilities: { mcp: true, dashboardApi: 1, demoStore: true },
+    });
 
     const dashboard = await fetch(`${origin}/api/v1/dashboard?endDate=2026-08-09&days=7`);
     expect(dashboard.status).toBe(200);

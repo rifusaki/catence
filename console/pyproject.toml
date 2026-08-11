@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Local Chainlit and LiteLLM console for Catence"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-  "chainlit",
+  "catence-chainlit==0.1.0",
   "aiosqlite>=0.20.0,<1.0.0",
   "greenlet>=3.0.0,<4.0.0",
   "litellm>=1.80.0,<2.0.0",
@@ -13,9 +13,6 @@ dependencies = [
 
 [project.scripts]
 catence-console = "catence_console.cli:main"
-
-[tool.uv.sources]
-chainlit = { path = "../../catence-ui/backend", editable = true }
 
 [build-system]
 requires = ["hatchling"]

@@ -5,6 +5,7 @@ coverage/
 .catence/
 .venv/
 console/.venv/
+console/.chainlit/
 .uv-cache/
 .npm-cache/
 .mcpb-stage/
