@@ -2,6 +2,7 @@
 import { Command } from 'commander';
 import { resolvePaths, type CatencePaths } from '../../core/runtime/configuration.js';
 import { connectStrava, connectStravaWithCallback, dataStatus, disconnectStravaAccount, initializeDataStore, linkActivity, rebuildRetrievalIndex, retryDataSync, syncData, type ProviderChoice, unlinkActivity } from '../../elt/application/management.js';
+import { createDemoStore } from '../../elt/application/demo.js';
 
 const program = new Command()
   .name('catence-data')
@@ -12,10 +13,28 @@ function currentPaths(): CatencePaths {
   return resolvePaths(program.opts<{ dataDir: string }>().dataDir);
 }
 
+function demoPaths(): CatencePaths {
+  const dataDirWasProvided = process.argv.some((argument) => argument === '--data-dir' || argument.startsWith('--data-dir='));
+  const dataDir = dataDirWasProvided || process.env.CATENCE_DATA_DIR
+    ? program.opts<{ dataDir: string }>().dataDir
+    : './catence-demo';
+  return resolvePaths(dataDir);
+}
+
 program.command('init')
   .description('Create an empty local data store without contacting a provider.')
   .action(async () => {
     process.stdout.write(`${JSON.stringify(await initializeDataStore(currentPaths()), null, 2)}\n`);
+  });
+
+program.command('demo')
+  .description('Create a generated local demo store without contacting providers. Refuses to overwrite a non-demo data directory.')
+  .option('--days <days>', 'generated days of wellness and training data', '90')
+  .option('--seed <seed>', 'deterministic generator seed', '17')
+  .action(async (options: { days: string; seed: string }) => {
+    const days = Number(options.days);
+    const seed = Number(options.seed);
+    process.stdout.write(`${JSON.stringify(await createDemoStore(demoPaths(), { days, seed }), null, 2)}\n`);
   });
 
 program.command('sync')

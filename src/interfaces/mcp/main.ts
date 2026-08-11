@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { resolvePaths } from '../../core/runtime/configuration.js';
+import { createDemoStore } from '../../elt/application/demo.js';
 import { parseServeCliOptions, SERVE_USAGE } from '../http/cli-options.js';
 import { createCatenceHttpServer } from '../http/server.js';
 import { MCP_USAGE, parseMcpCliOptions } from './cli-options.js';
@@ -33,12 +34,19 @@ async function run(): Promise<void> {
     process.once('SIGTERM', close);
     return;
   }
-  const options = parseMcpCliOptions(arguments_);
+  const demo = arguments_[0] === 'demo';
+  const options = parseMcpCliOptions(demo ? arguments_.slice(1) : arguments_);
   if (options.help) {
     process.stderr.write(`${MCP_USAGE}\n`);
     return;
   }
-  const server = createCatenceMcpServer(resolvePaths(options.dataDir));
+  const dataDir = options.dataDir ?? (demo ? process.env.CATENCE_DATA_DIR ?? './catence-demo' : undefined);
+  const paths = resolvePaths(dataDir);
+  if (demo) {
+    const result = await createDemoStore(paths);
+    process.stderr.write(`${String(result.message)}\n`);
+  }
+  const server = createCatenceMcpServer(paths);
   await server.connect(new StdioServerTransport());
   console.error('Catence MCP server is running on stdio; ordinary tools are read-only and Strava hydration is lock-guarded.');
 }

@@ -4,8 +4,11 @@ export type McpCliOptions = {
 };
 
 export const MCP_USAGE = `Usage: catence [--data-dir <directory>]
+       catence demo [--data-dir <directory>]
 
 Run Catence as a local, stdio-only MCP server. Ordinary data access is read-only; only declared Strava hydration tools write through the locked local store.
+
+The demo command creates safe generated data in ./catence-demo by default, then starts the same MCP server. It refuses to overwrite a non-demo data directory.
 
 Options:
   --data-dir <directory>  Catence data directory. Overrides CATENCE_DATA_DIR.

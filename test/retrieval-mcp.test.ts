@@ -9,6 +9,7 @@ import { buildRetrievalIndex, searchContext } from '../src/core/retrieval/index.
 import { AnalyticsService } from '../src/core/query/analytics.js';
 import { ActivityDiscoveryService } from '../src/core/query/activity-discovery.js';
 import { FitnessService } from '../src/core/query/fitness.js';
+import { WellnessService } from '../src/core/query/wellness.js';
 import { queryReadOnlyData } from '../src/core/query/sql-guard.js';
 import { temporaryDatabase } from './helpers.js';
 
@@ -110,6 +111,15 @@ describe('read-only retrieval and analytics', () => {
       const aliasedSql = await queryReadOnlyData(repository, { sql: 'SELECT a.activity_id, source.activity_source_id FROM activities AS a JOIN activity_sources AS source ON a.activity_id = source.activity_id ORDER BY source.activity_source_id' });
       expect(aliasedSql.data).toEqual(expect.arrayContaining([expect.objectContaining({ activity_source_id: 'garmin:garmin-ride-1' })]));
       const fitness = new FitnessService(repository);
+      const wellness = new WellnessService(repository);
+      const wellnessCorrelation = await wellness.correlate({ metricA: 'hrv_ms', metricB: 'resting_hr_bpm', startDate: '2026-01-01', endDate: '2026-01-08', scanLags: true });
+      expect((wellnessCorrelation.data as { selected: { correlation: number | null } }).selected.correlation).toBeLessThan(0);
+      const wellnessBaselines = await wellness.baselines({ metrics: ['hrv_ms', 'resting_hr_bpm'], endDate: '2026-01-08', windowDays: 8 });
+      expect((wellnessBaselines.data as Array<{ metric: string; latestValue: number | null }>)).toEqual(expect.arrayContaining([expect.objectContaining({ metric: 'hrv_ms', latestValue: 54 })]));
+      const wellnessAnomalies = await wellness.anomalies({ metrics: ['hrv_ms'], startDate: '2026-01-01', endDate: '2026-01-08', zThreshold: 1 });
+      expect((wellnessAnomalies.data as { metrics: Array<{ anomalies: unknown[] }> }).metrics[0]?.anomalies.length).toBeGreaterThan(0);
+      const wellnessCoverage = await wellness.coverage({ metrics: ['hrv_ms', 'training_load'], startDate: '2026-01-01', endDate: '2026-01-08' });
+      expect((wellnessCoverage.data as { metrics: Array<{ metric: string; expectedDays: number }> }).metrics).toEqual(expect.arrayContaining([expect.objectContaining({ metric: 'hrv_ms', expectedDays: 8 })]));
       expect((await fitness.ftpHistory()).data).toEqual(expect.objectContaining({ preferredSeries: expect.arrayContaining([expect.objectContaining({ value_number: 255 })]) }));
       expect(await fitness.vo2MaxHistory()).toEqual(expect.objectContaining({ data: expect.objectContaining({
         availableSports: expect.arrayContaining([expect.objectContaining({ sport: 'cycling', latest: 55.2 })]),
@@ -173,7 +183,7 @@ describe('read-only retrieval and analytics', () => {
     await client.connect(clientTransport);
     try {
       const tools = await client.listTools();
-      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['catence_status', 'describe_dataset', 'read_series', 'query_read_only_data', 'search_context', 'get_ftp_history', 'get_vo2max_history', 'find_activities', 'get_swim_laps', 'swim_progress_report', 'get_activity_segments', 'power_curve_trend', 'power_coverage_report', 'latest_cycling_activities', 'cycling_progress_report', 'hydrate_recent_strava_activities', 'review_daily_recovery_load', 'review_weekly_training', 'review_activity_deep_dive']));
+      expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(['catence_status', 'describe_dataset', 'read_series', 'query_read_only_data', 'search_context', 'get_ftp_history', 'get_vo2max_history', 'find_activities', 'get_swim_laps', 'swim_progress_report', 'get_activity_segments', 'power_curve_trend', 'power_coverage_report', 'latest_cycling_activities', 'cycling_progress_report', 'hydrate_recent_strava_activities', 'review_daily_recovery_load', 'review_weekly_training', 'review_activity_deep_dive', 'wellness_correlate', 'wellness_baselines', 'wellness_anomalies', 'wellness_coverage']));
       expect(client.getInstructions()).toContain('call get_activity_segments');
       const weeklyReview = await client.callTool({ name: 'review_weekly_training', arguments: { endDate: '2026-01-08' } });
       const weeklyPayload = JSON.parse(((weeklyReview as { content: Array<{ text: string }> }).content[0]).text) as { data: { startDate: string; endDate: string; health: unknown[]; training: unknown[] } };
@@ -183,6 +193,9 @@ describe('read-only retrieval and analytics', () => {
       const result = await client.callTool({ name: 'read_series', arguments: { dataset: 'daily_health', metrics: ['hrv_ms'], startDate: '2026-01-01', endDate: '2026-01-08', resolution: 'day' } });
       const payload = JSON.parse(((result as { content: Array<{ text: string }> }).content[0]).text) as { data: unknown[] };
       expect(payload.data).toHaveLength(8);
+      const wellnessResult = await client.callTool({ name: 'wellness_baselines', arguments: { metrics: ['hrv_ms'], endDate: '2026-01-08', windowDays: 8 } });
+      const wellnessPayload = JSON.parse(((wellnessResult as { content: Array<{ text: string }> }).content[0]).text) as { data: Array<{ metric: string }> };
+      expect(wellnessPayload.data).toEqual([expect.objectContaining({ metric: 'hrv_ms' })]);
       const ftpResult = await client.callTool({ name: 'get_ftp_history', arguments: { sport: 'cycling' } });
       const ftpPayload = JSON.parse(((ftpResult as { content: Array<{ text: string }> }).content[0]).text) as { data: { preferredSeries: unknown[] } };
       expect(ftpPayload.data.preferredSeries).toHaveLength(1);

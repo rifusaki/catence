@@ -16,8 +16,8 @@ Currently a bit limited but I'd like to expand it:
 - [x] Data normalization and storage
 - [x] Read-only local MCP server
 - [x] Local Streamable HTTP server
-- [ ] Publish on NPM
-- [ ] Publish on [APM](https://github.com/microsoft/apm)
+- [x] Release-ready npm, [APM](https://github.com/microsoft/apm), and MCPB distribution artifacts
+- [x] Generated demo store for safe MCP evaluation
 - [x] Bundled local Chainlit Console with persisted chat history
 - [ ] Data writing (training sessions, plans)
   - [ ] TrainingPeaks support
@@ -83,12 +83,51 @@ Priority is assigned per data type. Missing values mean the provider did not sup
 
 ## Set up
 
-Catence is not published to npm yet, so run it from a clone of this repository. It exposes the same local MCP server over stdio and optional Streamable HTTP.
+Catence exposes the same local MCP server over stdio and optional Streamable
+HTTP. A tagged release publishes the `catence` npm package, platform-specific
+MCPB demo bundles, and an APM package. Until that first public release is
+available, the source-checkout commands below remain fully supported.
+
+### Safe one-command demo
+
+After publication, start a no-account MCP server with generated data:
+
+```sh
+npx --yes catence@0.1.0 demo
+```
+
+It creates `./catence-demo` by default and refuses to replace a directory that
+is not already marked as a Catence demo. The synthetic store deliberately
+contains lagged training-load/recovery effects, a multi-signal anomaly period,
+and some missing sleep-score dates. Every MCP result includes a generated-data
+disclaimer, so it cannot be mistaken for a personal health record.
+
+From a source checkout, the equivalent command is:
+
+```sh
+npm run catence-data -- demo
+npm run mcp -- demo --data-dir ./catence-demo
+```
+
+### Install for live data
+
+After publication, install the package once, then create and synchronize a
+store that you own:
+
+```sh
+npm install --global catence@0.1.0
+catence-data --data-dir /absolute/path/to/catence-data init
+catence-data --data-dir /absolute/path/to/catence-data sync --provider all
+catence-data --data-dir /absolute/path/to/catence-data build-retrieval-index
+catence --data-dir /absolute/path/to/catence-data
+```
 
 ### Prerequisites
 
 - Node.js 22 or later
-- Python 3.12 or later and [uv](https://docs.astral.sh/uv/)
+- Python 3.12 or later and [uv](https://docs.astral.sh/uv/) for Garmin and
+  Strava provider syncs. The generated demo needs no account or provider
+  credential.
 
 Clone the repository, install the Node and Python dependencies, and create your
 local `.env` with the following credentials:
@@ -309,7 +348,16 @@ store and does not contain provider credentials.
 
 ## Add Catence to an MCP client
 
-First complete the setup and at least one sync. Each client should start the same source-checkout command, pointing at the same absolute data directory:
+First complete the setup and at least one sync. For a packaged install, point a
+client to the installed `catence` binary (or use the safe demo command):
+
+```sh
+catence --data-dir /absolute/path/to/catence-data
+npx --yes catence@0.1.0 demo
+```
+
+For a source checkout, each client should start the same local command,
+pointing at the same absolute data directory:
 
 ```sh
 npm --prefix /absolute/path/to/catence run mcp -- --data-dir /absolute/path/to/catence-data
@@ -319,7 +367,19 @@ The MCP server's ordinary reads are local and read-only. Its explicit Strava hyd
 
 ### Codex
 
-Add the server from the terminal:
+For a safe first look, add the generated demo server from the terminal:
+
+```sh
+codex mcp add catence-demo -- npx --yes catence@0.1.0 demo
+```
+
+For a live npm install, use:
+
+```sh
+codex mcp add catence -- catence --data-dir /absolute/path/to/catence-data
+```
+
+For a source checkout, use:
 
 ```sh
 codex mcp add catence -- npm --prefix /absolute/path/to/catence run mcp -- --data-dir /absolute/path/to/catence-data
@@ -373,3 +433,36 @@ Use Claude Code's MCP listing command to confirm it was added:
 ```sh
 claude mcp list
 ```
+
+### APM and MCPB
+
+The repository's [`apm.yml`](apm.yml) registers both `catence` and the safe
+`catence-demo` server with supported agent clients. After a tag is published:
+
+```sh
+apm install rifusaki/catence#v0.1.0
+```
+
+Each release also attaches platform-specific `catence-demo-*.mcpb` files. Open
+the matching file in an MCPB-capable desktop client (including Claude Desktop)
+to install the one-click generated demo. Live-source setup remains an explicit
+CLI step, so the bundle never requests or stores provider credentials.
+
+## Wellness shortcuts
+
+Catence keeps its flexible catalog and analytical tools, and now exposes four
+small opinionated wellness tools for common recovery questions:
+
+- `wellness_correlate` compares curated recovery/training metrics and can scan
+  lags from −7 to +7 days.
+- `wellness_baselines` returns a trailing mean, standard-deviation band, latest
+  value, and latest z-score.
+- `wellness_anomalies` finds statistical outliers and dates with multiple
+  unusual signals; it does not diagnose or prescribe.
+- `wellness_coverage` shows absent dates and unresolved extraction errors
+  without assuming that missing data means rest or a health outcome.
+
+They use the same source-aware `daily_health` and
+`canonical_activity_training` projections as the general query tools. See
+[distribution and release notes](docs/distribution.md) for the current tooling
+and remaining operational gaps.

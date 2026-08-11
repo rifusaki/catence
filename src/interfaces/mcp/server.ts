@@ -2,6 +2,7 @@ import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mc
 import { z } from 'zod';
 import { configuredMcpRateLimit, loadCatenceConfig, resolvePaths, type CatencePaths } from '../../core/runtime/configuration.js';
 import { SlidingWindowLimiter } from '../../core/runtime/limiter.js';
+import { demoStoreMetadata } from '../../elt/application/demo.js';
 import { DataWriteBusyError } from '../../elt/storage/write-lock.js';
 import { hydrateStravaActivity, hydrateStravaSegmentHistory, StravaEnrichmentError, StravaRateLimitError } from '../../elt/ingestion/providers/strava/service.js';
 import { openReadOnlyRepository, ReadOnlyDatabaseError } from '../../elt/storage/database.js';
@@ -11,6 +12,7 @@ import { ActivityDiscoveryService } from '../../core/query/activity-discovery.js
 import { getDataset, QueryValidationError } from '../../core/query/catalog.js';
 import { FitnessService } from '../../core/query/fitness.js';
 import { SwimmingService } from '../../core/query/swimming.js';
+import { WELLNESS_METRICS, WellnessService } from '../../core/query/wellness.js';
 import { jsonSafe, ReadOnlyRepository } from '../../core/query/repository.js';
 import { queryReadOnlyData } from '../../core/query/sql-guard.js';
 
@@ -143,13 +145,23 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
   const server = new McpServer({ name: 'catence', version: '0.1.0' }, { instructions: MCP_INSTRUCTIONS });
   const hydrateActivity = dependencies.hydrateStravaActivity ?? hydrateStravaActivity;
   const configPromise = loadCatenceConfig(paths);
+  const demoStorePromise = demoStoreMetadata(paths);
   const limiter = new SlidingWindowLimiter();
   const tool = <T>(name: string, fn: (input: T) => Promise<unknown>) => async (input: T): Promise<ToolResult> => {
     try {
       const config = await configPromise;
       const decision = limiter.check(`tool:${name}`, configuredMcpRateLimit(config, 'tools', name));
       if (!decision.allowed) return { ...textResult({ data: null, error: { code: 'rate_limited', message: `MCP tool ${name} is locally rate limited.`, retryAfterSeconds: decision.retryAfterSeconds } }), isError: true };
-      return textResult(await fn(input));
+      const value = await fn(input);
+      const demoStore = await demoStorePromise;
+      if (!demoStore || !value || typeof value !== 'object' || Array.isArray(value)) return textResult(value);
+      const result = value as Record<string, unknown>;
+      const caveats = Array.isArray(result.caveats) ? result.caveats : [];
+      return textResult({
+        ...result,
+        demoStore: { generated: true, seed: demoStore.seed, days: demoStore.days, startDate: demoStore.startDate, endDate: demoStore.endDate },
+        caveats: [...caveats, 'This response uses Catence generated demo data, not personal measurements.'],
+      });
     } catch (error) { return errorResult(error); }
   };
   const resourceLimit = async (name: string, uri: URL) => {
@@ -307,6 +319,33 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
     title: 'Fit a descriptive series model', description: 'Fit a bounded OLS, Theil–Sen, quadratic, or cubic descriptive model. Not a sport-performance model.',
     inputSchema: { ...seriesInput, model: z.enum(['ols_linear', 'theil_sen_linear', 'polynomial_2', 'polynomial_3']), xMetric: z.string().min(1).optional(), yMetric: z.string().min(1).optional() },
   }, tool('fit_series_model', async (input) => useRepository(paths, (repository) => new AnalyticsService(repository).fitSeriesModel({ ...input, filters: input.filters as DataFilter[] | undefined }))));
+
+  server.registerTool('wellness_correlate', {
+    title: 'Correlate recovery and training metrics',
+    description: 'Calculate a compact daily Pearson or Spearman correlation between curated wellness and training metrics, with an optional -7 through +7 day lag scan. Descriptive only.',
+    inputSchema: {
+      metricA: z.enum(WELLNESS_METRICS), metricB: z.enum(WELLNESS_METRICS), startDate: z.string().date().optional(), endDate: z.string().date().optional(),
+      method: z.enum(['pearson', 'spearman']).optional(), lagDays: z.number().int().min(-30).max(30).optional(), scanLags: z.boolean().optional(),
+    },
+  }, tool('wellness_correlate', async (input) => useRepository(paths, (repository) => new WellnessService(repository).correlate(input))));
+
+  server.registerTool('wellness_baselines', {
+    title: 'Read personal wellness baselines',
+    description: 'Return trailing means, standard-deviation bands, latest values, and latest z-scores for common recovery and training metrics. Missing values remain missing.',
+    inputSchema: { metrics: z.array(z.enum(WELLNESS_METRICS)).min(1).max(12).optional(), endDate: z.string().date().optional(), windowDays: z.number().int().min(7).max(365).optional() },
+  }, tool('wellness_baselines', async (input) => useRepository(paths, (repository) => new WellnessService(repository).baselines(input))));
+
+  server.registerTool('wellness_anomalies', {
+    title: 'Find statistical wellness anomalies',
+    description: 'Find daily recovery and wellness outliers by z-score and group dates with anomalies across multiple signals. This does not diagnose or prescribe.',
+    inputSchema: { metrics: z.array(z.enum(WELLNESS_METRICS)).min(1).max(12).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional(), zThreshold: z.number().min(1).max(5).optional() },
+  }, tool('wellness_anomalies', async (input) => useRepository(paths, (repository) => new WellnessService(repository).anomalies(input))));
+
+  server.registerTool('wellness_coverage', {
+    title: 'Inspect wellness data coverage',
+    description: 'Report present and missing dates for curated wellness/training metrics, plus unresolved extraction errors. Missing data is never interpreted as rest or a health outcome.',
+    inputSchema: { metrics: z.array(z.enum(WELLNESS_METRICS)).min(1).max(12).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional() },
+  }, tool('wellness_coverage', async (input) => useRepository(paths, (repository) => new WellnessService(repository).coverage(input))));
 
   server.registerTool('get_ftp_history', {
     title: 'Get dated FTP history',
