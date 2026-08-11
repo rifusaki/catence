@@ -115,20 +115,21 @@ export class ReadOnlyRepository {
   }
 
   async status(): Promise<Record<string, unknown>> {
-    const [runs, counts, errors, streamCoverage, indexState, cursors] = await Promise.all([
-      this.rows(`SELECT run_id, provider, cast(from_date AS VARCHAR) AS from_date, cast(started_at AS VARCHAR) AS started_at, cast(completed_at AS VARCHAR) AS completed_at, status, error_count FROM sync_runs ORDER BY started_at DESC LIMIT 20`),
-      this.rows(`SELECT
+    // @duckdb/node-api shares native statement state on a connection. These
+    // small status reads must remain sequential; concurrent calls can hang a
+    // read-only dashboard request before it writes its response.
+    const runs = await this.rows(`SELECT run_id, provider, cast(from_date AS VARCHAR) AS from_date, cast(started_at AS VARCHAR) AS started_at, cast(completed_at AS VARCHAR) AS completed_at, status, error_count FROM sync_runs ORDER BY started_at DESC LIMIT 20`);
+    const counts = await this.rows(`SELECT
         (SELECT count(*)::INTEGER FROM activities) AS activities,
         (SELECT count(*)::INTEGER FROM activity_sources) AS activity_sources,
         (SELECT count(*)::INTEGER FROM daily_metrics) AS daily_metrics,
         (SELECT count(*)::INTEGER FROM nutrition_items) AS nutrition_items,
         (SELECT count(*)::INTEGER FROM source_entities) AS source_entities,
-        (SELECT count(*)::INTEGER FROM retrieval_documents) AS retrieval_documents`),
-      this.rows(`SELECT count(*)::INTEGER AS unresolved FROM normalization_errors WHERE resolved_at IS NULL`),
-      this.rows(`SELECT count(*)::INTEGER AS streams, coalesce(sum(row_count), 0)::BIGINT AS sample_rows, min(start_at) AS starts_at, max(end_at) AS ends_at FROM stream_manifest`),
-      this.rows(`SELECT status, mode, source_watermark, cast(built_at AS VARCHAR) AS built_at FROM retrieval_index_state WHERE index_name = 'context'`),
-      this.rows(`SELECT provider, cursor_name, cast(covered_through_date AS VARCHAR) AS covered_through_date, cast(latest_source_date AS VARCHAR) AS latest_source_date, lookback_days, cast(last_completed_at AS VARCHAR) AS last_completed_at, status FROM sync_cursors ORDER BY provider, cursor_name`),
-    ]);
+        (SELECT count(*)::INTEGER FROM retrieval_documents) AS retrieval_documents`);
+    const errors = await this.rows(`SELECT count(*)::INTEGER AS unresolved FROM normalization_errors WHERE resolved_at IS NULL`);
+    const streamCoverage = await this.rows(`SELECT count(*)::INTEGER AS streams, coalesce(sum(row_count), 0)::BIGINT AS sample_rows, min(start_at) AS starts_at, max(end_at) AS ends_at FROM stream_manifest`);
+    const indexState = await this.rows(`SELECT status, mode, source_watermark, cast(built_at AS VARCHAR) AS built_at FROM retrieval_index_state WHERE index_name = 'context'`);
+    const cursors = await this.rows(`SELECT provider, cursor_name, cast(covered_through_date AS VARCHAR) AS covered_through_date, cast(latest_source_date AS VARCHAR) AS latest_source_date, lookback_days, cast(last_completed_at AS VARCHAR) AS last_completed_at, status FROM sync_cursors ORDER BY provider, cursor_name`);
     return {
       syncRuns: runs,
       entityCounts: counts[0] ?? {},
@@ -153,20 +154,16 @@ export class ReadOnlyRepository {
   async activity(activityId: string): Promise<Record<string, unknown> | null> {
     const activity = await this.rows<Record<string, unknown>>(`SELECT * FROM activities WHERE activity_id = $activityId`, { activityId });
     if (!activity[0]) return null;
-    const [sources, summaries, intervals] = await Promise.all([
-      this.rows(`SELECT * FROM activity_sources WHERE activity_id = $activityId ORDER BY CASE provider WHEN 'garmin' THEN 0 WHEN 'intervals' THEN 1 ELSE 2 END, provider`, { activityId }),
-      this.rows(`SELECT * FROM activity_summary_facts WHERE activity_id = $activityId ORDER BY CASE provider WHEN 'garmin' THEN 0 WHEN 'intervals' THEN 1 ELSE 2 END, provider`, { activityId }),
-      this.rows(`SELECT * FROM activity_interval_facts WHERE activity_id = $activityId ORDER BY CASE provider WHEN 'garmin' THEN 0 WHEN 'intervals' THEN 1 ELSE 2 END, provider, start_s`, { activityId }),
-    ]);
+    const sources = await this.rows(`SELECT * FROM activity_sources WHERE activity_id = $activityId ORDER BY CASE provider WHEN 'garmin' THEN 0 WHEN 'intervals' THEN 1 ELSE 2 END, provider`, { activityId });
+    const summaries = await this.rows(`SELECT * FROM activity_summary_facts WHERE activity_id = $activityId ORDER BY CASE provider WHEN 'garmin' THEN 0 WHEN 'intervals' THEN 1 ELSE 2 END, provider`, { activityId });
+    const intervals = await this.rows(`SELECT * FROM activity_interval_facts WHERE activity_id = $activityId ORDER BY CASE provider WHEN 'garmin' THEN 0 WHEN 'intervals' THEN 1 ELSE 2 END, provider, start_s`, { activityId });
     return { activity: activity[0], sources, summaries, intervals };
   }
 
   async summary(startDate: string, endDate: string): Promise<Record<string, unknown>> {
-    const [training, health, nutrition] = await Promise.all([
-      this.rows(`SELECT cast(started_at_utc AS DATE) AS date, count(*)::INTEGER AS activities, sum(distance_m) AS distance_m, sum(moving_s) AS moving_s, sum(training_load) AS training_load FROM canonical_activity_training WHERE cast(started_at_utc AS DATE) BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) GROUP BY 1 ORDER BY 1`, { startDate, endDate }),
-      this.rows(`SELECT * FROM daily_health WHERE metric_date BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) ORDER BY metric_date, provider`, { startDate, endDate }),
-      this.rows(`SELECT * FROM nutrition_days WHERE nutrition_date BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) ORDER BY nutrition_date, provider`, { startDate, endDate }),
-    ]);
+    const training = await this.rows(`SELECT cast(started_at_utc AS DATE) AS date, count(*)::INTEGER AS activities, sum(distance_m) AS distance_m, sum(moving_s) AS moving_s, sum(training_load) AS training_load FROM canonical_activity_training WHERE cast(started_at_utc AS DATE) BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) GROUP BY 1 ORDER BY 1`, { startDate, endDate });
+    const health = await this.rows(`SELECT * FROM daily_health WHERE metric_date BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) ORDER BY metric_date, provider`, { startDate, endDate });
+    const nutrition = await this.rows(`SELECT * FROM nutrition_days WHERE nutrition_date BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) ORDER BY nutrition_date, provider`, { startDate, endDate });
     return { training, health, nutrition };
   }
 

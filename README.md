@@ -15,13 +15,24 @@ Currently a bit limited but I'd like to expand it:
 - [x] Garmin, Intervals.icu, Strava data fetching
 - [x] Data normalization and storage
 - [x] Read-only local MCP server
-- [ ] Publish on NPM
-- [ ] Publish on [APM](https://github.com/microsoft/apm)
-- [ ] Local Streamable HTTP server
-- [ ] Open WebUI frontend
+- [x] Local Streamable HTTP server
+- [x] Release-ready npm, [APM](https://github.com/microsoft/apm), and MCPB distribution artifacts
+- [x] Generated demo store for safe MCP evaluation
+- [x] Bundled local Chainlit Console with persisted chat history
 - [ ] Data writing (training sessions, plans)
-  - [ ] TrainingPeaks support
+  - [ ] TrainingPeaks support?
 - [ ] Limited multi-user support (see Caveats)
+
+## What Catence can help you do
+
+Catence is most useful when a question benefits from checking several local signals instead of reacting to a single score. The Console and MCP tools can help you explore questions such as:
+
+- **Recovery and readiness:** “What changed in my sleep, HRV, resting heart rate, stress, and recent load before today’s session?”
+- **Training load:** “Is this week harder than my recent baseline, and which sessions contributed most?”
+- **Performance trends:** “How has my threshold pace, cycling power, or swim efficiency changed across the season?”
+- **Session review:** “Compare this long run or interval set with similar recent efforts, including pace/power, heart rate, terrain, and recovery.”
+- **Segments and gear:** “Show my history on this climb,” or “which shoes and bikes have carried the most recent training volume?”
+- **Data-quality review:** “Which recent activities lack streams, power, health context, or a matching provider record?”
 
 ## Sources
 
@@ -60,15 +71,44 @@ Priority is assigned per data type. Missing values mean the provider did not sup
 
 ## Set up
 
-Catence is not published to npm yet, so run it from a clone of this repository. It is currently a local, stdio-only MCP server.
+Catence exposes the same local MCP server over stdio and optional Streamable HTTP. A tagged release publishes the `catence` npm package, platform-specific MCPB demo bundles, and an APM package. Until that first public release is available, the source-checkout commands below remain fully supported.
+
+### Safe one-command demo
+
+After publication, start a no-account MCP server with generated data:
+
+```sh
+npx --yes catence@0.1.0 demo
+```
+
+It creates `./catence-demo` by default and refuses to replace a directory that is not already marked as a Catence demo. The synthetic store deliberately
+contains lagged training-load/recovery effects, a multi-signal anomaly period, and some missing sleep-score dates. Every MCP result includes a generated-data disclaimer, so it cannot be mistaken for a personal health record.
+
+From a source checkout, the equivalent command is:
+
+```sh
+npm run catence-data -- demo
+npm run mcp -- demo --data-dir ./catence-demo
+```
+
+### Install for live data
+
+After publication, install the package once, then create and synchronize a store that you own:
+
+```sh
+npm install --global catence@0.1.0
+catence-data --data-dir /absolute/path/to/catence-data init
+catence-data --data-dir /absolute/path/to/catence-data sync --provider all
+catence-data --data-dir /absolute/path/to/catence-data build-retrieval-index
+catence --data-dir /absolute/path/to/catence-data
+```
 
 ### Prerequisites
 
 - Node.js 22 or later
-- Python 3.12 or later and [uv](https://docs.astral.sh/uv/)
+- Python 3.12 or later and [uv](https://docs.astral.sh/uv/) for Garmin and Strava provider syncs
 
-Clone the repository, install the Node and Python dependencies, and create your
-local `.env` with the following credentials:
+Clone the repository, install the Node and Python dependencies, and create your local `.env` with the following credentials:
 
 - Garmin email/password
 - Intervals.icu [API Key and Athlete ID](https://forum.intervals.icu/t/api-access-to-intervals-icu/609)
@@ -107,13 +147,25 @@ npm run catence-data -- backfill --provider garmin --from 2026-07-01 --refresh
 npm run catence-data -- build-retrieval-index
 npm run mcp
 npm run mcp -- --data-dir /absolute/path/to/catence-data
+
+# Optional local Streamable HTTP MCP and dashboard API
+npm run mcp -- serve --data-dir /absolute/path/to/catence-data --allow-origin http://127.0.0.1:8000
+npm run mcp -- serve --allow-origin http://127.0.0.1:8000
 ```
 
 The first manual sync uses the previous 12 months only when there is no local normalized coverage. `sync --provider strava` refreshes gear data. Strava activity segments and gear are enriched on demand by the MCP tools.
 
 ### Connect Strava
 
-With `STRAVA_CLIENT_ID` and `STRAVA_CLIENT_SECRET` in `.env`, run the first command and open its returned authorization URL, which contains the authorization code. Pass it to the second command:
+With `STRAVA_CLIENT_ID` and `STRAVA_CLIENT_SECRET` in `.env`, the local callback flow avoids copying a code out of the browser URL. Register `http://127.0.0.1:8765/strava/callback` as the authorization callback in the Strava application, then run:
+
+```sh
+npm run catence-data -- auth strava --callback
+```
+
+The command prints the authorization URL to the terminal, waits up to five minutes for the browser callback, validates OAuth state, and stores the resulting token only in `<data-dir>/secrets/strava.json`.
+
+The existing manual flow remains available for headless use:
 
 ```sh
 npm run catence-data -- auth strava
@@ -126,19 +178,141 @@ Catence requests `read`, `activity:read_all`, and `read_all`. To remove the stor
 npm run catence-data -- disconnect strava
 ```
 
+## Run the local Console
+
+The Console is Catence’s local chat experience. It sends model calls through LiteLLM in-process and calls the same Streamable HTTP MCP tools that a coding agent uses. Provider keys are never written to Catence configuration or chat storage.
+
+### Install and launch
+
+After publication, the Console is a separate Python distribution. It includes the Catence-maintained Chainlit frontend and starts the matching npm runtime on loopback automatically:
+
+```sh
+uvx catence-console@0.1.0 serve --data-dir /absolute/path/to/catence-data
+```
+
+The command needs Node.js 22 and `npx`, but does not require a Catence or `catence-ui` checkout. Pass `--mcp-url http://127.0.0.1:8787/mcp` when you intentionally want to use an already-running compatible Catence runtime.
+
+For source development, install the locally built `catence-chainlit` wheel and run `uv run --project console catence-console serve` from this repository.
+
+### First-run setup
+
+Launch the Console once with your selected provider’s environment variables in the terminal. If `<data-dir>/config.json` has no Console section, the browser walks through provider and model selection (Azure, OpenAI, or Anthropic) and writes only non-secret configuration. For example:
+
+```sh
+# Azure OpenAI / Foundry: use the Azure resource root and the Responses API route.
+export AZURE_API_KEY='…'
+export AZURE_API_BASE='https://your-resource.openai.azure.com'
+export AZURE_API_VERSION='preview'
+
+uvx catence-console@0.1.0 serve --data-dir /absolute/path/to/catence-data
+```
+
+For an existing configuration or an automated setup, add a `console` section to `<data-dir>/config.json`. It defines named providers and deployments and environment-variable *names*, never credential values. The complete shape is in [`config.example.json`](config.example.json). For the two common direct providers, the minimal profiles are:
+
+```json
+{
+  "openai": {
+    "label": "OpenAI",
+    "model": "openai/gpt-5-mini",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  },
+  "anthropic": {
+    "label": "Anthropic",
+    "model": "anthropic/claude-sonnet-4-5",
+    "apiKeyEnv": "ANTHROPIC_API_KEY"
+  }
+}
+```
+
+A provider with several deployments looks like this:
+
+```json
+{
+  "console": {
+    "defaultProfile": "provider",
+    "limits": {
+      "toolRounds": 8,
+      "toolResultCharacters": 24000
+    },
+    "profiles": {
+      "azure-foundry": {
+        "label": "Provider",
+        "defaultModel": "terra",
+        "defaultReasoningEffort": "medium",
+        "models": {
+          "terra": { "label": "GPT-5.6 Terra", "model": "provider/gpt-5.6-terra" },
+          "luna": { "label": "GPT-5.6 Luna", "model": "provider/gpt-5.6-luna" },
+          "sol": { "label": "GPT-5.6 Sol", "model": "provider/gpt-5.6-sol" }
+        },
+        "apiKeyEnv": "API_KEY",
+        "apiBaseEnv": "API_BASE",
+        "apiVersionEnv": "API_VERSION"
+      }
+    }
+  }
+}
+```
+
+An OpenAI-compatible provider such as OpenCode uses a model such as `openai/your-model` plus `apiBaseEnv` and, if needed, `apiKeyEnv`. LiteLLM handles provider normalization.
+
+The Console shows all configured deployments in its Model selector and sends the selected Thinking effort to LiteLLM as `reasoning_effort`. Choose only efforts supported by the selected deployment. Existing profiles with a single `model` remain supported.
+
+### Launching
+
+Set the referenced variables in the terminal that will run the Console, then launch everything on loopback with one command:
+
+```sh
+uvx catence-console@0.1.0 serve --data-dir /absolute/path/to/catence-data
+```
+
+On its first normal launch this starts the matching Catence runtime at `http://127.0.0.1:8787`, permits only the local Console origins, and serves the prebuilt chat and dashboard at `http://127.0.0.1:8000`.
+
+To preflight a profile and an already-running Catence HTTP server, use:
+
+```sh
+uvx catence-console@0.1.0 doctor \
+  --data-dir /absolute/path/to/catence-data \
+  --mcp-url http://127.0.0.1:8787/mcp
+```
+
+`doctor` reports profile IDs, models, missing environment-variable names, and Catence health.
+
+### Local chat history
+
+Console chats, messages, tool steps, and thread metadata are persisted at `<data-dir>/console/chat-history.sqlite3`. A later turn receives a compact list of prior calls (not their results); it can lazily load one saved result when it is material, or repeat the authoritative call for fresh data.
+
 ## Add Catence to an MCP client
 
-First complete the setup and at least one sync. Each client should start the same source-checkout command, pointing at the same absolute data directory:
+First complete the setup and at least one sync. For a packaged install, point a client to the installed `catence` binary (or use the safe demo command):
+
+```sh
+catence --data-dir /absolute/path/to/catence-data
+npx --yes catence@0.1.0 demo
+```
+
+For a source checkout, each client should start the same local command, pointing at the same absolute data directory:
 
 ```sh
 npm --prefix /absolute/path/to/catence run mcp -- --data-dir /absolute/path/to/catence-data
 ```
 
-The MCP server's ordinary reads are local and read-only. Its explicit Strava hydration tools are the exception; they use the already stored local connection and a shared write lock.
+The MCP server's ordinary reads are local and read-only. Its explicit Strava hydration tools are the exception; they use the already stored local connection and a shared write lock. `catence serve` retains the same tools at `/mcp` and also exposes loopback dashboard data at `/api/v1/dashboard`; browser origins must be allowed explicitly with `--allow-origin`.
 
 ### Codex
 
-Add the server from the terminal:
+For a first look, add the generated demo server from the terminal:
+
+```sh
+codex mcp add catence-demo -- npx --yes catence@0.1.0 demo
+```
+
+For a live npm install, use:
+
+```sh
+codex mcp add catence -- catence --data-dir /absolute/path/to/catence-data
+```
+
+For a source checkout, use:
 
 ```sh
 codex mcp add catence -- npm --prefix /absolute/path/to/catence run mcp -- --data-dir /absolute/path/to/catence-data
@@ -192,3 +366,24 @@ Use Claude Code's MCP listing command to confirm it was added:
 ```sh
 claude mcp list
 ```
+
+### APM and MCPB
+
+The repository's [`apm.yml`](apm.yml) registers both `catence` and the safe `catence-demo` server with supported agent clients. After a tag is published:
+
+```sh
+apm install rifusaki/catence#v0.1.0
+```
+
+Each release also attaches platform-specific `catence-demo-*.mcpb` files. Open the matching file in an MCPB-capable desktop client (including Claude Desktop) to install the one-click generated demo. Live-source setup remains an explicit CLI step, so the bundle never requests or stores provider credentials.
+
+## Wellness shortcuts
+
+Catence keeps its flexible catalog and analytical tools, and now exposes four small opinionated wellness tools for common recovery questions:
+
+- `wellness_correlate` compares curated recovery/training metrics and can scan lags from −7 to +7 days.
+- `wellness_baselines` returns a trailing mean, standard-deviation band, latest value, and latest z-score.
+- `wellness_anomalies` finds statistical outliers and dates with multiple unusual signals; it does not diagnose or prescribe.
+- `wellness_coverage` shows absent dates and unresolved extraction errors without assuming that missing data means rest or a health outcome.
+
+They use the same source-aware `daily_health` and `canonical_activity_training` projections as the general query tools. See [distribution and release notes](docs/distribution.md) for the current tooling.

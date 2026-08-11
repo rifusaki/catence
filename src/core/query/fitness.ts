@@ -4,6 +4,7 @@ import { ReadOnlyRepository } from './repository.js';
 
 const CYCLING_SPORTS = ['cycling', 'road_biking', 'indoor_cycling', 'virtual_ride'] as const;
 const DEFAULT_POWER_DURATIONS = [5, 60, 300, 1_200, 1_800] as const;
+const RUNNING_VO2MAX_ALIASES = new Set(['run', 'running']);
 
 export type FitnessDateRange = {
   startDate?: string;
@@ -188,19 +189,21 @@ export class FitnessService {
       return {
         data: {
           availableSports,
-          actionRequired: 'Choose a sport explicitly.',
+          sportAliases: [{ requestedSport: 'running', sourceSport: 'generic', reason: 'Garmin labels its running VO₂max estimate as generic.' }],
+          actionRequired: 'Choose a sport explicitly. Use running for Garmin running VO₂max.',
         },
         provenance: { dataset: 'training_metric_observations', metric: 'vo2_max_ml_kg_min' },
         query: { ...request, sport: null },
         caveats: [
           'No VO₂max observations are returned until sport is chosen explicitly; Catence never silently defaults to cycling.',
-          'Garmin may label its running VO₂max estimate as generic. Choose sport: generic when applicable.',
+          'For a running request, Catence reads Garmin’s generic source-labelled VO₂max series and retains generic on each returned observation.',
         ],
       };
     }
-    const sport = request.sport;
-    const values: QueryValues = { sport };
-    const clauses = ["metric_name = 'vo2_max_ml_kg_min'", 'lower(sport) = lower($sport)', ...addDateRange('observed_at', request, values)];
+    const requestedSport = request.sport;
+    const sourceSport = RUNNING_VO2MAX_ALIASES.has(requestedSport.trim().toLowerCase()) ? 'generic' : requestedSport;
+    const values: QueryValues = { sourceSport };
+    const clauses = ["metric_name = 'vo2_max_ml_kg_min'", 'lower(sport) = lower($sourceSport)', ...addDateRange('observed_at', request, values)];
     const observations = await this.repository.rows<MetricRow>(`
       SELECT observation_id, cast(observed_at AS VARCHAR) AS observed_at, value_number, value_text, unit, sport,
         source_type, source_remote_id, activity_source_id, raw_object_hash
@@ -210,11 +213,12 @@ export class FitnessService {
     `, values);
     return {
       data: observations,
-      provenance: { dataset: 'training_metric_observations', metric: 'vo2_max_ml_kg_min', sport },
-      query: { ...request, sport },
+      provenance: { dataset: 'training_metric_observations', metric: 'vo2_max_ml_kg_min', requestedSport, sourceSport },
+      query: { ...request, sport: requestedSport, sourceSport },
       caveats: [
-        'Sport values are reported exactly as Garmin supplied them; generic and cycling values are never combined.',
-        ...(observations.length === 0 ? [`No normalized ${sport} VO₂max history is available for this range.`] : []),
+        'Sport values on observations are reported exactly as Garmin supplied them; generic and cycling values are never combined.',
+        ...(sourceSport === 'generic' && requestedSport !== 'generic' ? ['Garmin supplies running VO₂max under the generic source label; the returned rows preserve that raw label.'] : []),
+        ...(observations.length === 0 ? [`No normalized ${requestedSport} VO₂max history is available for this range.`] : []),
       ],
     };
   }

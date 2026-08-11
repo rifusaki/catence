@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { resolvePaths, type CatencePaths } from '../../core/runtime/configuration.js';
-import { connectStrava, dataStatus, disconnectStravaAccount, initializeDataStore, linkActivity, rebuildRetrievalIndex, retryDataSync, syncData, type ProviderChoice, unlinkActivity } from '../../elt/application/management.js';
+import { connectStrava, connectStravaWithCallback, createDemoStore, dataStatus, disconnectStravaAccount, initializeDataStore, linkActivity, rebuildRetrievalIndex, resolvePaths, retryDataSync, syncData, type CatencePaths, type ProviderChoice, unlinkActivity } from '../../runtime/index.js';
 
 const program = new Command()
   .name('catence-data')
@@ -12,10 +11,28 @@ function currentPaths(): CatencePaths {
   return resolvePaths(program.opts<{ dataDir: string }>().dataDir);
 }
 
+function demoPaths(): CatencePaths {
+  const dataDirWasProvided = process.argv.some((argument) => argument === '--data-dir' || argument.startsWith('--data-dir='));
+  const dataDir = dataDirWasProvided || process.env.CATENCE_DATA_DIR
+    ? program.opts<{ dataDir: string }>().dataDir
+    : './catence-demo';
+  return resolvePaths(dataDir);
+}
+
 program.command('init')
   .description('Create an empty local data store without contacting a provider.')
   .action(async () => {
     process.stdout.write(`${JSON.stringify(await initializeDataStore(currentPaths()), null, 2)}\n`);
+  });
+
+program.command('demo')
+  .description('Create a generated local demo store without contacting providers. Refuses to overwrite a non-demo data directory.')
+  .option('--days <days>', 'generated days of wellness and training data', '90')
+  .option('--seed <seed>', 'deterministic generator seed', '17')
+  .action(async (options: { days: string; seed: string }) => {
+    const days = Number(options.days);
+    const seed = Number(options.seed);
+    process.stdout.write(`${JSON.stringify(await createDemoStore(demoPaths(), { days, seed }), null, 2)}\n`);
   });
 
 program.command('sync')
@@ -45,9 +62,20 @@ program.command('retry')
 program.command('auth').description('Connect a source account without storing credentials in DuckDB.')
   .command('strava')
   .option('--code <authorization-code>', 'OAuth authorization code returned by Strava')
-  .option('--redirect-uri <uri>', 'OAuth redirect URI', 'http://localhost')
-  .action(async (options: { code?: string; redirectUri: string }) => {
-    process.stdout.write(JSON.stringify(await connectStrava(currentPaths(), options.code, options.redirectUri), null, 2) + "\n");
+  .option('--redirect-uri <uri>', 'OAuth redirect URI; defaults depend on the selected flow')
+  .option('--callback', 'wait for a browser OAuth callback on a loopback redirect URI')
+  .option('--timeout-seconds <seconds>', 'maximum callback wait time', '300')
+  .action(async (options: { code?: string; redirectUri?: string; callback?: boolean; timeoutSeconds: string }) => {
+    if (options.callback && options.code) throw new Error('--code and --callback cannot be used together.');
+    const timeoutSeconds = Number(options.timeoutSeconds);
+    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 900) throw new Error('--timeout-seconds must be an integer between 1 and 900.');
+    const redirectUri = options.redirectUri ?? (options.callback ? 'http://127.0.0.1:8765/strava/callback' : 'http://localhost');
+    const result = options.callback
+      ? await connectStravaWithCallback(currentPaths(), redirectUri, (url) => {
+        process.stderr.write(`Open this URL in your browser to connect Strava:\n${url}\nWaiting for the local callback…\n`);
+      }, timeoutSeconds * 1_000)
+      : await connectStrava(currentPaths(), options.code, redirectUri);
+    process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   });
 
 program.command('disconnect').description('Remove locally stored credentials for a source account.')

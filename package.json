@@ -2,6 +2,18 @@
   "name": "catence",
   "version": "0.1.0",
   "description": "Local MCP access to normalized Garmin, Intervals.icu, and targeted Strava fitness data.",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rifusaki/catence.git"
+  },
+  "homepage": "https://github.com/rifusaki/catence#readme",
+  "bugs": {
+    "url": "https://github.com/rifusaki/catence/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -36,13 +48,20 @@
   ],
   "scripts": {
     "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\" && tsc -p tsconfig.build.json",
-    "check": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
+    "check": "node scripts/check-runtime-boundaries.mjs && tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.config.ts",
     "test:watch": "vitest",
     "catence-data": "tsx src/interfaces/cli/main.ts",
     "mcp": "tsx src/interfaces/mcp/main.ts",
-    "prepack": "npm run build",
-    "prepublishOnly": "npm run check && npm test"
+    "console": "uv run --project console catence-console serve",
+    "console:doctor": "uv run --project console catence-console doctor",
+    "package:check": "npm pack --dry-run",
+    "release:check": "node scripts/release-artifacts.mjs check",
+    "mcpb:validate": "npm exec --yes --package @anthropic-ai/mcpb -- mcpb validate mcpb/manifest.json",
+    "mcpb:prepare": "npm run build && node scripts/release-artifacts.mjs prepare-mcpb",
+    "mcpb:pack": "node scripts/pack-mcpb.mjs",
+    "prepack": "npm run release:check && npm run build",
+    "prepublishOnly": "npm run release:check && npm run check && npm test"
   },
   "dependencies": {
     "@duckdb/node-api": "^1.4.4-r.1",
@@ -57,5 +76,10 @@
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
+  },
+  "overrides": {
+    "fast-uri": "3.1.5",
+    "hono": "4.12.34",
+    "nanoid": "3.3.17"
   }
 }

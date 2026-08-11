@@ -1,0 +1,15 @@
+{
+  "name": "Catence",
+  "description": "Local fitness data MCP server.",
+  "repository": "https://github.com/rifusaki/catence",
+  "license": "AGPL-3.0-or-later",
+  "transport": "stdio",
+  "install": {
+    "command": "npx",
+    "args": ["--yes", "catence@0.1.0"]
+  },
+  "demo": {
+    "command": "npx",
+    "args": ["--yes", "catence@0.1.0", "demo"]
+  }
+}

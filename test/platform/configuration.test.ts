@@ -30,4 +30,59 @@ describe('Catence config limits', () => {
     await writeFile(paths.config, '{"mcp":{"rateLimits":{"server":0}}}');
     await expect(loadCatenceConfig(paths)).rejects.toThrow('Invalid Catence config');
   });
+
+  it('accepts Console profiles that reference environment variables instead of secret values', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'catence-config-'));
+    const paths = resolvePaths(root);
+    await writeFile(paths.config, JSON.stringify({
+      console: {
+        defaultProfile: 'azure-foundry',
+        limits: { toolRounds: 12, toolResultCharacters: 48_000 },
+        profiles: {
+          'azure-foundry': {
+            label: 'Azure Foundry',
+            model: 'azure_ai/catence',
+            apiKeyEnv: 'AZURE_API_KEY',
+            apiBaseEnv: 'AZURE_API_BASE',
+          },
+        },
+      },
+    }));
+    const config = await loadCatenceConfig(paths);
+    expect(config.console?.profiles?.['azure-foundry']).toMatchObject({ model: 'azure_ai/catence', apiKeyEnv: 'AZURE_API_KEY' });
+    expect(config.console?.limits).toEqual({ toolRounds: 12, toolResultCharacters: 48_000 });
+
+    await writeFile(paths.config, JSON.stringify({ console: { profiles: { unsafe: { model: 'openai/model', apiKeyEnv: 'sk-should-not-be-here' } } } }));
+    await expect(loadCatenceConfig(paths)).rejects.toThrow('Invalid Catence config');
+  });
+
+  it('accepts a provider with multiple Console deployments and a thinking-effort default', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'catence-config-'));
+    const paths = resolvePaths(root);
+    await writeFile(paths.config, JSON.stringify({
+      console: {
+        defaultProfile: 'azure-foundry',
+        profiles: {
+          'azure-foundry': {
+            defaultModel: 'luna',
+            defaultReasoningEffort: 'medium',
+            models: {
+              terra: { model: 'azure_ai/gpt-5.6-terra' },
+              luna: { label: 'GPT-5.6 Luna', model: 'azure_ai/gpt-5.6-luna' },
+              sol: { model: 'azure_ai/gpt-5.6-sol' },
+            },
+            apiKeyEnv: 'AZURE_API_KEY',
+            apiBaseEnv: 'AZURE_API_BASE',
+          },
+        },
+      },
+    }));
+
+    const config = await loadCatenceConfig(paths);
+    expect(config.console?.profiles?.['azure-foundry']).toMatchObject({
+      defaultModel: 'luna',
+      defaultReasoningEffort: 'medium',
+      models: { luna: { model: 'azure_ai/gpt-5.6-luna' } },
+    });
+  });
 });

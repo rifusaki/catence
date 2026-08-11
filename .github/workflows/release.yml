@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=moderate
+      - run: npm run release:check
+      - run: npm run check
+      - run: npm test
+      - run: npm run package:check
+      - run: npm run mcpb:validate
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check apm-cli
+      - run: mkdir -p /tmp/catence-apm-consumer && apm install --root /tmp/catence-apm-consumer --target codex --dry-run
+
+  mcpb:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run mcpb:pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcpb-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*.mcpb
+          if-no-files-found: error
+
+  console:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: astral-sh/setup-uv@v6
+      - name: Verify the matching Catence Chainlit wheel exists
+        run: |
+          version=$(node -p "require('./release/manifest.json').version")
+          uv pip install --system "catence-chainlit==$version"
+      - run: uv build console --wheel --out-dir dist/console
+      - uses: actions/upload-artifact@v4
+        with:
+          name: catence-console-wheel
+          path: dist/console/*.whl
+          if-no-files-found: error
+
+  publish:
+    needs: [verify, mcpb, console]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mcpb-*
+          path: dist/mcpb
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: catence-console-wheel
+          path: dist/console
+      - run: npm ci
+      - run: npm run release:check
+      - run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-console:
+    needs: [publish, console]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: catence-console-wheel
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: [publish, publish-console]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mcpb-*
+          path: dist/mcpb
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" dist/mcpb/*.mcpb --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

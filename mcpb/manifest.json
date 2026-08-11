@@ -1,0 +1,52 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/mcpb-manifest-v0.3.schema.json",
+  "manifest_version": "0.3",
+  "name": "catence-demo",
+  "display_name": "Catence Demo",
+  "version": "0.1.0",
+  "description": "A safe, local Catence fitness-data demo for MCP clients.",
+  "long_description": "Creates a clearly marked synthetic wellness and training store, then serves Catence's local MCP tools. The generated numbers are safe for evaluation and are never personal measurements. Install the npm package for live Garmin, Intervals.icu, and Strava synchronization.",
+  "author": {
+    "name": "Rifusaki",
+    "url": "https://github.com/rifusaki"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rifusaki/catence.git"
+  },
+  "homepage": "https://github.com/rifusaki/catence",
+  "documentation": "https://github.com/rifusaki/catence#readme",
+  "support": "https://github.com/rifusaki/catence/issues",
+  "server": {
+    "type": "node",
+    "entry_point": "dist/interfaces/mcp/main.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/dist/interfaces/mcp/main.js",
+        "demo",
+        "--data-dir",
+        "${user_config.data_dir}"
+      ]
+    }
+  },
+  "tools_generated": true,
+  "keywords": ["mcp", "fitness", "garmin", "wellness", "training", "demo", "local-first"],
+  "license": "AGPL-3.0-or-later",
+  "user_config": {
+    "data_dir": {
+      "type": "directory",
+      "title": "Demo data directory",
+      "description": "Where Catence stores its generated demo data. This command refuses to replace a real Catence data directory.",
+      "default": "${HOME}/.catence-demo",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=22.0.0"
+    }
+  },
+  "privacy_policies": []
+}

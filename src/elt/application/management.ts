@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -145,6 +147,100 @@ export async function retryDataSync(paths: CatencePaths, previousRunId: string):
 
 export async function connectStrava(paths: CatencePaths, code: string | undefined, redirectUri: string): Promise<unknown> {
   return code ? completeStravaAuthorization(paths, code, redirectUri) : getStravaAuthorizationUrl(paths, redirectUri);
+}
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+/** Validate a local OAuth return address before opening a callback listener. */
+export function loopbackStravaRedirect(redirectUri: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(redirectUri);
+  } catch {
+    throw new Error('--redirect-uri must be an absolute URL.');
+  }
+  if (parsed.protocol !== 'http:' || !LOOPBACK_HOSTS.has(parsed.hostname) || !parsed.port) {
+    throw new Error('--callback requires an http loopback --redirect-uri with an explicit port.');
+  }
+  return parsed;
+}
+
+type StravaCallbackResult = { code: string; state: string | null };
+
+function readStravaCallback(requestUrl: string | undefined, callback: URL): StravaCallbackResult {
+  const received = new URL(requestUrl ?? '/', callback);
+  if (received.pathname !== callback.pathname) throw new Error('Strava returned to an unexpected callback path.');
+  const error = received.searchParams.get('error');
+  if (error) throw new Error(`Strava authorization was declined or failed: ${error}.`);
+  const code = received.searchParams.get('code');
+  if (!code) throw new Error('Strava callback did not include an authorization code.');
+  return { code, state: received.searchParams.get('state') };
+}
+
+function callbackPage(response: import('node:http').ServerResponse, success: boolean): void {
+  response.writeHead(success ? 200 : 400, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+  response.end(success
+    ? '<!doctype html><title>Catence connected</title><p>Strava is connected to Catence. You can close this tab.</p>'
+    : '<!doctype html><title>Catence authorization failed</title><p>Strava authorization did not complete. Return to the terminal for details.</p>');
+}
+
+/**
+ * Complete Strava OAuth through a short-lived loopback callback listener.
+ *
+ * The authorization URL is emitted through the caller so the CLI can keep
+ * stdout machine-readable for the final connection result.
+ */
+export async function connectStravaWithCallback(
+  paths: CatencePaths,
+  redirectUri: string,
+  onAuthorizationUrl: (url: string) => void,
+  timeoutMs = 300_000,
+): Promise<unknown> {
+  const callback = loopbackStravaRedirect(redirectUri);
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000) throw new Error('OAuth callback timeout must be at least one second.');
+  const expectedState = randomUUID();
+  const listener = createServer();
+  const callbackResult = new Promise<StravaCallbackResult>((resolve, reject) => {
+    listener.once('error', reject);
+    listener.on('request', (request, response) => {
+      if (request.method !== 'GET') {
+        response.writeHead(405, { allow: 'GET' }).end();
+        return;
+      }
+      try {
+        const result = readStravaCallback(request.url, callback);
+        if (result.state !== expectedState) throw new Error('Strava callback state did not match this authorization request.');
+        callbackPage(response, true);
+        resolve(result);
+      } catch (error) {
+        callbackPage(response, false);
+        reject(error);
+      }
+    });
+  });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      listener.once('error', reject);
+      listener.listen(Number(callback.port), callback.hostname.replace(/^\[|\]$/g, ''), () => {
+        listener.off('error', reject);
+        resolve();
+      });
+    });
+    const authorization = await getStravaAuthorizationUrl(paths, callback.toString());
+    if (!authorization.authorizationUrl) throw new Error('Strava did not return an authorization URL.');
+    const authorizationUrl = new URL(authorization.authorizationUrl);
+    authorizationUrl.searchParams.set('state', expectedState);
+    onAuthorizationUrl(authorizationUrl.toString());
+    const timed = Promise.race<StravaCallbackResult>([
+      callbackResult,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timed out waiting for the Strava callback.')), timeoutMs)),
+    ]);
+    const { code } = await timed;
+    return completeStravaAuthorization(paths, code, callback.toString());
+  } finally {
+    if (listener.listening) await new Promise<void>((resolve) => listener.close(() => resolve()));
+  }
 }
 
 export async function disconnectStravaAccount(paths: CatencePaths): Promise<{ provider: 'strava'; disconnected: true }> {
