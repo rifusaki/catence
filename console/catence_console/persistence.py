@@ -42,6 +42,7 @@ class SavedConsolePreferences:
     reasoning_effort: str
     tool_rounds: int
     tool_result_characters: int
+    athlete_id: str | None = None
 
 
 def _database_path(data_directory: Path) -> Path:
@@ -173,7 +174,7 @@ class ConsolePreferencesStore:
             with self._connect() as connection:
                 row = connection.execute(
                     """
-                    SELECT model_choice, reasoning_effort, tool_rounds, tool_result_characters
+                    SELECT model_choice, reasoning_effort, tool_rounds, tool_result_characters, athlete_id
                     FROM console_preferences WHERE user_identifier = ?
                     """,
                     (user_identifier,),
@@ -188,6 +189,7 @@ class ConsolePreferencesStore:
             reasoning_effort=row[1],
             tool_rounds=row[2],
             tool_result_characters=row[3],
+            athlete_id=row[4],
         )
 
     def save(self, user_identifier: str, preferences: SavedConsolePreferences) -> None:
@@ -197,13 +199,14 @@ class ConsolePreferencesStore:
                     """
                     INSERT INTO console_preferences (
                         user_identifier, model_choice, reasoning_effort, tool_rounds,
-                        tool_result_characters, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        tool_result_characters, athlete_id, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(user_identifier) DO UPDATE SET
                         model_choice = excluded.model_choice,
                         reasoning_effort = excluded.reasoning_effort,
                         tool_rounds = excluded.tool_rounds,
                         tool_result_characters = excluded.tool_result_characters,
+                        athlete_id = excluded.athlete_id,
                         updated_at = excluded.updated_at
                     """,
                     (
@@ -212,6 +215,7 @@ class ConsolePreferencesStore:
                         preferences.reasoning_effort,
                         preferences.tool_rounds,
                         preferences.tool_result_characters,
+                        preferences.athlete_id,
                         datetime.now(UTC).isoformat(),
                     ),
                 )
@@ -334,6 +338,7 @@ def _initialize_schema(database_path: Path) -> None:
                 "reasoning_effort" TEXT NOT NULL,
                 "tool_rounds" INTEGER NOT NULL,
                 "tool_result_characters" INTEGER NOT NULL,
+                "athlete_id" TEXT,
                 "updated_at" TEXT NOT NULL
             );
             """
@@ -352,6 +357,12 @@ def _initialize_schema(database_path: Path) -> None:
                 connection.execute(
                     f'ALTER TABLE "steps" ADD COLUMN "{column}" {definition}'
                 )
+
+        existing_preference_columns = {
+            row[1] for row in connection.execute('PRAGMA table_info("console_preferences")')
+        }
+        if "athlete_id" not in existing_preference_columns:
+            connection.execute('ALTER TABLE "console_preferences" ADD COLUMN "athlete_id" TEXT')
 
 
 def local_data_layer(data_directory: Path):

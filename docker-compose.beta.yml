@@ -1,0 +1,29 @@
+name: catence-beta
+
+services:
+  console:
+    build:
+      context: .
+      dockerfile: console/Dockerfile.registry
+      args:
+        CATENCE_NPM_VERSION: ${CATENCE_NPM_VERSION:?Set an npm beta version, for example 0.2.0-beta.1}
+        CATENCE_CONSOLE_VERSION: ${CATENCE_CONSOLE_VERSION:?Set a PEP 440 Console beta version, for example 0.2.0b1}
+    image: catence-console:${CATENCE_NPM_VERSION}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${CATENCE_CONSOLE_PORT:-8000}:8000"
+    environment:
+      CATENCE_HOME: /data
+      CATENCE_CONSOLE_USERNAME: ${CATENCE_CONSOLE_USERNAME:?Set a shared Console username}
+      CATENCE_CONSOLE_PASSWORD_HASH: ${CATENCE_CONSOLE_PASSWORD_HASH:?Set a bcrypt password hash}
+      CHAINLIT_AUTH_SECRET: ${CHAINLIT_AUTH_SECRET:?Set a long random signing secret}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AZURE_API_KEY: ${AZURE_API_KEY:-}
+      AZURE_API_BASE: ${AZURE_API_BASE:-}
+      AZURE_API_VERSION: ${AZURE_API_VERSION:-preview}
+    volumes:
+      - catence-beta-data:/data
+
+volumes:
+  catence-beta-data:

@@ -1,8 +1,9 @@
-name: Release
+name: Beta
 
 on:
   push:
-    tags: ['v*']
+    branches: [beta]
+    tags: ['v*-beta.*']
 
 permissions:
   contents: write
@@ -10,7 +11,6 @@ permissions:
 
 jobs:
   verify:
-    if: ${{ !contains(github.ref_name, '-beta.') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,10 +28,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install --disable-pip-version-check apm-cli
-      - run: mkdir -p /tmp/catence-apm-consumer && apm install --root /tmp/catence-apm-consumer --target codex --dry-run
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --frozen --project console --group dev python -m pytest console/tests -q
+      - run: uv build console --wheel
 
   mcpb:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: verify
     strategy:
       fail-fast: false
@@ -53,6 +55,7 @@ jobs:
           if-no-files-found: error
 
   console:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: verify
     runs-on: ubuntu-latest
     steps:
@@ -64,7 +67,7 @@ jobs:
         with:
           node-version: 22
       - uses: astral-sh/setup-uv@v6
-      - name: Verify the matching Catence Chainlit wheel exists
+      - name: Verify the prerelease Chainlit wheel is already published
         run: |
           version=$(node -p "require('./release/manifest.json').chainlitVersion")
           uv pip install --system "catence-chainlit==$version"
@@ -76,9 +79,10 @@ jobs:
           if-no-files-found: error
 
   publish:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: [verify, mcpb, console]
     runs-on: ubuntu-latest
-    environment: release
+    environment: beta
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -94,18 +98,16 @@ jobs:
         with:
           name: catence-console-wheel
           path: dist/console
-      # npm trusted publishing requires npm 11.5.1 or newer. Do not set
-      # setup-node's registry-url here: it writes a GitHub-token .npmrc that
-      # prevents npm from selecting the GitHub Actions OIDC identity.
       - run: npm install --global npm@^11.5.1
       - run: npm ci
       - run: npm run release:check
-      - run: npm publish --access public --provenance --tag latest
+      - run: npm publish --access public --provenance --tag beta
 
   publish-console:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: [publish, console]
     runs-on: ubuntu-latest
-    environment: pypi
+    environment: beta
     permissions:
       id-token: write
     steps:
@@ -116,6 +118,7 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   github-release:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: [publish, publish-console]
     runs-on: ubuntu-latest
     steps:
@@ -124,6 +127,6 @@ jobs:
           pattern: mcpb-*
           path: dist/mcpb
           merge-multiple: true
-      - run: gh release create "$GITHUB_REF_NAME" dist/mcpb/*.mcpb --repo "$GITHUB_REPOSITORY" --generate-notes
+      - run: gh release create "$GITHUB_REF_NAME" dist/mcpb/*.mcpb --repo "$GITHUB_REPOSITORY" --generate-notes --prerelease
         env:
           GH_TOKEN: ${{ github.token }}

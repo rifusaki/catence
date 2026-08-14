@@ -58,11 +58,12 @@ def test_health_rejects_an_incompatible_protocol(monkeypatch):
 
 def test_runtime_command_uses_the_lockstep_npm_release(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "_require_command", lambda command, _explanation: command)
+    monkeypatch.setattr(cli.shutil, "which", lambda _command: None)
 
     command = cli._runtime_command(tmp_path, "127.0.0.1", 8787, 8000)
 
-    assert command[:4] == ["npx", "--yes", "catence@0.1.0", "serve"]
-    assert command[command.index("--data-dir") + 1] == str(tmp_path)
+    assert command[:4] == ["npx", "--yes", "catence@0.2.0", "serve"]
+    assert command[command.index("--home") + 1] == str(tmp_path)
 
 
 def test_serve_runs_chainlit_from_the_installed_console_package(monkeypatch, tmp_path):
@@ -85,13 +86,15 @@ def test_serve_runs_chainlit_from_the_installed_console_package(monkeypatch, tmp
         return FakeProcess()
 
     monkeypatch.setattr(cli, "_wait_for_health", lambda *_args: None)
+    monkeypatch.setattr(cli, "validate_auth_configuration", lambda: None)
     monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
 
     result = cli.serve(
         Namespace(
-            data_dir=tmp_path,
+            home=tmp_path,
             mcp_url="http://127.0.0.1:8787/mcp",
-            host="127.0.0.1",
+            ui_host="127.0.0.1",
+            mcp_host="127.0.0.1",
             mcp_port=8787,
             ui_port=8000,
             external_mcp=False,

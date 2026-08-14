@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import shutil
@@ -15,6 +16,7 @@ import urllib.request
 from pathlib import Path
 from typing import NoReturn
 
+from .auth import missing_auth_environment, validate_auth_configuration
 from .config import ConsoleConfigurationError, load_console_configuration, missing_environment
 from .release import CATENCE_PROTOCOL_VERSION, CATENCE_RELEASE_VERSION
 
@@ -46,15 +48,17 @@ def _health(url: str) -> tuple[bool, dict[str, object]]:
         return False, {"detail": str(error)}
 
 
-def doctor(data_directory: Path, mcp_url: str) -> int:
+def doctor(catalog_home: Path, mcp_url: str) -> int:
     report: dict[str, object] = {
-        "dataDirectory": str(data_directory),
+        "home": str(catalog_home),
         "mcpUrl": mcp_url,
         "profiles": [],
         "ok": False,
     }
+    missing_auth = list(missing_auth_environment())
+    report["authentication"] = {"ready": not missing_auth, "missingEnvironment": missing_auth}
     try:
-        configuration = load_console_configuration(data_directory)
+        configuration = load_console_configuration(catalog_home)
         profiles = []
         for profile in configuration.profiles.values():
             profiles.append(
@@ -75,7 +79,7 @@ def doctor(data_directory: Path, mcp_url: str) -> int:
     healthy, health = _health(mcp_url.rsplit("/mcp", 1)[0])
     report["catenceServer"] = {"reachable": healthy, **health}
     profile_ready = all(profile["ready"] for profile in report["profiles"] if isinstance(profile, dict))
-    report["ok"] = bool(healthy and profile_ready)
+    report["ok"] = bool(healthy and profile_ready and not missing_auth)
     _json_output(report)
     return 0 if report["ok"] else 1
 
@@ -100,15 +104,18 @@ def _wait_for_health(mcp_url: str, process: subprocess.Popen[object] | None) -> 
     raise RuntimeError("Catence server did not pass /health within 20 seconds.")
 
 
-def _runtime_command(data_directory: Path, host: str, mcp_port: int, ui_port: int) -> list[str]:
-    npx = _require_command("npx", "start the matching Catence runtime")
-    return [
-        npx,
+def _runtime_command(catalog_home: Path, host: str, mcp_port: int, ui_port: int) -> list[str]:
+    runtime = shutil.which("catence")
+    command = [runtime, "serve"] if runtime else [
+        _require_command("npx", "start the matching Catence runtime"),
         "--yes",
         f"catence@{CATENCE_RELEASE_VERSION}",
         "serve",
-        "--data-dir",
-        str(data_directory),
+    ]
+    return [
+        *command,
+        "--home",
+        str(catalog_home),
         "--host",
         host,
         "--port",
@@ -132,17 +139,17 @@ def _stop(process: subprocess.Popen[object]) -> None:
 
 
 def serve(args: argparse.Namespace) -> int:
-    data_directory = args.data_dir.resolve()
-    mcp_url = args.mcp_url or f"http://{args.host}:{args.mcp_port}/mcp"
+    catalog_home = args.home.resolve()
+    mcp_url = args.mcp_url or f"http://{args.mcp_host}:{args.mcp_port}/mcp"
     console_root = Path(__file__).resolve().parent
+    validate_auth_configuration()
 
     environment = dict(os.environ)
     environment.update(
         {
-            "CATENCE_DATA_DIR": str(data_directory),
+            "CATENCE_HOME": str(catalog_home),
             "CATENCE_MCP_URL": mcp_url,
             "CHAINLIT_APP_ROOT": str(console_root),
-            "CHAINLIT_LOCAL_USER": "catence-local",
         }
     )
 
@@ -150,7 +157,7 @@ def serve(args: argparse.Namespace) -> int:
     if args.mcp_url or args.external_mcp:
         _wait_for_health(mcp_url, None)
     else:
-        catence_process = subprocess.Popen(_runtime_command(data_directory, args.host, args.mcp_port, args.ui_port), env=environment)
+        catence_process = subprocess.Popen(_runtime_command(catalog_home, args.mcp_host, args.mcp_port, args.ui_port), env=environment)
         _wait_for_health(mcp_url, catence_process)
 
     chainlit_command = [
@@ -161,12 +168,12 @@ def serve(args: argparse.Namespace) -> int:
         str(console_root / "app.py"),
         "--headless",
         "--host",
-        args.host,
+        args.ui_host,
         "--port",
         str(args.ui_port),
     ]
     console_process = subprocess.Popen(chainlit_command, cwd=console_root, env=environment)
-    print(f"Catence Console is starting at http://{args.host}:{args.ui_port}", flush=True)
+    print(f"Catence Console is starting at http://{args.ui_host}:{args.ui_port}", flush=True)
     previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
     def stop_on_sigterm(_signal_number: int, _frame: object) -> None:
@@ -194,27 +201,51 @@ def parser() -> argparse.ArgumentParser:
     subcommands = command.add_subparsers(dest="command", required=True)
 
     def connection_options(subcommand: argparse.ArgumentParser) -> None:
-        subcommand.add_argument("--data-dir", type=Path, default=Path(os.environ.get("CATENCE_DATA_DIR", ".catence")))
+        subcommand.add_argument("--home", type=Path, default=Path(os.environ.get("CATENCE_HOME", str(Path.home() / ".catence"))))
         subcommand.add_argument("--mcp-url", default=os.environ.get("CATENCE_MCP_URL", "http://127.0.0.1:8787/mcp"))
 
     doctor_command = subcommands.add_parser("doctor", help="Validate named profiles, required environment variables, and Catence health.")
     connection_options(doctor_command)
 
     serve_command = subcommands.add_parser("serve", help="Run the packaged Console and a matching Catence runtime on loopback.")
-    serve_command.add_argument("--data-dir", type=Path, default=Path(os.environ.get("CATENCE_DATA_DIR", ".catence")))
+    serve_command.add_argument("--home", type=Path, default=Path(os.environ.get("CATENCE_HOME", str(Path.home() / ".catence"))))
     serve_command.add_argument("--mcp-url", default=os.environ.get("CATENCE_MCP_URL"), help="Use an already-running compatible Catence HTTP MCP server.")
-    serve_command.add_argument("--host", choices=("127.0.0.1", "localhost"), default="127.0.0.1")
+    serve_command.add_argument("--ui-host", default=os.environ.get("CATENCE_CONSOLE_HOST", "127.0.0.1"))
+    serve_command.add_argument("--mcp-host", default="127.0.0.1")
     serve_command.add_argument("--mcp-port", type=int, default=8787)
     serve_command.add_argument("--ui-port", type=int, default=8000)
     serve_command.add_argument("--no-build-ui", action="store_true", help="Deprecated no-op; catence-chainlit includes prebuilt frontend assets.")
     serve_command.add_argument("--external-mcp", action="store_true", help="Deprecated alias for using the loopback server already running at --host/--mcp-port.")
+    auth_command = subcommands.add_parser("auth", help="Generate or validate Console login configuration.")
+    auth_command.add_subparsers(dest="auth_command", required=True).add_parser(
+        "hash-password", help="Prompt for a password and print a bcrypt hash for CATENCE_CONSOLE_PASSWORD_HASH."
+    )
     return command
+
+
+def hash_password() -> int:
+    password = getpass.getpass("Console password: ")
+    confirmation = getpass.getpass("Confirm Console password: ")
+    if not password:
+        raise RuntimeError("Console password cannot be empty.")
+    if password != confirmation:
+        raise RuntimeError("Console passwords did not match.")
+    import bcrypt
+
+    print(bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8"))
+    return 0
 
 
 def main() -> NoReturn:
     args = parser().parse_args()
     if args.command == "doctor":
-        raise SystemExit(doctor(args.data_dir.resolve(), args.mcp_url))
+        raise SystemExit(doctor(args.home.resolve(), args.mcp_url))
+    if args.command == "auth" and args.auth_command == "hash-password":
+        try:
+            raise SystemExit(hash_password())
+        except RuntimeError as error:
+            print(f"catence-console: {error}", file=sys.stderr)
+            raise SystemExit(2) from error
     try:
         raise SystemExit(serve(args))
     except RuntimeError as error:

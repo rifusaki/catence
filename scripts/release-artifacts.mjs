@@ -19,16 +19,27 @@ async function checkVersions() {
   const consoleRelease = await readFile(path.join(root, 'console/catence_console/release.py'), 'utf8');
   const runtimeContract = await readFile(path.join(root, 'src/contracts/release.ts'), 'utf8');
   const version = packageJson.version;
+  const pythonVersion = release.pythonVersion;
+  const chainlitVersion = release.chainlitVersion;
+  const channel = release.channel;
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) throw new Error(`package.json version is not valid semver: ${version}`);
   if (release.version !== version) throw new Error(`release/manifest.json version ${release.version} must equal package.json version ${version}.`);
+  if (!/^\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?$/.test(pythonVersion ?? '')) throw new Error(`release/manifest.json pythonVersion ${pythonVersion} is not a supported PEP 440 release version.`);
+  if (!/^\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?$/.test(chainlitVersion ?? '')) throw new Error(`release/manifest.json chainlitVersion ${chainlitVersion} is not a supported PEP 440 release version.`);
+  if (!['stable', 'beta'].includes(channel)) throw new Error('release/manifest.json channel must be stable or beta.');
+  const beta = version.match(/^(\d+\.\d+\.\d+)-beta\.(\d+)$/);
+  if (channel === 'stable' && (beta || pythonVersion !== version)) throw new Error('A stable release must use matching final npm and Python versions.');
+  if (channel === 'beta' && (!beta || pythonVersion !== `${beta[1]}b${beta[2]}` || chainlitVersion !== pythonVersion)) {
+    throw new Error('A beta release must map npm X.Y.Z-beta.N to Python and Chainlit X.Y.ZbN.');
+  }
   if (!Number.isInteger(release.protocolVersion) || release.protocolVersion < 1) throw new Error('release/manifest.json protocolVersion must be a positive integer.');
   if (release.packages?.npm !== packageJson.name) throw new Error(`release/manifest.json npm package must equal ${packageJson.name}.`);
   if (packageJson.engines?.node !== release.node) throw new Error(`package.json Node engine must equal release/manifest.json (${release.node}).`);
   const consoleVersion = consoleProject.match(/^version\s*=\s*"([^"]+)"$/m)?.[1];
   const consolePython = consoleProject.match(/^requires-python\s*=\s*"([^"]+)"$/m)?.[1];
-  if (release.packages?.console !== 'catence-console' || consoleVersion !== version) throw new Error(`console/pyproject.toml version must equal ${version}.`);
+  if (release.packages?.console !== 'catence-console' || consoleVersion !== pythonVersion) throw new Error(`console/pyproject.toml version must equal Python release version ${pythonVersion}.`);
   if (consolePython !== release.python) throw new Error(`console/pyproject.toml Python range must equal release/manifest.json (${release.python}).`);
-  if (!consoleProject.includes(`${release.packages.chainlit}==${version}`)) throw new Error(`console/pyproject.toml must pin ${release.packages.chainlit}==${version}.`);
+  if (!consoleProject.includes(`${release.packages.chainlit}==${chainlitVersion}`)) throw new Error(`console/pyproject.toml must pin ${release.packages.chainlit}==${chainlitVersion}.`);
   if (!consoleRelease.includes(`CATENCE_RELEASE_VERSION = "${version}"`)) throw new Error(`console runtime version must equal ${version}.`);
   if (!consoleRelease.includes(`CATENCE_PROTOCOL_VERSION = ${release.protocolVersion}`)) throw new Error('console protocol version must equal release/manifest.json.');
   if (manifest.version !== version) throw new Error(`mcpb/manifest.json version ${manifest.version} must equal package.json version ${version}.`);
@@ -39,7 +50,7 @@ async function checkVersions() {
   if (!runtimeContract.includes(`CATENCE_PROTOCOL_VERSION = ${release.protocolVersion}`)) throw new Error(`src/contracts/release.ts protocol version must equal release/manifest.json.`);
   const tag = process.env.GITHUB_REF_NAME;
   if (tag && process.env.GITHUB_REF_TYPE === 'tag' && tag !== `v${version}`) throw new Error(`Release tag ${tag} must equal v${version}.`);
-  return { packageJson, manifest, release, version };
+  return { packageJson, manifest, release, version, pythonVersion, chainlitVersion, channel };
 }
 
 function copyFilter(source) {

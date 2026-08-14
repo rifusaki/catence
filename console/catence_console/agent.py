@@ -155,6 +155,12 @@ def _saved_result_payload(store: ToolCallStore | None, thread_id: str | None, ar
     return result
 
 
+def _scoped_tool_arguments(name: str, arguments: dict[str, Any], athlete_id: str | None) -> dict[str, Any]:
+    if athlete_id and name not in {_RECALL_SAVED_TOOL_RESULT, "list_athletes"}:
+        return {**arguments, "athleteId": athlete_id}
+    return arguments
+
+
 async def _invoke_tool(
     session: ClientSession,
     name: str,
@@ -163,7 +169,11 @@ async def _invoke_tool(
     *,
     tool_call_store: ToolCallStore | None = None,
     thread_id: str | None = None,
+    athlete_id: str | None = None,
 ) -> dict[str, Any]:
+    # A shared Console process may see several athlete stores. The selected
+    # athlete is server-owned session state, never model-controlled input.
+    arguments = _scoped_tool_arguments(name, arguments, athlete_id)
     step = cl.Step(name=f"Catence · {name}", type="tool", default_open=False)
     step.input = arguments
     await step.send()
@@ -196,6 +206,7 @@ async def respond(
     tool_result_character_limit: int = DEFAULT_TOOL_RESULT_CHARACTER_LIMIT,
     tool_call_store: ToolCallStore | None = None,
     thread_id: str | None = None,
+    athlete_id: str | None = None,
     complete: Callable[..., Awaitable[Any]] = acompletion,
 ) -> str:
     """Run one bounded Chat turn, displaying each evidence-producing MCP call."""
@@ -207,6 +218,17 @@ async def respond(
             listed_tools = await session.list_tools()
             tools = _tool_definitions(list(listed_tools.tools))
             messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+            if athlete_id:
+                messages.insert(
+                    1,
+                    {
+                        "role": "system",
+                        "content": (
+                            f"This Console chat is scoped to athleteId {athlete_id!r}. "
+                            "Every Catence data tool call is forced to that athlete; do not try to select or compare another athlete."
+                        ),
+                    },
+                )
             initialized_raw = _as_json(initialized)
             server_instructions = initialized_raw.get("instructions") if isinstance(initialized_raw, dict) else None
             if isinstance(server_instructions, str) and server_instructions.strip():
@@ -241,6 +263,7 @@ async def respond(
                 )
                 for tool_call in tool_calls:
                     call_id, name, arguments = _tool_call_parts(tool_call)
+                    arguments = _scoped_tool_arguments(name, arguments, athlete_id)
                     payload = await _invoke_tool(
                         session,
                         name,
@@ -248,6 +271,7 @@ async def respond(
                         tool_result_character_limit,
                         tool_call_store=tool_call_store,
                         thread_id=thread_id,
+                        athlete_id=None,
                     )
                     if tool_call_store is not None and thread_id and name != _RECALL_SAVED_TOOL_RESULT:
                         tool_call_store.record(

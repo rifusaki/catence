@@ -1,11 +1,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { catenceRuntimeHealth, DashboardSnapshotService, jsonSafe, openReadOnlyRepository, resolvePaths, type CatencePaths } from '../../runtime/index.js';
+import { catenceRuntimeHealth, DashboardSnapshotService, jsonSafe, loadCatalog, openReadOnlyRepository, resolveAthlete, resolveCatalogPaths, type CatalogPaths, type CatencePaths } from '../../runtime/index.js';
 import { createCatenceMcpServer } from '../mcp/server.js';
 
 const MAX_REQUEST_BYTES = 1_000_000;
 
 export type CatenceHttpServerOptions = {
+  /** A shared catalog for public servers. All data APIs then require athleteId. */
+  catalogPaths?: CatalogPaths;
+  /** Internal compatibility hook for tests and embedded single-store callers. */
   paths?: CatencePaths;
   allowedOrigins?: readonly string[];
 };
@@ -79,7 +82,17 @@ async function dashboardSnapshot(paths: CatencePaths, url: URL): Promise<Record<
   }
 }
 
-async function handleMcpRequest(request: IncomingMessage, response: ServerResponse, paths: CatencePaths): Promise<void> {
+async function dashboardPaths(catalogPaths: CatalogPaths | null, staticPaths: CatencePaths | null, url: URL): Promise<CatencePaths> {
+  if (catalogPaths) {
+    const athleteId = url.searchParams.get('athleteId');
+    if (!athleteId) throw new Error('athleteId is required. Call /api/v1/athletes to inspect the configured catalog.');
+    return (await resolveAthlete(catalogPaths, athleteId)).paths;
+  }
+  if (staticPaths) return staticPaths;
+  throw new Error('No Catence data store is configured.');
+}
+
+async function handleMcpRequest(request: IncomingMessage, response: ServerResponse, paths: CatencePaths | CatalogPaths): Promise<void> {
   if (request.method !== 'POST') {
     methodNotAllowed(response);
     return;
@@ -132,7 +145,8 @@ async function handleMcpRequest(request: IncomingMessage, response: ServerRespon
  * process-wide MCP session state or a second query implementation.
  */
 export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}): Server {
-  const paths = options.paths ?? resolvePaths();
+  const catalogPaths = options.catalogPaths ?? (options.paths ? null : resolveCatalogPaths());
+  const staticPaths = options.paths ?? null;
   const allowedOrigins = options.allowedOrigins ?? [];
 
   return createServer((request, response) => {
@@ -153,9 +167,24 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
         return;
       }
 
+      if (pathname === '/api/v1/athletes' && request.method === 'GET') {
+        if (!catalogPaths) {
+          json(response, 200, { defaultAthleteId: 'local', athletes: [{ id: 'local', label: 'Local athlete' }] });
+          return;
+        }
+        try {
+          const catalog = await loadCatalog(catalogPaths);
+          json(response, 200, { defaultAthleteId: catalog.defaultAthleteId, athletes: catalog.athletes });
+        } catch (error) {
+          json(response, 400, { error: { code: 'catalog_unavailable', message: error instanceof Error ? error.message : String(error) } });
+        }
+        return;
+      }
+
       if (pathname === '/api/v1/dashboard' && request.method === 'GET') {
         try {
-          json(response, 200, await dashboardSnapshot(paths, new URL(request.url ?? '/', 'http://localhost')));
+          const url = new URL(request.url ?? '/', 'http://localhost');
+          json(response, 200, await dashboardSnapshot(await dashboardPaths(catalogPaths, staticPaths, url), url));
         } catch (error) {
           json(response, 400, { error: { code: 'dashboard_unavailable', message: error instanceof Error ? error.message : String(error) } });
         }
@@ -163,7 +192,7 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       }
 
       if (pathname === '/mcp') {
-        await handleMcpRequest(request, response, paths);
+        await handleMcpRequest(request, response, catalogPaths ?? staticPaths ?? resolveCatalogPaths());
         return;
       }
 

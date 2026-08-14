@@ -1,8 +1,11 @@
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { z } from 'zod';
 import {
   ActivityDiscoveryService,
   AnalyticsService,
+  loadCatalog,
+  type CatalogPaths,
   configuredMcpRateLimit,
   DataWriteBusyError,
   DATASET_CATALOG,
@@ -18,7 +21,8 @@ import {
   QueryValidationError,
   ReadOnlyDatabaseError,
   ReadOnlyRepository,
-  resolvePaths,
+  resolveAthlete,
+  resolveCatalogPaths,
   searchContext,
   SlidingWindowLimiter,
   StravaEnrichmentError,
@@ -54,6 +58,12 @@ type StravaActivityHydrator = typeof hydrateStravaActivity;
 type McpDependencies = {
   hydrateStravaActivity?: StravaActivityHydrator;
 };
+
+type AthleteResolution = { athlete: { id: string; label: string }; paths: CatencePaths };
+
+function isCatalogPaths(value: CatencePaths | CatalogPaths): value is CatalogPaths {
+  return 'catalog' in value;
+}
 
 const MCP_INSTRUCTIONS = [
   'For a selected activity\'s Strava segments, climb segments, grade by segment, KOM/PR, or per-segment analysis, call get_activity_segments after identifying the activity.',
@@ -155,32 +165,66 @@ async function activitySegments(repository: ReadOnlyRepository, activityId: stri
   `, values);
 }
 
-export function createCatenceMcpServer(paths = resolvePaths(), dependencies: McpDependencies = {}): McpServer {
+export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = resolveCatalogPaths(), dependencies: McpDependencies = {}): McpServer {
   const server = new McpServer({ name: 'catence', version: '0.1.0' }, { instructions: MCP_INSTRUCTIONS });
   const hydrateActivity = dependencies.hydrateStravaActivity ?? hydrateStravaActivity;
-  const configPromise = loadCatenceConfig(paths);
-  const demoStorePromise = demoStoreMetadata(paths);
+  const catalogPaths = isCatalogPaths(paths) ? paths : null;
+  const staticPaths: CatencePaths | null = isCatalogPaths(paths) ? null : paths;
+  const scope = new AsyncLocalStorage<AthleteResolution>();
+  const activePaths = (): CatencePaths => scope.getStore()?.paths ?? staticPaths ?? (() => { throw new Error('athleteId is required. Call list_athletes to inspect the configured catalog.'); })();
+  const activeAthlete = () => scope.getStore()?.athlete;
   const limiter = new SlidingWindowLimiter();
-  const tool = <T>(name: string, fn: (input: T) => Promise<unknown>) => async (input: T): Promise<ToolResult> => {
+  const athleteIdSchema = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/);
+  const promptAthleteSchema: Record<string, z.ZodType> = catalogPaths ? { athleteId: athleteIdSchema } : {};
+
+  if (catalogPaths) {
+    server.registerTool('list_athletes', {
+      title: 'List configured athletes',
+      description: 'List athlete IDs and labels available to this shared Catence agent. No personal metrics are returned.',
+    }, async (): Promise<ToolResult> => {
+      try {
+        const catalog = await loadCatalog(catalogPaths);
+        return textResult({ data: { defaultAthleteId: catalog.defaultAthleteId, athletes: catalog.athletes } });
+      } catch (error) { return errorResult(error); }
+    });
+    const originalRegister = server.registerTool.bind(server) as unknown as (name: string, configuration: Record<string, unknown>, handler: unknown) => unknown;
+    (server as unknown as { registerTool: (name: string, configuration: Record<string, unknown>, handler: unknown) => unknown }).registerTool = (name, configuration, handler) => {
+      const originalInput = configuration.inputSchema as Record<string, z.ZodType> | undefined;
+      return originalRegister(name, {
+        ...configuration,
+        description: `${String(configuration.description ?? '')} Requires athleteId from list_athletes.`,
+        inputSchema: { athleteId: athleteIdSchema, ...(originalInput ?? {}) },
+      }, handler);
+    };
+  }
+
+  const tool = <T extends Record<string, unknown>>(name: string, fn: (input: T) => Promise<unknown>) => async (rawInput: T & { athleteId?: string }): Promise<ToolResult> => {
     try {
-      const config = await configPromise;
-      const decision = limiter.check(`tool:${name}`, configuredMcpRateLimit(config, 'tools', name));
-      if (!decision.allowed) return { ...textResult({ data: null, error: { code: 'rate_limited', message: `MCP tool ${name} is locally rate limited.`, retryAfterSeconds: decision.retryAfterSeconds } }), isError: true };
-      const value = await fn(input);
-      const demoStore = await demoStorePromise;
-      if (!demoStore || !value || typeof value !== 'object' || Array.isArray(value)) return textResult(value);
-      const result = value as Record<string, unknown>;
-      const caveats = Array.isArray(result.caveats) ? result.caveats : [];
-      return textResult({
-        ...result,
-        demoStore: { generated: true, seed: demoStore.seed, days: demoStore.days, startDate: demoStore.startDate, endDate: demoStore.endDate },
-        caveats: [...caveats, 'This response uses Catence generated demo data, not personal measurements.'],
-      });
+      const selected = catalogPaths
+        ? await resolveAthlete(catalogPaths, rawInput.athleteId ?? '')
+        : null;
+      const run = async (): Promise<ToolResult> => {
+        const currentPaths = activePaths();
+        const config = await loadCatenceConfig(currentPaths);
+        const decision = limiter.check(`${activeAthlete()?.id ?? 'local'}:tool:${name}`, configuredMcpRateLimit(config, 'tools', name));
+        if (!decision.allowed) return { ...textResult({ data: null, ...(activeAthlete() ? { athlete: activeAthlete() } : {}), error: { code: 'rate_limited', message: `MCP tool ${name} is locally rate limited.`, retryAfterSeconds: decision.retryAfterSeconds } }), isError: true };
+        const { athleteId: _athleteId, ...input } = rawInput;
+        const value = await fn(input as T);
+        const result = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : { data: value };
+        const demoStore = await demoStoreMetadata(currentPaths);
+        const caveats = Array.isArray(result.caveats) ? result.caveats : [];
+        return textResult({
+          ...result,
+          ...(activeAthlete() ? { athlete: activeAthlete() } : {}),
+          ...(demoStore ? { demoStore: { generated: true, seed: demoStore.seed, days: demoStore.days, startDate: demoStore.startDate, endDate: demoStore.endDate }, caveats: [...caveats, 'This response uses Catence generated demo data, not personal measurements.'] } : {}),
+        });
+      };
+      return selected ? scope.run(selected, run) : run();
     } catch (error) { return errorResult(error); }
   };
   const resourceLimit = async (name: string, uri: URL) => {
     try {
-      const config = await configPromise;
+      const config = await loadCatenceConfig(activePaths());
       const decision = limiter.check(`resource:${name}`, configuredMcpRateLimit(config, 'resources', name));
       if (!decision.allowed) return resource(uri, { error: { code: 'rate_limited', message: `MCP resource ${name} is locally rate limited.`, retryAfterSeconds: decision.retryAfterSeconds } });
       return null;
@@ -190,40 +234,40 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
   server.registerPrompt('daily_recovery_load_review', {
     title: 'Daily recovery and load review',
     description: 'Ask for a source-cited recovery and training-load review for one date.',
-    argsSchema: { date: z.string().date().optional() },
-  }, ({ date }) => ({
+    argsSchema: { ...promptAthleteSchema, date: z.string().date().optional() },
+  }, ({ date, ...input }) => ({
     messages: [{
       role: 'user',
-      content: { type: 'text', text: `Run review_daily_recovery_load for ${date ?? utcDate()}. Summarize only returned evidence, name data gaps, and do not present a training prescription as fact.` },
+      content: { type: 'text', text: `Run review_daily_recovery_load for ${date ?? utcDate()}${typeof (input as { athleteId?: unknown }).athleteId === 'string' ? ` with athleteId ${(input as { athleteId: string }).athleteId}` : ''}. Summarize only returned evidence, name data gaps, and do not present a training prescription as fact.` },
     }],
   }));
 
   server.registerPrompt('weekly_training_review', {
     title: 'Weekly training review',
     description: 'Ask for a source-cited seven-day training review ending on an optional date.',
-    argsSchema: { endDate: z.string().date().optional() },
-  }, ({ endDate }) => ({
+    argsSchema: { ...promptAthleteSchema, endDate: z.string().date().optional() },
+  }, ({ endDate, ...input }) => ({
     messages: [{
       role: 'user',
-      content: { type: 'text', text: `Run review_weekly_training ending on ${endDate ?? utcDate()}. Explain volume, load, and recovery evidence with dates and coverage caveats.` },
+      content: { type: 'text', text: `Run review_weekly_training ending on ${endDate ?? utcDate()}${typeof (input as { athleteId?: unknown }).athleteId === 'string' ? ` with athleteId ${(input as { athleteId: string }).athleteId}` : ''}. Explain volume, load, and recovery evidence with dates and coverage caveats.` },
     }],
   }));
 
   server.registerPrompt('activity_deep_dive', {
     title: 'Activity deep dive',
     description: 'Ask for an evidence-first deep dive into one canonical Catence activity.',
-    argsSchema: { activityId: z.string().min(1) },
-  }, ({ activityId }) => ({
+    argsSchema: { ...promptAthleteSchema, activityId: z.string().min(1) },
+  }, ({ activityId, ...input }) => ({
     messages: [{
       role: 'user',
-      content: { type: 'text', text: `Run review_activity_deep_dive for ${activityId}. Use its source records and intervals first; load read_series only if a specific sampled metric is needed.` },
+      content: { type: 'text', text: `Run review_activity_deep_dive for ${activityId}${typeof (input as { athleteId?: unknown }).athleteId === 'string' ? ` with athleteId ${(input as { athleteId: string }).athleteId}` : ''}. Use its source records and intervals first; load read_series only if a specific sampled metric is needed.` },
     }],
   }));
 
   server.registerTool('catence_status', {
     title: 'Catence data status',
     description: 'Read sync state, data coverage, entity counts, stream availability, unresolved errors, and retrieval-index freshness. Read-only.',
-  }, tool('catence_status', async () => useRepository(paths, async (repository) => ({
+  }, tool('catence_status', async () => useRepository(activePaths(), async (repository) => ({
     data: { ...(await repository.status()), ...(await repository.coverage()) },
     provenance: { database: 'read-only DuckDB snapshot' }, query: {}, caveats: [],
   }))));
@@ -234,7 +278,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
     inputSchema: { date: z.string().date().optional() },
   }, tool('review_daily_recovery_load', async (input) => {
     const date = input.date ?? utcDate();
-    return useRepository(paths, async (repository) => ({
+    return useRepository(activePaths(), async (repository) => ({
       data: { date, ...(await repository.summary(date, date)) },
       provenance: { relations: ['daily_health', 'canonical_activity_training', 'nutrition_days'], database: 'read-only DuckDB snapshot' },
       query: { date },
@@ -252,7 +296,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
   }, tool('review_weekly_training', async (input) => {
     const endDate = input.endDate ?? utcDate();
     const startDate = subtractDays(endDate, 6);
-    return useRepository(paths, async (repository) => ({
+    return useRepository(activePaths(), async (repository) => ({
       data: { startDate, endDate, ...(await repository.summary(startDate, endDate)) },
       provenance: { relations: ['daily_health', 'canonical_activity_training', 'nutrition_days'], database: 'read-only DuckDB snapshot' },
       query: { startDate, endDate },
@@ -267,7 +311,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
     title: 'Review one activity in depth',
     description: 'Return canonical activity identity, source summaries, and structured intervals. Call read_series separately only when a specific sampled metric is required.',
     inputSchema: { activityId: z.string().min(1) },
-  }, tool('review_activity_deep_dive', async (input) => useRepository(paths, async (repository) => {
+  }, tool('review_activity_deep_dive', async (input) => useRepository(activePaths(), async (repository) => {
     const activity = await repository.activity(input.activityId);
     return {
       data: activity,
@@ -282,7 +326,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
   server.registerTool('describe_data', {
     title: 'Describe available Catence datasets',
     description: 'List cataloged datasets, fields, units, permitted filters/groupings, providers, and time coverage. Read-only.',
-  }, tool('describe_data', async () => useRepository(paths, async (repository) => ({
+  }, tool('describe_data', async () => useRepository(activePaths(), async (repository) => ({
     data: { datasets: repository.catalog(), ...(await repository.coverage()) },
     provenance: { catalog: 'Catence catalog, restricted to analytical views' }, query: {}, caveats: ['activity_samples is available only through read_series or aggregate_data and only reads registered Parquet stream manifests.'],
   }))));
@@ -291,7 +335,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
     title: 'Describe one Catence dataset',
     description: 'Read a compact schema, permitted filters/groupings, provenance fields, and coverage for one cataloged dataset. Read-only.',
     inputSchema: { dataset: z.string().min(1) },
-  }, tool('describe_dataset', async (input) => useRepository(paths, async (repository) => {
+  }, tool('describe_dataset', async (input) => useRepository(activePaths(), async (repository) => {
     const dataset = getDataset(input.dataset);
     const coverage = (await repository.coverage()).coverage as Array<Record<string, unknown>>;
     const observedValues = dataset.name === 'training_metric_observations'
@@ -313,7 +357,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
 
   server.registerTool('read_series', {
     title: 'Read a bounded time series', description: 'Read cataloged numeric series with deterministic cursor pagination and automatic stream downsampling. metrics must be numeric catalog columns; place identifiers and other strings in filters. Call describe_dataset first if the fields are uncertain.', inputSchema: seriesInput,
-  }, tool('read_series', async (input) => useRepository(paths, (repository) => new AnalyticsService(repository).readSeries({ ...input, filters: input.filters as DataFilter[] | undefined }))));
+  }, tool('read_series', async (input) => useRepository(activePaths(), (repository) => new AnalyticsService(repository).readSeries({ ...input, filters: input.filters as DataFilter[] | undefined }))));
 
   server.registerTool('aggregate_data', {
     title: 'Aggregate cataloged data', description: 'Declarative aggregation over one cataloged dataset. A timeBucket adds a time_bucket field, which can be used in orderBy. No joins, arbitrary expressions, or file paths.',
@@ -322,17 +366,17 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
       metrics: z.array(z.object({ column: z.string().min(1), operation: z.enum(['count', 'sum', 'mean', 'min', 'max', 'percentile']), percentile: z.number().gt(0).lt(1).optional(), as: z.string().min(1).max(64).optional() })).min(1).max(12),
       dimensions: z.array(z.string().min(1)).max(8).optional(), filters: z.array(filterSchema).max(50).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional(), timeBucket: z.enum(['day', 'week', 'month']).optional(), orderBy: z.object({ column: z.string().min(1), direction: z.enum(['asc', 'desc']).optional() }).optional(), limit: z.number().int().min(1).max(500).optional(),
     },
-  }, tool('aggregate_data', async (input) => useRepository(paths, (repository) => new AnalyticsService(repository).aggregate({ ...input, filters: input.filters as DataFilter[] | undefined }))));
+  }, tool('aggregate_data', async (input) => useRepository(activePaths(), (repository) => new AnalyticsService(repository).aggregate({ ...input, filters: input.filters as DataFilter[] | undefined }))));
 
   server.registerTool('analyze_series', {
     title: 'Analyze a descriptive series', description: 'Run deterministic rolling statistics, baselines, correlations, seasonal comparisons, or trends on a cataloged series.',
     inputSchema: { ...seriesInput, analysis: z.enum(['rolling_mean', 'rolling_median', 'baseline_change', 'z_score', 'pearson', 'spearman', 'seasonal_comparison', 'linear_trend', 'theil_sen_trend']), compareMetric: z.string().min(1).optional(), window: z.number().int().min(2).max(100).optional() },
-  }, tool('analyze_series', async (input) => useRepository(paths, (repository) => new AnalyticsService(repository).analyzeSeries({ ...input, filters: input.filters as DataFilter[] | undefined }))));
+  }, tool('analyze_series', async (input) => useRepository(activePaths(), (repository) => new AnalyticsService(repository).analyzeSeries({ ...input, filters: input.filters as DataFilter[] | undefined }))));
 
   server.registerTool('fit_series_model', {
     title: 'Fit a descriptive series model', description: 'Fit a bounded OLS, Theil–Sen, quadratic, or cubic descriptive model. Not a sport-performance model.',
     inputSchema: { ...seriesInput, model: z.enum(['ols_linear', 'theil_sen_linear', 'polynomial_2', 'polynomial_3']), xMetric: z.string().min(1).optional(), yMetric: z.string().min(1).optional() },
-  }, tool('fit_series_model', async (input) => useRepository(paths, (repository) => new AnalyticsService(repository).fitSeriesModel({ ...input, filters: input.filters as DataFilter[] | undefined }))));
+  }, tool('fit_series_model', async (input) => useRepository(activePaths(), (repository) => new AnalyticsService(repository).fitSeriesModel({ ...input, filters: input.filters as DataFilter[] | undefined }))));
 
   server.registerTool('wellness_correlate', {
     title: 'Correlate recovery and training metrics',
@@ -341,37 +385,37 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
       metricA: z.enum(WELLNESS_METRICS), metricB: z.enum(WELLNESS_METRICS), startDate: z.string().date().optional(), endDate: z.string().date().optional(),
       method: z.enum(['pearson', 'spearman']).optional(), lagDays: z.number().int().min(-30).max(30).optional(), scanLags: z.boolean().optional(),
     },
-  }, tool('wellness_correlate', async (input) => useRepository(paths, (repository) => new WellnessService(repository).correlate(input))));
+  }, tool('wellness_correlate', async (input) => useRepository(activePaths(), (repository) => new WellnessService(repository).correlate(input))));
 
   server.registerTool('wellness_baselines', {
     title: 'Read personal wellness baselines',
     description: 'Return trailing means, standard-deviation bands, latest values, and latest z-scores for common recovery and training metrics. Missing values remain missing.',
     inputSchema: { metrics: z.array(z.enum(WELLNESS_METRICS)).min(1).max(12).optional(), endDate: z.string().date().optional(), windowDays: z.number().int().min(7).max(365).optional() },
-  }, tool('wellness_baselines', async (input) => useRepository(paths, (repository) => new WellnessService(repository).baselines(input))));
+  }, tool('wellness_baselines', async (input) => useRepository(activePaths(), (repository) => new WellnessService(repository).baselines(input))));
 
   server.registerTool('wellness_anomalies', {
     title: 'Find statistical wellness anomalies',
     description: 'Find daily recovery and wellness outliers by z-score and group dates with anomalies across multiple signals. This does not diagnose or prescribe.',
     inputSchema: { metrics: z.array(z.enum(WELLNESS_METRICS)).min(1).max(12).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional(), zThreshold: z.number().min(1).max(5).optional() },
-  }, tool('wellness_anomalies', async (input) => useRepository(paths, (repository) => new WellnessService(repository).anomalies(input))));
+  }, tool('wellness_anomalies', async (input) => useRepository(activePaths(), (repository) => new WellnessService(repository).anomalies(input))));
 
   server.registerTool('wellness_coverage', {
     title: 'Inspect wellness data coverage',
     description: 'Report present and missing dates for curated wellness/training metrics, plus unresolved extraction errors. Missing data is never interpreted as rest or a health outcome.',
     inputSchema: { metrics: z.array(z.enum(WELLNESS_METRICS)).min(1).max(12).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional() },
-  }, tool('wellness_coverage', async (input) => useRepository(paths, (repository) => new WellnessService(repository).coverage(input))));
+  }, tool('wellness_coverage', async (input) => useRepository(activePaths(), (repository) => new WellnessService(repository).coverage(input))));
 
   server.registerTool('get_ftp_history', {
     title: 'Get dated FTP history',
     description: 'Return normalized cycling FTP settings and activity-summary observations with source-aware preferred daily values. Read-only.',
     inputSchema: { sport: z.string().min(1).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional(), sourcePreference: z.enum(['settings', 'settings_then_activity', 'all']).optional() },
-  }, tool('get_ftp_history', async (input) => useRepository(paths, (repository) => new FitnessService(repository).ftpHistory(input))));
+  }, tool('get_ftp_history', async (input) => useRepository(activePaths(), (repository) => new FitnessService(repository).ftpHistory(input))));
 
   server.registerTool('get_vo2max_history', {
     title: 'Get sport-specific VO₂max history',
     description: 'Return normalized Garmin VO₂max observations for exactly one sport. For running, pass sport: running (or run): Garmin supplies that series with raw sport generic, which is preserved in each row. Cycling remains separate. Omit sport only to inspect available source labels. Read-only.',
     inputSchema: { sport: z.string().min(1).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional() },
-  }, tool('get_vo2max_history', async (input) => useRepository(paths, (repository) => new FitnessService(repository).vo2MaxHistory(input))));
+  }, tool('get_vo2max_history', async (input) => useRepository(activePaths(), (repository) => new FitnessService(repository).vo2MaxHistory(input))));
 
   server.registerTool('find_activities', {
     title: 'Find activities and likely races',
@@ -383,28 +427,28 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
       startDate: z.string().date().optional(), endDate: z.string().date().optional(),
       sort: z.enum(['date_desc', 'date_asc']).optional(), limit: z.number().int().min(1).max(100).optional(), cursor: z.string().min(1).optional(),
     },
-  }, tool('find_activities', async (input) => useRepository(paths, (repository) => new ActivityDiscoveryService(repository).findActivities(input))));
+  }, tool('find_activities', async (input) => useRepository(activePaths(), (repository) => new ActivityDiscoveryService(repository).findActivities(input))));
 
   server.registerTool('get_swim_laps', {
     title: 'Read explicit swim lengths and grouped sets',
     description: 'Return source-aware swim lengths when a provider actually supplied them, plus Garmin detected and Intervals.icu auto-detected sets. A missing length list is reported as unavailable; laps are never reconstructed from samples.',
     inputSchema: { activityId: z.string().min(1), provider: z.enum(['garmin', 'intervals']).optional() },
-  }, tool('get_swim_laps', async (input) => useRepository(paths, (repository) => new SwimmingService(repository).swimLaps(input))));
+  }, tool('get_swim_laps', async (input) => useRepository(activePaths(), (repository) => new SwimmingService(repository).swimLaps(input))));
 
   server.registerTool('swim_progress_report', {
     title: 'Build a source-aware swim progress report',
     description: 'Compare Garmin swimming summaries and data completeness over a date range, optionally within one pool length. It does not derive pace trends from moving time divided by distance.',
     inputSchema: { startDate: z.string().date().optional(), endDate: z.string().date().optional(), poolLengthM: z.number().positive().max(200).optional() },
-  }, tool('swim_progress_report', async (input) => useRepository(paths, (repository) => new SwimmingService(repository).swimProgressReport(input))));
+  }, tool('swim_progress_report', async (input) => useRepository(activePaths(), (repository) => new SwimmingService(repository).swimProgressReport(input))));
 
   server.registerTool('get_activity_segments', {
     title: 'Hydrate and read an activity’s Strava segments',
     description: 'For a selected activity’s segments, climbs, KOM/PRs, or per-segment analysis: automatically hydrate the matching Strava activity before returning its persisted segment efforts. Use this before saying segment data is unavailable.',
     inputSchema: { activityId: z.string().min(1), refresh: z.boolean().optional(), limit: z.number().int().min(1).max(500).optional() },
   }, tool('get_activity_segments', async (input) => {
-    const hydration = await hydrateActivity(paths, input.activityId, input.refresh ?? false);
+    const hydration = await hydrateActivity(activePaths(), input.activityId, input.refresh ?? false);
     const hydratedStravaActivityIds = stravaActivityIds(hydration);
-    const segments = await useRepository(paths, (repository) => activitySegments(repository, input.activityId, hydratedStravaActivityIds, input.limit ?? 200));
+    const segments = await useRepository(activePaths(), (repository) => activitySegments(repository, input.activityId, hydratedStravaActivityIds, input.limit ?? 200));
     return {
       data: { hydration, hydratedStravaActivityIds, segments },
       provenance: { provider: 'strava', relations: ['activity_segments', 'strava_segments'], operation: 'targeted_activity_hydration_then_read' },
@@ -420,43 +464,43 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
     title: 'Read labelled power-curve trends',
     description: 'Return monthly bests for selected power durations from an explicit sport or sport family, including the supporting activity and source type. Read-only.',
     inputSchema: { sport: z.string().min(1).optional(), sportFamily: z.enum(['cycling', 'running']).optional(), durations: z.array(z.number().int().min(1).max(86_400)).min(1).max(12).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional(), sourceQuality: z.enum(['all', 'garmin_fit_derived']).optional() },
-  }, tool('power_curve_trend', async (input) => useRepository(paths, (repository) => new FitnessService(repository).powerCurveTrend(input))));
+  }, tool('power_curve_trend', async (input) => useRepository(activePaths(), (repository) => new FitnessService(repository).powerCurveTrend(input))));
 
   server.registerTool('power_coverage_report', {
     title: 'Inspect FIT-derived power coverage',
     description: 'Report powered activities and the complete duration-best inventory for an explicit sport or sport family. Uses Garmin FIT-derived power, not sparse activity summaries. Read-only.',
     inputSchema: { sport: z.string().min(1).optional(), sportFamily: z.enum(['cycling', 'running']).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional(), sourceQuality: z.enum(['all', 'garmin_fit_derived']).optional() },
-  }, tool('power_coverage_report', async (input) => useRepository(paths, (repository) => new FitnessService(repository).powerCoverageReport(input))));
+  }, tool('power_coverage_report', async (input) => useRepository(activePaths(), (repository) => new FitnessService(repository).powerCoverageReport(input))));
 
   server.registerTool('latest_cycling_activities', {
     title: 'List latest cycling activities',
     description: 'List Garmin cycling source records without duplicate Intervals summaries, optionally flagging multisport parent records. Read-only.',
     inputSchema: { startDate: z.string().date().optional(), endDate: z.string().date().optional(), includeMultisport: z.boolean().optional(), limit: z.number().int().min(1).max(100).optional() },
-  }, tool('latest_cycling_activities', async (input) => useRepository(paths, (repository) => new FitnessService(repository).latestCyclingActivities(input))));
+  }, tool('latest_cycling_activities', async (input) => useRepository(activePaths(), (repository) => new FitnessService(repository).latestCyclingActivities(input))));
 
   server.registerTool('cycling_progress_report', {
     title: 'Build a cycling progress report',
     description: 'Combine source-aware FTP and VO₂max histories with monthly canonical volume/load and labelled power-curve trends. Read-only and descriptive.',
     inputSchema: { startDate: z.string().date().optional(), endDate: z.string().date().optional() },
-  }, tool('cycling_progress_report', async (input) => useRepository(paths, (repository) => new FitnessService(repository).cyclingProgressReport(input))));
+  }, tool('cycling_progress_report', async (input) => useRepository(activePaths(), (repository) => new FitnessService(repository).cyclingProgressReport(input))));
 
   server.registerTool('query_read_only_data', {
     title: 'Query cataloged read-only data', description: 'Advanced fallback after describe_data/describe_dataset: one parameterized SELECT or WITH … SELECT over cataloged views only. Do not query information_schema, DuckDB system tables, or uncataloged physical relations. Results use deterministic cursor pagination and always report whether they are incomplete. Filesystem access, extensions, DDL, and mutation are rejected.',
     inputSchema: { sql: z.string().min(1).max(20_000), values: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).refine((value) => Object.keys(value).length <= 100, 'At most 100 bind values are allowed.').optional(), cursor: z.string().min(1).optional(), pageSize: z.number().int().min(1).max(500).optional() },
-  }, tool('query_read_only_data', async (input) => useRepository(paths, (repository) => queryReadOnlyData(repository, input))));
+  }, tool('query_read_only_data', async (input) => useRepository(activePaths(), (repository) => queryReadOnlyData(repository, input))));
 
   server.registerTool('search_context', {
     title: 'Search generated context', description: 'Search compact generated activity, plan, nutrition, and message context. Results identify authoritative follow-up tools rather than making numerical claims.',
     inputSchema: { query: z.string().min(2).max(500), filters: z.array(z.object({ column: z.enum(['provider', 'entity_type', 'occurred_on']), op: z.enum(['eq', 'in', 'between']), value: z.unknown() })).max(20).optional(), limit: z.number().int().min(1).max(50).optional() },
-  }, tool('search_context', async (input) => useRepository(paths, (repository) => searchContext(repository, input))));
+  }, tool('search_context', async (input) => useRepository(activePaths(), (repository) => searchContext(repository, input))));
 
   server.registerTool('hydrate_strava_activity', {
     title: 'Hydrate one activity from Strava',
     description: 'Write-only targeted enrichment. Safely matches exactly one Catence activity/source to Strava, then archives and persists its activity detail, gear assignment, and segment efforts. For a segment/climb request, prefer get_activity_segments, which invokes this prerequisite automatically.',
     inputSchema: { activityId: z.string().min(1), refresh: z.boolean().optional() },
   }, tool('hydrate_strava_activity', async (input) => {
-    const data = await hydrateActivity(paths, input.activityId, input.refresh ?? false);
-    return { data, coverage: await useRepository(paths, (repository) => repository.coverage()), provenance: { provider: 'strava', operation: 'activity_detail', archivedBeforeNormalization: true }, caveats: ['Segment verification is unavailable from Strava public segment data and is never inferred.'] };
+    const data = await hydrateActivity(activePaths(), input.activityId, input.refresh ?? false);
+    return { data, coverage: await useRepository(activePaths(), (repository) => repository.coverage()), provenance: { provider: 'strava', operation: 'activity_detail', archivedBeforeNormalization: true }, caveats: ['Segment verification is unavailable from Strava public segment data and is never inferred.'] };
   }));
 
   server.registerTool('hydrate_recent_strava_activities', {
@@ -470,7 +514,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
   }, tool('hydrate_recent_strava_activities', async (input) => {
     const activityIds = input.activityIds
       ? [...new Set(input.activityIds)]
-      : await useRepository(paths, async (repository) => {
+      : await useRepository(activePaths(), async (repository) => {
         const values: Record<string, unknown> = {
           startDate: input.startDate!, endDate: `${input.endDate!}T23:59:59.999Z`, limit: input.limit ?? 20,
         };
@@ -504,7 +548,7 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
         continue;
       }
       try {
-        const result = await hydrateStravaActivity(paths, activityId, input.refresh ?? false);
+        const result = await hydrateStravaActivity(activePaths(), activityId, input.refresh ?? false);
         const status = typeof result.status === 'string' ? result.status : 'completed';
         outcomes.push({ activityId, status, result });
       } catch (error) {
@@ -531,23 +575,29 @@ export function createCatenceMcpServer(paths = resolvePaths(), dependencies: Mcp
     description: 'Write-only targeted enrichment. Fetches a persisted Strava segment and the authenticated athlete’s paged historic efforts; interrupted or throttled work is resumable.',
     inputSchema: { segmentId: z.string().min(1), refresh: z.boolean().optional() },
   }, tool('hydrate_strava_segment_history', async (input) => {
-    const data = await hydrateStravaSegmentHistory(paths, input.segmentId, input.refresh ?? false);
-    return { data, coverage: await useRepository(paths, (repository) => repository.coverage()), provenance: { provider: 'strava', operation: 'segment_effort_history', archivedBeforeNormalization: true }, caveats: ['Only the authenticated athlete’s historic segment efforts are requested.'] };
+    const data = await hydrateStravaSegmentHistory(activePaths(), input.segmentId, input.refresh ?? false);
+    return { data, coverage: await useRepository(activePaths(), (repository) => repository.coverage()), provenance: { provider: 'strava', operation: 'segment_effort_history', archivedBeforeNormalization: true }, caveats: ['Only the authenticated athlete’s historic segment efforts are requested.'] };
   }));
 
-  server.registerResource('status', 'catence://status', { title: 'Catence status', mimeType: 'application/json' }, async (uri) => {
-    const limited = await resourceLimit('status', uri); if (limited) return limited;
-    try { return resource(uri, await useRepository(paths, (repository) => repository.status())); } catch (error) { return resource(uri, { error: errorResult(error).content[0].text }); }
-  });
-  server.registerResource('catalog', 'catence://catalog', { title: 'Catence catalog', mimeType: 'application/json' }, async (uri) => { const limited = await resourceLimit('catalog', uri); if (limited) return limited; return resource(uri, { datasets: Object.values(DATASET_CATALOG) }); });
-  server.registerResource('activity', new ResourceTemplate('catence://activity/{activityId}', { list: undefined }), { title: 'Activity detail', mimeType: 'application/json' }, async (uri, variables) => {
-    const limited = await resourceLimit('activity', uri); if (limited) return limited;
-    try { return resource(uri, await useRepository(paths, (repository) => repository.activity(variable(variables.activityId)))); } catch (error) { return resource(uri, { error: errorResult(error).content[0].text }); }
-  });
-  server.registerResource('summary', new ResourceTemplate('catence://summary/{startDate}/{endDate}', { list: undefined }), { title: 'Catence date-range summary', mimeType: 'application/json' }, async (uri, variables) => {
-    const limited = await resourceLimit('summary', uri); if (limited) return limited;
-    try { return resource(uri, await useRepository(paths, (repository) => repository.summary(variable(variables.startDate), variable(variables.endDate)))); } catch (error) { return resource(uri, { error: errorResult(error).content[0].text }); }
-  });
+  if (catalogPaths) {
+    server.registerResource('athletes', 'catence://athletes', { title: 'Configured athlete roster', mimeType: 'application/json' }, async (uri) => {
+      try { const catalog = await loadCatalog(catalogPaths); return resource(uri, { defaultAthleteId: catalog.defaultAthleteId, athletes: catalog.athletes }); } catch (error) { return resource(uri, { error: errorResult(error).content[0].text }); }
+    });
+  } else {
+    server.registerResource('status', 'catence://status', { title: 'Catence status', mimeType: 'application/json' }, async (uri) => {
+      const limited = await resourceLimit('status', uri); if (limited) return limited;
+      try { return resource(uri, await useRepository(activePaths(), (repository) => repository.status())); } catch (error) { return resource(uri, { error: errorResult(error).content[0].text }); }
+    });
+    server.registerResource('catalog', 'catence://catalog', { title: 'Catence catalog', mimeType: 'application/json' }, async (uri) => { const limited = await resourceLimit('catalog', uri); if (limited) return limited; return resource(uri, { datasets: Object.values(DATASET_CATALOG) }); });
+    server.registerResource('activity', new ResourceTemplate('catence://activity/{activityId}', { list: undefined }), { title: 'Activity detail', mimeType: 'application/json' }, async (uri, variables) => {
+      const limited = await resourceLimit('activity', uri); if (limited) return limited;
+      try { return resource(uri, await useRepository(activePaths(), (repository) => repository.activity(variable(variables.activityId)))); } catch (error) { return resource(uri, { error: errorResult(error).content[0].text }); }
+    });
+    server.registerResource('summary', new ResourceTemplate('catence://summary/{startDate}/{endDate}', { list: undefined }), { title: 'Catence date-range summary', mimeType: 'application/json' }, async (uri, variables) => {
+      const limited = await resourceLimit('summary', uri); if (limited) return limited;
+      try { return resource(uri, await useRepository(activePaths(), (repository) => repository.summary(variable(variables.startDate), variable(variables.endDate)))); } catch (error) { return resource(uri, { error: errorResult(error).content[0].text }); }
+    });
+  }
   return server;
 }
 

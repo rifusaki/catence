@@ -1,6 +1,6 @@
 {
   "name": "Catence",
-  "description": "Local-first, multi-athlete fitness MCP server with an isolated generated demo for Try in Browser.",
+  "description": "Local multi-athlete fitness MCP server.",
   "repository": "https://github.com/rifusaki/catence",
   "license": "AGPL-3.0-or-later",
   "transport": "stdio",

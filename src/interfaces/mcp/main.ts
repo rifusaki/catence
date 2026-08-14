@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { createDemoStore, resolvePaths } from '../../runtime/index.js';
+import { existsSync } from 'node:fs';
+import { addAthlete, athleteStorePaths, createDemoStore, defaultCatalogHome, initializeCatalog, loadCatalog, resolveCatalogPaths } from '../../runtime/index.js';
 import { parseServeCliOptions, SERVE_USAGE } from '../http/cli-options.js';
 import { createCatenceHttpServer } from '../http/server.js';
 import { MCP_USAGE, parseMcpCliOptions } from './cli-options.js';
@@ -15,7 +16,7 @@ async function run(): Promise<void> {
       return;
     }
     const httpServer = createCatenceHttpServer({
-      paths: resolvePaths(options.dataDir),
+      catalogPaths: resolveCatalogPaths(options.home),
       allowedOrigins: options.allowedOrigins,
     });
     await new Promise<void>((resolve, reject) => {
@@ -39,13 +40,18 @@ async function run(): Promise<void> {
     process.stderr.write(`${MCP_USAGE}\n`);
     return;
   }
-  const dataDir = options.dataDir ?? (demo ? process.env.CATENCE_DATA_DIR ?? './catence-demo' : undefined);
-  const paths = resolvePaths(dataDir);
+  const catalogPaths = resolveCatalogPaths(demo && !options.home ? `${defaultCatalogHome()}-demo` : options.home);
   if (demo) {
+    if (!existsSync(catalogPaths.catalog)) {
+      await initializeCatalog(catalogPaths, { id: 'demo', label: 'Generated demo athlete' });
+    } else if (!(await loadCatalog(catalogPaths)).athletes.some((athlete) => athlete.id === 'demo')) {
+      await addAthlete(catalogPaths, { id: 'demo', label: 'Generated demo athlete' });
+    }
+    const paths = athleteStorePaths(catalogPaths, 'demo');
     const result = await createDemoStore(paths);
     process.stderr.write(`${String(result.message)}\n`);
   }
-  const server = createCatenceMcpServer(paths);
+  const server = createCatenceMcpServer(catalogPaths);
   await server.connect(new StdioServerTransport());
   console.error('Catence MCP server is running on stdio; ordinary tools are read-only and Strava hydration is lock-guarded.');
 }

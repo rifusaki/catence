@@ -80,6 +80,14 @@ def test_tool_result_limit_marks_truncated_evidence():
     assert "20" in payload["message"]
 
 
+def test_selected_athlete_overrides_model_supplied_scope_for_data_tools():
+    assert agent._scoped_tool_arguments("read_series", {"athleteId": "other", "dataset": "daily"}, "alex") == {
+        "athleteId": "alex",
+        "dataset": "daily",
+    }
+    assert agent._scoped_tool_arguments("list_athletes", {}, "alex") == {}
+
+
 def test_respond_passes_mcp_instructions_and_saved_call_context_to_the_model(monkeypatch, tmp_path):
     monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)

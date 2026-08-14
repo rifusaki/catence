@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import type { CatencePaths } from '../../contracts/runtime.js';
 import { buildRetrievalIndex } from '../../core/retrieval/index.js';
 import { defaultFromDate, ensurePaths, requireIntervalsConfig } from '../../core/runtime/configuration.js';
+import { athleteProviderEnvironment } from '../../core/runtime/secrets.js';
 import { importJsonl } from '../ingestion/importer.js';
 import { IntervalsExtractor } from '../ingestion/providers/intervals.js';
 import { completeStravaAuthorization, disconnectStrava, getStravaAuthorizationUrl, syncStravaGear } from '../ingestion/providers/strava/service.js';
@@ -66,7 +67,8 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
   let extractionStarted = false;
   try {
     if (provider === 'intervals') {
-      const config = requireIntervalsConfig();
+      const environment = await athleteProviderEnvironment(paths);
+      const config = requireIntervalsConfig(environment);
       extractionStarted = true;
       await new IntervalsExtractor(database, paths, config.apiKey, config.athleteId).sync(runId, activityWindow, !options.backfill || options.refreshActivities);
     } else {
@@ -86,7 +88,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       if (options.backfill && !options.refreshActivities) arguments_.push('--historical-only');
       await execFileAsync('uv', arguments_, {
         cwd: packageRoot(),
-        env: { ...process.env, UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT ?? path.join(paths.root, 'python-venv') },
+        env: { ...(await athleteProviderEnvironment(paths)), UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT ?? path.join(paths.root, 'python-venv') },
       });
       if (!existsSync(output)) throw new Error('Garmin staging worker completed without writing a JSONL manifest.');
       await importJsonl(database, runId, output);

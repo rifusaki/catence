@@ -134,11 +134,14 @@ def test_resumed_chat_falls_back_when_its_saved_model_was_removed(tmp_path, monk
     from catence_console import app
 
     monkeypatch.setattr(app.cl.user_session, "get", lambda key: "removed:model" if key == "catence_model" else None)
-    profile_id, model_id, reasoning_effort, tool_rounds, tool_result_characters = _session_settings(configuration)
+    profile_id, model_id, reasoning_effort, tool_rounds, tool_result_characters, athlete_id = _session_settings(
+        configuration, "athlete-a", {"athlete-a"}
+    )
 
     assert (profile_id, model_id, reasoning_effort) == ("openai", "default", None)
     assert tool_rounds == configuration.limits.tool_rounds
     assert tool_result_characters == configuration.limits.tool_result_characters
+    assert athlete_id == "athlete-a"
 
 
 def test_persistent_preferences_are_normalized_and_settings_expose_configured_reset_values(tmp_path):
@@ -166,14 +169,17 @@ def test_persistent_preferences_are_normalized_and_settings_expose_configured_re
         tool_result_characters=48_000,
     )
 
-    normalized = _normalized_preferences(configuration, saved)
+    normalized = _normalized_preferences(configuration, saved, "athlete-a", {"athlete-a"})
 
-    assert normalized == saved
-    assert _configured_preferences(configuration) == SavedConsolePreferences(
+    assert normalized == SavedConsolePreferences(
+        model_choice="azure:luna", reasoning_effort="high", tool_rounds=12, tool_result_characters=48_000, athlete_id="athlete-a"
+    )
+    assert _configured_preferences(configuration, "athlete-a") == SavedConsolePreferences(
         model_choice="azure:terra",
         reasoning_effort="default",
         tool_rounds=8,
         tool_result_characters=24_000,
+        athlete_id="athlete-a",
     )
     settings = _chat_settings(
         configuration,
@@ -181,6 +187,9 @@ def test_persistent_preferences_are_normalized_and_settings_expose_configured_re
         reasoning_effort=normalized.reasoning_effort,
         tool_rounds=normalized.tool_rounds,
         tool_result_characters=normalized.tool_result_characters,
+        athlete_id="athlete-a",
+        athletes={"Athlete A": "athlete-a"},
+        default_athlete_id="athlete-a",
     )
     values = {input["id"]: input for input in settings._inputs_as_dicts()}
     assert values["model"]["initial"] == "azure:luna"
@@ -214,6 +223,7 @@ def test_confirming_custom_settings_persists_them_and_confirming_reset_clears_th
     monkeypatch.setattr(app, "DATA_DIRECTORY", tmp_path)
     monkeypatch.setattr(app.cl.user_session, "get", lambda key, default=None: session.get(key, default))
     monkeypatch.setattr(app.cl.user_session, "set", lambda key, value: session.__setitem__(key, value))
+    monkeypatch.setattr(app, "_athlete_roster", lambda: ("athlete-a", {"Athlete A": "athlete-a"}))
 
     class FakeMessage:
         def __init__(self, **_kwargs):
@@ -240,6 +250,7 @@ def test_confirming_custom_settings_persists_them_and_confirming_reset_clears_th
         reasoning_effort="high",
         tool_rounds=12,
         tool_result_characters=48_000,
+        athlete_id="athlete-a",
     )
 
     asyncio.run(

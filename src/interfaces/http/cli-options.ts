@@ -1,5 +1,5 @@
 export type ServeCliOptions = {
-  dataDir?: string;
+  home?: string;
   host: string;
   port: number;
   allowedOrigins: string[];
@@ -11,7 +11,7 @@ export const SERVE_USAGE = `Usage: catence serve [options]
 Run Catence as a local Streamable HTTP MCP server.
 
 Options:
-  --data-dir <directory>     Catence data directory. Overrides CATENCE_DATA_DIR.
+  --home <directory>         Catence catalog home. Defaults to CATENCE_HOME or ~/.catence.
   --host <host>              Listener host. Defaults to 127.0.0.1.
   --port <port>              Listener port. Defaults to 8787.
   --allow-origin <origin>    Browser origin allowed to call Catence APIs. May be repeated.
@@ -31,22 +31,22 @@ function parsePort(value: string): number {
 }
 
 export function parseServeCliOptions(arguments_: readonly string[]): ServeCliOptions {
-  let dataDir: string | undefined;
+  let home: string | undefined;
   let host = process.env.CATENCE_HTTP_HOST ?? '127.0.0.1';
   let port = process.env.CATENCE_HTTP_PORT ? parsePort(process.env.CATENCE_HTTP_PORT) : 8787;
   const allowedOrigins: string[] = [];
 
   for (let index = 0; index < arguments_.length; index++) {
     const argument = arguments_[index];
-    if (argument === '-h' || argument === '--help') return { dataDir, host, port, allowedOrigins, help: true };
-    if (argument === '--data-dir') {
-      dataDir = requiredValue(arguments_, index, '--data-dir');
+    if (argument === '-h' || argument === '--help') return { home, host, port, allowedOrigins, help: true };
+    if (argument === '--home') {
+      home = requiredValue(arguments_, index, '--home');
       index++;
       continue;
     }
-    if (argument.startsWith('--data-dir=')) {
-      dataDir = argument.slice('--data-dir='.length);
-      if (!dataDir) throw new Error('--data-dir requires a value.');
+    if (argument.startsWith('--home=')) {
+      home = argument.slice('--home='.length);
+      if (!home) throw new Error('--home requires a value.');
       continue;
     }
     if (argument === '--host') {
@@ -82,5 +82,5 @@ export function parseServeCliOptions(arguments_: readonly string[]): ServeCliOpt
     throw new Error(`Unknown option: ${argument}`);
   }
 
-  return { dataDir, host, port, allowedOrigins, help: false };
+  return { home, host, port, allowedOrigins, help: false };
 }

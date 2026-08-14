@@ -2,11 +2,13 @@ node_modules/
 dist/
 coverage/
 .env
+.env.beta
 .catence/
 .venv/
 console/.venv/
 console/.chainlit/
 .uv-cache/
+.cache/
 .npm-cache/
 .mcpb-stage/
 .pytest_cache/

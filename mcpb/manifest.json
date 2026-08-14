@@ -3,7 +3,7 @@
   "manifest_version": "0.3",
   "name": "catence-demo",
   "display_name": "Catence Demo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A safe, local Catence fitness-data demo for MCP clients.",
   "long_description": "Creates a clearly marked synthetic wellness and training store, then serves Catence's local MCP tools. The generated numbers are safe for evaluation and are never personal measurements. Install the npm package for live Garmin, Intervals.icu, and Strava synchronization.",
   "author": {
@@ -25,8 +25,8 @@
       "args": [
         "${__dirname}/dist/interfaces/mcp/main.js",
         "demo",
-        "--data-dir",
-        "${user_config.data_dir}"
+        "--home",
+        "${user_config.home}"
       ]
     }
   },
@@ -34,10 +34,10 @@
   "keywords": ["mcp", "fitness", "garmin", "wellness", "training", "demo", "local-first"],
   "license": "AGPL-3.0-or-later",
   "user_config": {
-    "data_dir": {
+    "home": {
       "type": "directory",
       "title": "Demo data directory",
-      "description": "Where Catence stores its generated demo data. This command refuses to replace a real Catence data directory.",
+      "description": "Where Catence stores its generated demo catalog. This command refuses to replace a real athlete store.",
       "default": "${HOME}/.catence-demo",
       "required": false
     }

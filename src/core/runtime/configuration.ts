@@ -31,10 +31,10 @@ export function defaultFromDate(now = new Date()): string {
   return date.toISOString().slice(0, 10);
 }
 
-export function requireIntervalsConfig(): { apiKey: string; athleteId: string } {
-  const apiKey = process.env.INTERVALS_API_KEY;
+export function requireIntervalsConfig(environment: NodeJS.ProcessEnv = process.env): { apiKey: string; athleteId: string } {
+  const apiKey = environment.INTERVALS_API_KEY;
   if (!apiKey) throw new Error('INTERVALS_API_KEY is required for an Intervals sync.');
-  return { apiKey, athleteId: process.env.INTERVALS_ATHLETE_ID ?? '0' };
+  return { apiKey, athleteId: environment.INTERVALS_ATHLETE_ID ?? '0' };
 }
 
 const rateLimitSchema = z.object({ requests: z.number().int().positive(), windowSeconds: z.number().int().positive() }).strict();

@@ -10,6 +10,19 @@ export type { CatencePaths } from '../contracts/runtime.js';
 export { CATENCE_PROTOCOL_VERSION, CATENCE_RUNTIME_VERSION, catenceRuntimeHealth } from '../contracts/release.js';
 
 export { configuredMcpRateLimit, loadCatenceConfig, resolvePaths } from '../core/runtime/configuration.js';
+export {
+  addAthlete,
+  athleteStorePaths,
+  defaultAthlete,
+  defaultCatalogHome,
+  initializeCatalog,
+  loadCatalog,
+  resolveAthlete,
+  resolveCatalogPaths,
+} from '../core/runtime/catalog.js';
+export type { Athlete, CatalogPaths, CatenceCatalog } from '../core/runtime/catalog.js';
+export { athleteProviderEnvironment, providerSecretPath, readAthleteSecrets, setAthleteSecret } from '../core/runtime/secrets.js';
+export type { AthleteSecrets, SecretProvider } from '../core/runtime/secrets.js';
 export { SlidingWindowLimiter } from '../core/runtime/limiter.js';
 export { DashboardSnapshotService } from '../core/dashboard/snapshot.js';
 export { searchContext } from '../core/retrieval/index.js';

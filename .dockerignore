@@ -1,0 +1,14 @@
+.git
+node_modules
+dist
+.catence
+.cache
+.env
+.env.beta
+coverage
+console/.venv
+console/.cache
+console/.pytest_cache
+console/dist
+**/__pycache__
+**/.DS_Store

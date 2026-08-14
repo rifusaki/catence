@@ -3,14 +3,14 @@ import { parseServeCliOptions, SERVE_USAGE } from '../src/interfaces/http/cli-op
 
 describe('parseServeCliOptions', () => {
   it('uses local-only defaults', () => {
-    expect(parseServeCliOptions([])).toEqual({ dataDir: undefined, host: '127.0.0.1', port: 8787, allowedOrigins: [], help: false });
+    expect(parseServeCliOptions([])).toEqual({ home: undefined, host: '127.0.0.1', port: 8787, allowedOrigins: [], help: false });
   });
 
   it('accepts server and browser options', () => {
     expect(parseServeCliOptions([
-      '--data-dir', '/tmp/catence', '--host=0.0.0.0', '--port', '9000', '--allow-origin', 'http://127.0.0.1:8000', '--allow-origin=http://localhost:8000',
+      '--home', '/tmp/catence', '--host=0.0.0.0', '--port', '9000', '--allow-origin', 'http://127.0.0.1:8000', '--allow-origin=http://localhost:8000',
     ])).toEqual({
-      dataDir: '/tmp/catence', host: '0.0.0.0', port: 9000, allowedOrigins: ['http://127.0.0.1:8000', 'http://localhost:8000'], help: false,
+      home: '/tmp/catence', host: '0.0.0.0', port: 9000, allowedOrigins: ['http://127.0.0.1:8000', 'http://localhost:8000'], help: false,
     });
   });
 

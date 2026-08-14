@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import type { CatencePaths } from '../../../../contracts/runtime.js';
 import { ensurePaths, loadCatenceConfig } from '../../../../core/runtime/configuration.js';
+import { athleteProviderEnvironment } from '../../../../core/runtime/secrets.js';
 import { CatenceDatabase, openReadOnlyRepository } from '../../../storage/database.js';
 import { importJsonl } from '../../importer.js';
 import { withDataWriteLock } from '../../../storage/write-lock.js';
@@ -71,7 +72,7 @@ async function invokeWorker(paths: CatencePaths, args: string[], resultPath: str
   try {
     await execFileAsync('uv', ['run', 'python', '-m', 'python.catence.providers.strava.cli', ...args, '--data-dir', paths.root, '--result', resultPath], {
       cwd: packageRoot(),
-      env: { ...process.env, UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT ?? path.join(paths.root, 'python-venv') },
+      env: { ...(await athleteProviderEnvironment(paths)), UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT ?? path.join(paths.root, 'python-venv') },
     });
   } catch (error) {
     if (!existsSync(resultPath)) {
