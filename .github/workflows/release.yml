@@ -1,5 +1,9 @@
 name: Release
 
+# Single workflow for both stable (`vX.Y.Z`) and beta (`vX.Y.Z-beta.N`) tags.
+# npm trusted publishing allows only ONE configuration per package, pinned to
+# the workflow filename, so both channels must publish through this one file.
+
 on:
   push:
     tags: ['v*']
@@ -9,8 +13,28 @@ permissions:
   id-token: write
 
 jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      blocked: ${{ steps.check.outputs.blocked }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require beta tags to be on beta
+        id: check
+        run: |
+          blocked=false
+          if echo "$GITHUB_REF_NAME" | grep -q -- '-beta.'; then
+            if ! git branch -r --contains "$GITHUB_SHA" | grep -q 'origin/beta'; then
+              blocked=true
+            fi
+          fi
+          echo "blocked=$blocked" >> "$GITHUB_OUTPUT"
+
   verify:
-    if: ${{ !contains(github.ref_name, '-beta.') }}
+    needs: guard
+    if: ${{ needs.guard.outputs.blocked != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,8 +52,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install --disable-pip-version-check apm-cli
-      - run: mkdir -p /tmp/catence-apm-consumer && apm install --root /tmp/catence-apm-consumer --target codex --dry-run
+      - name: Verify stable APM consumer install
+        if: ${{ !contains(github.ref_name, '-beta.') }}
+        run: |
+          python -m pip install --disable-pip-version-check apm-cli
+          mkdir -p /tmp/catence-apm-consumer
+          apm install --root /tmp/catence-apm-consumer --target codex --dry-run
+      - name: Set up uv for beta Console verification
+        if: ${{ contains(github.ref_name, '-beta.') }}
+        uses: astral-sh/setup-uv@v6
+      - name: Run Console tests
+        if: ${{ contains(github.ref_name, '-beta.') }}
+        run: uv run --frozen --project console --group dev python -m pytest console/tests -q
+      - name: Build Console wheel
+        if: ${{ contains(github.ref_name, '-beta.') }}
+        run: uv build console --wheel
 
   mcpb:
     needs: verify
@@ -64,7 +101,7 @@ jobs:
         with:
           node-version: 22
       - uses: astral-sh/setup-uv@v6
-      - name: Verify the matching Catence Chainlit wheel exists
+      - name: Verify the matching Catence Chainlit wheel is published
         run: |
           version=$(node -p "require('./release/manifest.json').chainlitVersion")
           uv pip install --system "catence-chainlit==$version"
@@ -78,7 +115,7 @@ jobs:
   publish:
     needs: [verify, mcpb, console]
     runs-on: ubuntu-latest
-    environment: release
+    environment: ${{ contains(github.ref_name, '-beta.') && 'beta' || 'release' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -100,12 +137,12 @@ jobs:
       - run: npm install --global npm@^11.5.1
       - run: npm ci
       - run: npm run release:check
-      - run: npm publish --access public --provenance --tag latest
+      - run: npm publish --access public --provenance --tag ${{ contains(github.ref_name, '-beta.') && 'beta' || 'latest' }}
 
   publish-console:
     needs: [publish, console]
     runs-on: ubuntu-latest
-    environment: pypi
+    environment: ${{ contains(github.ref_name, '-beta.') && 'beta' || 'pypi' }}
     permissions:
       id-token: write
     steps:
@@ -124,6 +161,13 @@ jobs:
           pattern: mcpb-*
           path: dist/mcpb
           merge-multiple: true
-      - run: gh release create "$GITHUB_REF_NAME" dist/mcpb/*.mcpb --repo "$GITHUB_REPOSITORY" --generate-notes
+      - name: Create stable GitHub release
+        if: ${{ !contains(github.ref_name, '-beta.') }}
+        run: gh release create "$GITHUB_REF_NAME" dist/mcpb/*.mcpb --repo "$GITHUB_REPOSITORY" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Create beta GitHub prerelease
+        if: ${{ contains(github.ref_name, '-beta.') }}
+        run: gh release create "$GITHUB_REF_NAME" dist/mcpb/*.mcpb --repo "$GITHUB_REPOSITORY" --generate-notes --prerelease
         env:
           GH_TOKEN: ${{ github.token }}
