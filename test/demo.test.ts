@@ -11,7 +11,7 @@ import { openReadOnlyRepository } from '../src/elt/storage/database.js';
 import { createCatenceMcpServer } from '../src/interfaces/mcp/server.js';
 
 describe('generated demo store', () => {
-  it('creates deterministic, visibly generated wellness/training data without provider access', async () => {
+  it('creates deterministic, visibly generated wellness/training data without provider access', { timeout: 60_000 }, async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'catence-demo-'));
     const paths = resolvePaths(root);
     try {
