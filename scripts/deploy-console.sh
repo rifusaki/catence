@@ -274,18 +274,20 @@ ARG CATENCE_NPM_VERSION
 ARG CATENCE_CONSOLE_VERSION
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_LINK_MODE=copy \
+    UV_PYTHON_INSTALL_DIR=/usr/local/uv/python \
     CATENCE_HOME=/data
 
 RUN test -n "$CATENCE_NPM_VERSION" \
     && test -n "$CATENCE_CONSOLE_VERSION" \
     && apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-venv curl ca-certificates \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && curl -LsSf https://astral.sh/uv/install.sh | sh \
     && install -m 755 /root/.local/bin/uv /usr/local/bin/uv
 
 RUN npm install --global "catence@${CATENCE_NPM_VERSION}" \
-    && uv venv /opt/catence-console \
+    && uv python install 3.12 \
+    && uv venv /opt/catence-console --python 3.12 \
     && uv pip install --python /opt/catence-console/bin/python "catence-console==${CATENCE_CONSOLE_VERSION}"
 
 RUN useradd --create-home --uid 10001 catence \
