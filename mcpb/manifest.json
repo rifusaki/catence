@@ -3,7 +3,7 @@
   "manifest_version": "0.3",
   "name": "catence-demo",
   "display_name": "Catence Demo",
-  "version": "0.2.0-beta.1",
+  "version": "0.2.0-beta.2",
   "description": "A safe, local Catence fitness-data demo for MCP clients.",
   "long_description": "Creates a clearly marked synthetic wellness and training store, then serves Catence's local MCP tools. The generated numbers are safe for evaluation and are never personal measurements. Install the npm package for live Garmin, Intervals.icu, and Strava synchronization.",
   "author": {
