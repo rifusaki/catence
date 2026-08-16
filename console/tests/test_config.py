@@ -17,25 +17,25 @@ def test_loads_named_profiles_without_storing_values(tmp_path, monkeypatch):
     write_config(
         tmp_path,
         {
-            "defaultProfile": "azure",
+            "defaultProfile": "openai-compatible",
             "profiles": {
-                "azure": {
-                    "label": "Azure Foundry",
-                    "model": "azure_ai/catence",
-                    "apiKeyEnv": "AZURE_API_KEY",
-                    "apiBaseEnv": "AZURE_API_BASE",
+                "openai-compatible": {
+                    "label": "OpenAI-compatible",
+                    "model": "openai/catence",
+                    "apiKeyEnv": "OPENAI_API_KEY",
+                    "apiBaseEnv": "OPENAI_API_BASE",
                 }
             },
         },
     )
-    monkeypatch.setenv("AZURE_API_KEY", "not-printed")
-    monkeypatch.setenv("AZURE_API_BASE", "https://example.test")
+    monkeypatch.setenv("OPENAI_API_KEY", "not-printed")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://example.test")
 
     configuration = load_console_configuration(tmp_path)
 
-    assert configuration.default_profile == "azure"
-    assert configuration.profile("azure").litellm_options() == {
-        "model": "azure_ai/catence",
+    assert configuration.default_profile == "openai-compatible"
+    assert configuration.profile("openai-compatible").litellm_options() == {
+        "model": "openai/catence",
         "api_key": "not-printed",
         "api_base": "https://example.test",
     }
@@ -69,12 +69,12 @@ def test_loads_multiple_models_and_a_default_reasoning_effort(tmp_path):
     write_config(
         tmp_path,
         {
-            "defaultProfile": "azure",
+            "defaultProfile": "openai-compatible",
             "profiles": {
-                "azure": {
+                "openai-compatible": {
                     "models": {
-                        "terra": {"model": "azure/gpt-5.6-terra"},
-                        "luna": {"label": "Luna", "model": "azure/gpt-5.6-luna"},
+                        "terra": {"model": "openai/gpt-5.6-terra"},
+                        "luna": {"label": "Luna", "model": "openai/gpt-5.6-luna"},
                     },
                     "defaultModel": "luna",
                     "defaultReasoningEffort": "high",
@@ -85,13 +85,13 @@ def test_loads_multiple_models_and_a_default_reasoning_effort(tmp_path):
 
     configuration = load_console_configuration(tmp_path)
 
-    assert configuration.default_model_choice() == "azure:luna"
+    assert configuration.default_model_choice() == "openai-compatible:luna"
     assert configuration.model_choices() == {
-        "azure · terra": "azure:terra",
-        "azure · Luna": "azure:luna",
+        "openai-compatible · terra": "openai-compatible:terra",
+        "openai-compatible · Luna": "openai-compatible:luna",
     }
-    profile, model_id = configuration.selected_model("azure:terra")
-    assert profile.litellm_options(model_id) == {"model": "azure/gpt-5.6-terra"}
+    profile, model_id = configuration.selected_model("openai-compatible:terra")
+    assert profile.litellm_options(model_id) == {"model": "openai/gpt-5.6-terra"}
     assert profile.default_reasoning_effort == "high"
 
 
@@ -148,13 +148,13 @@ def test_persistent_preferences_are_normalized_and_settings_expose_configured_re
     write_config(
         tmp_path,
         {
-            "defaultProfile": "azure",
+            "defaultProfile": "openai-compatible",
             "limits": {"toolRounds": 8, "toolResultCharacters": 24_000},
             "profiles": {
-                "azure": {
+                "openai-compatible": {
                     "models": {
-                        "terra": {"model": "azure/gpt-5.6-terra"},
-                        "luna": {"model": "azure/gpt-5.6-luna"},
+                        "terra": {"model": "openai/gpt-5.6-terra"},
+                        "luna": {"model": "openai/gpt-5.6-luna"},
                     },
                     "defaultModel": "terra",
                 }
@@ -163,7 +163,7 @@ def test_persistent_preferences_are_normalized_and_settings_expose_configured_re
     )
     configuration = load_console_configuration(tmp_path)
     saved = SavedConsolePreferences(
-        model_choice="azure:luna",
+        model_choice="openai-compatible:luna",
         reasoning_effort="high",
         tool_rounds=12,
         tool_result_characters=48_000,
@@ -172,10 +172,10 @@ def test_persistent_preferences_are_normalized_and_settings_expose_configured_re
     normalized = _normalized_preferences(configuration, saved, "athlete-a", {"athlete-a"})
 
     assert normalized == SavedConsolePreferences(
-        model_choice="azure:luna", reasoning_effort="high", tool_rounds=12, tool_result_characters=48_000, athlete_id="athlete-a"
+        model_choice="openai-compatible:luna", reasoning_effort="high", tool_rounds=12, tool_result_characters=48_000, athlete_id="athlete-a"
     )
     assert _configured_preferences(configuration, "athlete-a") == SavedConsolePreferences(
-        model_choice="azure:terra",
+        model_choice="openai-compatible:terra",
         reasoning_effort="default",
         tool_rounds=8,
         tool_result_characters=24_000,
@@ -192,8 +192,8 @@ def test_persistent_preferences_are_normalized_and_settings_expose_configured_re
         default_athlete_id="athlete-a",
     )
     values = {input["id"]: input for input in settings._inputs_as_dicts()}
-    assert values["model"]["initial"] == "azure:luna"
-    assert values["model"]["resetValue"] == "azure:terra"
+    assert values["model"]["initial"] == "openai-compatible:luna"
+    assert values["model"]["resetValue"] == "openai-compatible:terra"
     assert values["reasoningEffort"]["initial"] == "high"
     assert values["reasoningEffort"]["resetValue"] == "default"
     assert values["toolRounds"]["resetValue"] == 8
@@ -204,13 +204,13 @@ def test_confirming_custom_settings_persists_them_and_confirming_reset_clears_th
     write_config(
         tmp_path,
         {
-            "defaultProfile": "azure",
+            "defaultProfile": "openai-compatible",
             "limits": {"toolRounds": 8, "toolResultCharacters": 24_000},
             "profiles": {
-                "azure": {
+                "openai-compatible": {
                     "models": {
-                        "terra": {"model": "azure/gpt-5.6-terra"},
-                        "luna": {"model": "azure/gpt-5.6-luna"},
+                        "terra": {"model": "openai/gpt-5.6-terra"},
+                        "luna": {"model": "openai/gpt-5.6-luna"},
                     },
                     "defaultModel": "terra",
                 }
@@ -237,7 +237,7 @@ def test_confirming_custom_settings_persists_them_and_confirming_reset_clears_th
     asyncio.run(
         app.update_settings(
             {
-                "model": "azure:luna",
+                "model": "openai-compatible:luna",
                 "reasoningEffort": "high",
                 "toolRounds": 12,
                 "toolResultCharacters": 48_000,
@@ -246,7 +246,7 @@ def test_confirming_custom_settings_persists_them_and_confirming_reset_clears_th
     )
     store = app.console_preferences_store(tmp_path)
     assert store.load("athlete-a") == SavedConsolePreferences(
-        model_choice="azure:luna",
+        model_choice="openai-compatible:luna",
         reasoning_effort="high",
         tool_rounds=12,
         tool_result_characters=48_000,
@@ -256,7 +256,7 @@ def test_confirming_custom_settings_persists_them_and_confirming_reset_clears_th
     asyncio.run(
         app.update_settings(
             {
-                "model": "azure:terra",
+                "model": "openai-compatible:terra",
                 "reasoningEffort": "default",
                 "toolRounds": 8,
                 "toolResultCharacters": 24_000,

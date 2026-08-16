@@ -103,7 +103,7 @@ def test_tool_call_store_keeps_thread_scoped_calls_and_deletes_them_with_the_thr
 def test_console_preferences_are_user_scoped_and_removable(tmp_path):
     store = console_preferences_store(tmp_path)
     preferences = SavedConsolePreferences(
-        model_choice="azure:terra",
+        model_choice="openai-compatible:terra",
         reasoning_effort="high",
         tool_rounds=12,
         tool_result_characters=48_000,

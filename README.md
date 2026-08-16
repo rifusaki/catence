@@ -153,7 +153,7 @@ export OPENAI_API_KEY='…'
 uvx catence-console@0.2.0 serve
 ```
 
-On the first authenticated visit, the Console wizard asks for an Azure, OpenAI, or Anthropic model and writes only the non-secret model configuration to `~/.catence/config.json`. Model-provider keys remain process environment variables. The Console settings include an athlete selector; the server overwrites model-supplied athlete scope with that selected value on every personal-data call.
+On the first authenticated visit, the Console wizard asks for an OpenAI-compatible, OpenAI, or Anthropic model and writes only the non-secret model configuration to `~/.catence/config.json`. The `openai-compatible` option covers Azure and Opencode; see [`docs/llm-providers.md`](docs/llm-providers.md). Model-provider keys remain process environment variables. The Console settings include an athlete selector; the server overwrites model-supplied athlete scope with that selected value on every personal-data call.
 
 To preflight the Console and a running runtime:
 

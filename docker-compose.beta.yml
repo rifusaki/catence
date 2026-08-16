@@ -18,10 +18,8 @@ services:
       CATENCE_CONSOLE_PASSWORD_HASH: ${CATENCE_CONSOLE_PASSWORD_HASH:?Set a bcrypt password hash}
       CHAINLIT_AUTH_SECRET: ${CHAINLIT_AUTH_SECRET:?Set a long random signing secret}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      AZURE_API_KEY: ${AZURE_API_KEY:-}
-      AZURE_API_BASE: ${AZURE_API_BASE:-}
-      AZURE_API_VERSION: ${AZURE_API_VERSION:-preview}
     volumes:
       - catence-beta-data:/data
 

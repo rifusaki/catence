@@ -1,0 +1,237 @@
+# Console LLM providers
+
+Catence Console talks to a model through [LiteLLM](https://docs.litellm.ai/).
+There are exactly three provider shapes: **OpenAI**, **Anthropic**, and a
+generic **OpenAI-compatible** profile. Azure and Opencode are not special cases
+in the code: both are reached through the OpenAI-compatible profile, and the
+steps for each are documented below.
+
+## How configuration is split
+
+Catence never stores a credential value in `config.json`. A Console profile
+records only a LiteLLM model name and the *names* of the environment variables
+that hold the key, base URL, and (optionally) API version. The values
+themselves stay in the Console process environment.
+
+```jsonc
+// ~/.catence/config.json (or /data/config.json inside the Docker image)
+{
+  "console": {
+    "defaultProfile": "openai",
+    "profiles": {
+      "openai": {
+        "label": "OpenAI",
+        "model": "openai/gpt-5-mini",
+        "apiKeyEnv": "OPENAI_API_KEY"
+      },
+      "anthropic": {
+        "label": "Anthropic",
+        "model": "anthropic/claude-sonnet-4-5",
+        "apiKeyEnv": "ANTHROPIC_API_KEY"
+      },
+      "openai-compatible": {
+        "label": "OpenAI-compatible",
+        "model": "openai/your-model-name",
+        "apiKeyEnv": "OPENAI_API_KEY",
+        "apiBaseEnv": "OPENAI_API_BASE"
+      }
+    }
+  }
+}
+```
+
+The supported profile fields are `label`, `model` (or `models` + `defaultModel`
+for multiple deployments), `defaultReasoningEffort`, `apiKeyEnv`, `apiBaseEnv`,
+and `apiVersionEnv`. Every `*Env` value must be an uppercase environment
+variable name; a raw secret there is rejected.
+
+| Profile field | Environment variable it reads |
+| --- | --- |
+| `apiKeyEnv` | API key |
+| `apiBaseEnv` | Base URL (OpenAI-compatible endpoints) |
+| `apiVersionEnv` | Optional API version, only for endpoints that require one |
+
+## OpenAI
+
+Point the profile at the public OpenAI API. Only a key is required.
+
+```sh
+export OPENAI_API_KEY='sk-…'
+```
+
+```jsonc
+{
+  "console": {
+    "defaultProfile": "openai",
+    "profiles": {
+      "openai": {
+        "label": "OpenAI",
+        "model": "openai/gpt-5-mini",
+        "apiKeyEnv": "OPENAI_API_KEY"
+      }
+    }
+  }
+}
+```
+
+## Anthropic
+
+Only a key is required.
+
+```sh
+export ANTHROPIC_API_KEY='sk-ant-…'
+```
+
+```jsonc
+{
+  "console": {
+    "defaultProfile": "anthropic",
+    "profiles": {
+      "anthropic": {
+        "label": "Anthropic",
+        "model": "anthropic/claude-sonnet-4-5",
+        "apiKeyEnv": "ANTHROPIC_API_KEY"
+      }
+    }
+  }
+}
+```
+
+## OpenAI-compatible
+
+Use this one profile for any endpoint that speaks the OpenAI Chat Completions
+API: Azure, Opencode, Ollama, LM Studio, a LiteLLM proxy, and so on. Set the
+key and the base URL; the model name is whatever the endpoint expects.
+
+```sh
+export OPENAI_API_KEY='…'
+export OPENAI_API_BASE='https://host.example/v1'
+```
+
+```jsonc
+{
+  "console": {
+    "defaultProfile": "openai-compatible",
+    "profiles": {
+      "openai-compatible": {
+        "label": "OpenAI-compatible",
+        "model": "openai/your-model-name",
+        "apiKeyEnv": "OPENAI_API_KEY",
+        "apiBaseEnv": "OPENAI_API_BASE"
+      }
+    }
+  }
+}
+```
+
+LiteLLM appends `/chat/completions` to `OPENAI_API_BASE`, so point it at the
+`…/v1` root of the endpoint, not the full completions path.
+
+### Azure
+
+Azure OpenAI's unified v1 API is OpenAI-compatible, so it uses the same
+`openai-compatible` profile. Use the **Azure deployment name** as the model.
+
+```sh
+export OPENAI_API_KEY='your-azure-openai-api-key'
+export OPENAI_API_BASE='https://YOUR-RESOURCE-NAME.openai.azure.com/openai/v1/'
+```
+
+```jsonc
+{
+  "console": {
+    "defaultProfile": "openai-compatible",
+    "profiles": {
+      "openai-compatible": {
+        "label": "Azure OpenAI",
+        "model": "openai/gpt-4.1-nano",   // your deployment name
+        "apiKeyEnv": "OPENAI_API_KEY",
+        "apiBaseEnv": "OPENAI_API_BASE"
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- `OPENAI_API_BASE` also accepts the Foundry models form
+  `https://YOUR-RESOURCE-NAME.services.ai.azure.com/openai/v1/`.
+- With the v1 API the `api-version` query parameter is no longer required, so
+  `apiVersionEnv` stays unset. If an older endpoint still needs one, add
+  `"apiVersionEnv": "OPENAI_API_VERSION"` and export
+  `OPENAI_API_VERSION='2024-06-01'` (or your API version).
+- `OPENAI_API_KEY` holds the Azure OpenAI API key. If you use Microsoft Entra
+  ID instead, a keyless token provider can be passed in the same variable.
+
+### Opencode
+
+Opencode itself does not expose an OpenAI-compatible server; its `serve` command
+publishes Opencode's own API. To reuse the providers you already configured in
+Opencode, run an OpenAI-compatible gateway such as the
+[`opencode-llm-proxy`](https://github.com/KochC/opencode-llm-proxy) plugin, which
+serves Chat Completions at `http://127.0.0.1:4010/v1` and lists every configured
+model as `provider/model`.
+
+```sh
+export OPENAI_API_KEY='unused'           # or your OPENCODE_LLM_PROXY_TOKEN
+export OPENAI_API_BASE='http://127.0.0.1:4010/v1'
+```
+
+```jsonc
+{
+  "console": {
+    "defaultProfile": "openai-compatible",
+    "profiles": {
+      "openai-compatible": {
+        "label": "Opencode",
+        "model": "openai/github-copilot/claude-sonnet-4.6",  // provider/model
+        "apiKeyEnv": "OPENAI_API_KEY",
+        "apiBaseEnv": "OPENAI_API_BASE"
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- Use the fully qualified `provider/model` id from the gateway's
+  `GET /v1/models` listing.
+- If the gateway requires a bearer token, set `OPENAI_API_KEY` to the
+  `OPENCODE_LLM_PROXY_TOKEN`; otherwise any non-empty value satisfies the
+  profile's required-environment check.
+
+## Multiple deployments per provider
+
+A profile can list several models under one set of credentials; the Console
+settings then offer a per-deployment choice.
+
+```jsonc
+{
+  "console": {
+    "profiles": {
+      "openai-compatible": {
+        "label": "Azure OpenAI",
+        "defaultModel": "nano",
+        "models": {
+          "nano": { "label": "GPT-4.1 nano", "model": "openai/gpt-4.1-nano" },
+          "mini": { "label": "GPT-5 mini", "model": "openai/gpt-5-mini" }
+        },
+        "apiKeyEnv": "OPENAI_API_KEY",
+        "apiBaseEnv": "OPENAI_API_BASE"
+      }
+    }
+  }
+}
+```
+
+## Verifying a profile
+
+`catence-console doctor` reports, for each profile, which environment variables
+are still missing and whether the local Catence runtime is reachable. It never
+prints credential values.
+
+```sh
+catence-console doctor --home "$HOME/.catence" --mcp-url http://127.0.0.1:8787/mcp
+```

@@ -342,17 +342,20 @@ async def _setup_wizard() -> ConsoleConfiguration | None:
             "This wizard writes only provider and model names; API keys stay in your terminal environment."
         )
     ).send()
-    provider = await _ask_setup_question("Choose a provider: `azure`, `openai`, or `anthropic`.")
+    provider = await _ask_setup_question(
+        "Choose a provider: `openai-compatible`, `openai`, or `anthropic`. "
+        "Use `openai-compatible` for any OpenAI-compatible endpoint such as Azure or Opencode."
+    )
     if provider is None:
         return None
     provider = provider.lower()
     examples = {
-        "azure": "Azure deployment name, for example `gpt-5.6-terra`",
+        "openai-compatible": "OpenAI-compatible model or deployment name, for example `gpt-5-mini`",
         "openai": "OpenAI model name, for example `gpt-5-mini`",
         "anthropic": "Anthropic model name, for example `claude-sonnet-4-5`",
     }
     if provider not in examples:
-        await cl.Message(content="Setup paused: choose `azure`, `openai`, or `anthropic` and start a new chat to try again.").send()
+        await cl.Message(content="Setup paused: choose `openai-compatible`, `openai`, or `anthropic` and start a new chat to try again.").send()
         return None
     model = await _ask_setup_question(f"Enter the {examples[provider]}.")
     if model is None:
@@ -364,7 +367,7 @@ async def _setup_wizard() -> ConsoleConfiguration | None:
         return None
 
     environment = {
-        "azure": "Set `AZURE_API_KEY`, `AZURE_API_BASE`, and `AZURE_API_VERSION=preview`, then restart the Console.",
+        "openai-compatible": "Set `OPENAI_API_KEY` and `OPENAI_API_BASE`, then restart the Console. See docs/llm-providers.md for Azure and Opencode.",
         "openai": "Set `OPENAI_API_KEY`, then restart the Console.",
         "anthropic": "Set `ANTHROPIC_API_KEY`, then restart the Console.",
     }

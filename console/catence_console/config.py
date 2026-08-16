@@ -289,14 +289,12 @@ def write_provider_setup(data_directory: Path, provider: str, model: str) -> Con
     """Create a safe first Console profile without storing any credential values."""
 
     presets = {
-        "azure": {
-            "id": "azure-foundry",
-            "label": "Azure Foundry",
-            "model": f"azure_ai/{model}",
-            "apiKeyEnv": "AZURE_API_KEY",
-            "apiBaseEnv": "AZURE_API_BASE",
-            "apiVersionEnv": "AZURE_API_VERSION",
-            "defaultReasoningEffort": "medium",
+        "openai-compatible": {
+            "id": "openai-compatible",
+            "label": "OpenAI-compatible",
+            "model": f"openai/{model}",
+            "apiKeyEnv": "OPENAI_API_KEY",
+            "apiBaseEnv": "OPENAI_API_BASE",
         },
         "openai": {
             "id": "openai",
@@ -314,7 +312,7 @@ def write_provider_setup(data_directory: Path, provider: str, model: str) -> Con
     try:
         preset = presets[provider]
     except KeyError as error:
-        raise ConsoleConfigurationError("Choose Azure, OpenAI, or Anthropic.") from error
+        raise ConsoleConfigurationError("Choose openai-compatible, openai, or anthropic.") from error
     if not model.strip():
         raise ConsoleConfigurationError("A model or deployment name is required.")
 

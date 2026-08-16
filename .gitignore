@@ -18,6 +18,7 @@ __pycache__/
 .DS_Store
 # CocoIndex Code (ccc)
 /.cocoindex_code/
-docs/
+docs/*
 !docs/architecture.md
 !docs/mcp-activity-retrieval.md
+!docs/llm-providers.md
