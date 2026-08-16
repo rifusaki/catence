@@ -14,12 +14,15 @@
 # Examples:
 #   ./deploy-console.sh                       # latest stable
 #   ./deploy-console.sh beta                  # latest beta
+#   ./deploy-console.sh beta --generate-secrets  # prompt for a password hash
 #   ./deploy-console.sh --port 8080 --bind 0.0.0.0
 #   ./deploy-console.sh --home /mnt/d/catence-data --no-build
 #
-# Required on first run: CATENCE_CONSOLE_PASSWORD_HASH, CATENCE_CONSOLE_USERNAME,
-# CHAINLIT_AUTH_SECRET, and one model-provider key. The script prompts for a
-# password and generates the bcrypt hash + signing secret when they are missing.
+# The script writes the complete scaffold (Dockerfile, docker-compose.yml, and a
+# .env with placeholders) and builds the image without needing any secrets. Add
+# the Console password hash and one model-provider key to .env afterwards, then
+# run `docker compose up -d` or re-run this script. Pass --generate-secrets to
+# be prompted for the password and have the hash written for you.
 
 set -euo pipefail
 
@@ -30,7 +33,7 @@ CHANNEL="${CATENCE_CHANNEL:-stable}"            # stable | beta
 PORT="${CATENCE_CONSOLE_PORT:-8000}"
 BIND="${CATENCE_BIND_ADDRESS:-127.0.0.1}"
 DEPLOY_DIR="${CATENCE_DEPLOY_DIR:-catence-deploy}"
-USERNAME="${CATENCE_CONSOLE_USERNAME:-coach}"
+USERNAME="${CATENCE_CONSOLE_USERNAME:-}"
 NPM_VERSION="${CATENCE_NPM_VERSION:-}"           # optional pin
 CONSOLE_VERSION="${CATENCE_CONSOLE_VERSION:-}"   # optional pin
 PASSWORD_HASH="${CATENCE_CONSOLE_PASSWORD_HASH:-}"
@@ -39,7 +42,7 @@ DATA_HOME="${CATENCE_DATA_HOME:-}"               # optional bind-mount host path
 DATA_VOLUME="${CATENCE_DATA_VOLUME:-}"           # optional named-volume override
 SKIP_BUILD="${CATENCE_SKIP_BUILD:-0}"
 PULL="${CATENCE_PULL:-1}"
-NO_SECRETS="${CATENCE_NO_SECRETS:-0}"
+GENERATE_SECRETS="${CATENCE_GENERATE_SECRETS:-0}"
 DRY_RUN="${CATENCE_DRY_RUN:-0}"
 ENV_FILE="${CATENCE_ENV_FILE:-}"                 # optional existing env to source
 
@@ -48,12 +51,40 @@ info() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 
 usage() {
-  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+  if [ -f "$0" ] && [ -r "$0" ]; then
+    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+  else
+    cat <<'EOF'
+Usage: curl -fsSL <raw-url> | bash -s [stable|beta] [options]
+
+  stable|beta           channel (default: stable)
+  --generate-secrets    prompt for a Console password and write its bcrypt hash
+  --port N              host port to publish (default: 8000)
+  --bind ADDR           bind address (default: 127.0.0.1)
+  --dir DIR             deployment directory (default: ./catence-deploy)
+  --home DIR            bind-mount DIR as the Catence data volume
+  --volume NAME         named volume for Catence data (default: catence[-channel]-data)
+  --username NAME       Console login name (default: coach)
+  --password-hash HASH  provide a bcrypt hash instead of generating one
+  --auth-secret SECRET  provide a Chainlit signing secret
+  --npm-version V       pin the npm catence version
+  --console-version V   pin the catence-console version
+  --env-file FILE       source an existing environment file first
+  --no-build            reuse the existing image
+  --no-pull             skip --pull on build
+  --dry-run             write the scaffold without building
+  -h, --help            show this help
+EOF
+  fi
   exit 0
 }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required. $2"
+}
+
+dotenv_get() { # key file -> literal value (no shell expansion of `$`)
+  grep -E "^$1=" "$2" 2>/dev/null | tail -n1 | cut -d= -f2- || true
 }
 
 # ---------------------------------------------------------------------------
@@ -76,7 +107,7 @@ while [ "$#" -gt 0 ]; do
     --env-file)   shift; ENV_FILE="$1" ;;
     --no-build)   SKIP_BUILD=1 ;;
     --no-pull)    PULL=0 ;;
-    --no-secrets) NO_SECRETS=1 ;;
+    --generate-secrets) GENERATE_SECRETS=1 ;;
     --dry-run)    DRY_RUN=1 ;;
     -h|--help)    usage ;;
     *) die "unknown argument: $1" ;;
@@ -109,7 +140,7 @@ else JSON_PY=""; fi
 if command -v node >/dev/null 2>&1; then JSON_NODE=node; else JSON_NODE=""; fi
 
 # ---------------------------------------------------------------------------
-# Load an optional existing environment file (provider keys, pre-set secrets)
+# Load optional environment values (provider keys, pre-set secrets)
 # ---------------------------------------------------------------------------
 if [ -n "$ENV_FILE" ]; then
   [ -f "$ENV_FILE" ] || die "--env-file '$ENV_FILE' not found"
@@ -117,10 +148,25 @@ if [ -n "$ENV_FILE" ]; then
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
-  USERNAME="${CATENCE_CONSOLE_USERNAME:-$USERNAME}"
-  PASSWORD_HASH="${CATENCE_CONSOLE_PASSWORD_HASH:-$PASSWORD_HASH}"
-  AUTH_SECRET="${CHAINLIT_AUTH_SECRET:-$AUTH_SECRET}"
 fi
+
+# Merge sourced/flag values, then preserve anything a user already saved in the
+# deploy directory's .env. The .env is read literally (never `source`d) so a
+# bcrypt hash's `$` characters are not expanded.
+USERNAME="${USERNAME:-${CATENCE_CONSOLE_USERNAME:-}}"
+PASSWORD_HASH="${PASSWORD_HASH:-${CATENCE_CONSOLE_PASSWORD_HASH:-}}"
+AUTH_SECRET="${AUTH_SECRET:-${CHAINLIT_AUTH_SECRET:-}}"
+
+if [ -f "$DEPLOY_DIR/.env" ]; then
+  [ -n "$USERNAME" ]          || USERNAME="$(dotenv_get CATENCE_CONSOLE_USERNAME "$DEPLOY_DIR/.env")"
+  [ -n "$PASSWORD_HASH" ]      || PASSWORD_HASH="$(dotenv_get CATENCE_CONSOLE_PASSWORD_HASH "$DEPLOY_DIR/.env")"
+  [ -n "$AUTH_SECRET" ]        || AUTH_SECRET="$(dotenv_get CHAINLIT_AUTH_SECRET "$DEPLOY_DIR/.env")"
+  [ -n "${OPENAI_API_KEY:-}" ]    || OPENAI_API_KEY="$(dotenv_get OPENAI_API_KEY "$DEPLOY_DIR/.env")"
+  [ -n "${OPENAI_API_BASE:-}" ]   || OPENAI_API_BASE="$(dotenv_get OPENAI_API_BASE "$DEPLOY_DIR/.env")"
+  [ -n "${ANTHROPIC_API_KEY:-}" ] || ANTHROPIC_API_KEY="$(dotenv_get ANTHROPIC_API_KEY "$DEPLOY_DIR/.env")"
+fi
+
+USERNAME="${USERNAME:-coach}"
 
 # ---------------------------------------------------------------------------
 # Registry JSON helpers
@@ -285,9 +331,9 @@ services:
       - "${BIND}:${PORT}:8000"
     environment:
       CATENCE_HOME: /data
-      CATENCE_CONSOLE_USERNAME: "\${CATENCE_CONSOLE_USERNAME:?set CATENCE_CONSOLE_USERNAME in .env}"
-      CATENCE_CONSOLE_PASSWORD_HASH: "\${CATENCE_CONSOLE_PASSWORD_HASH:?set CATENCE_CONSOLE_PASSWORD_HASH in .env}"
-      CHAINLIT_AUTH_SECRET: "\${CHAINLIT_AUTH_SECRET:?set CHAINLIT_AUTH_SECRET in .env}"
+      CATENCE_CONSOLE_USERNAME: "\${CATENCE_CONSOLE_USERNAME:-}"
+      CATENCE_CONSOLE_PASSWORD_HASH: "\${CATENCE_CONSOLE_PASSWORD_HASH:-}"
+      CHAINLIT_AUTH_SECRET: "\${CHAINLIT_AUTH_SECRET:-}"
       OPENAI_API_KEY: "\${OPENAI_API_KEY:-}"
       OPENAI_API_BASE: "\${OPENAI_API_BASE:-}"
       ANTHROPIC_API_KEY: "\${ANTHROPIC_API_KEY:-}"
@@ -315,30 +361,33 @@ EOF
 
 write_dockerfile
 write_compose
+write_env
 
 # ---------------------------------------------------------------------------
-# Build the image
+# Dry run stops after writing the scaffold
 # ---------------------------------------------------------------------------
 if [ "$DRY_RUN" = "1" ]; then
-  write_env
   info "Dry run complete. Wrote $DEPLOY_DIR/"
   info "Would deploy: project=$PROJECT image=$IMAGE_NAME channel=$CHANNEL"
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# Build the image (no secrets required; versions are baked into the build args)
+# ---------------------------------------------------------------------------
 if [ "$SKIP_BUILD" = "1" ]; then
   info "Skipping build (using existing image $IMAGE_NAME)."
 else
   info "Building $IMAGE_NAME..."
-  build_args=(-f "$DEPLOY_DIR/docker-compose.yml" --env-file "$DEPLOY_DIR/.env" build)
+  build_args=(-f "$DEPLOY_DIR/docker-compose.yml" build)
   [ "$PULL" = "1" ] && build_args+=(--pull)
   $COMPOSE "${build_args[@]}"
 fi
 
 # ---------------------------------------------------------------------------
-# Generate the bcrypt password hash from the built image when missing
+# Optionally generate the bcrypt password hash from the built image
 # ---------------------------------------------------------------------------
-if [ -z "$PASSWORD_HASH" ] && [ "$NO_SECRETS" = "0" ]; then
+if [ -z "$PASSWORD_HASH" ] && [ "$GENERATE_SECRETS" = "1" ]; then
   local_pw=""
   read -rsp "Enter the Console password (hidden): " local_pw || true
   printf '\n'
@@ -351,18 +400,33 @@ if [ -z "$PASSWORD_HASH" ] && [ "$NO_SECRETS" = "0" ]; then
     --entrypoint /opt/catence-console/bin/python "$IMAGE_NAME" \
     -c 'import bcrypt,sys;print(bcrypt.hashpw(sys.stdin.read().rstrip("\n").encode(),bcrypt.gensalt()).decode())')"
   [ -n "$PASSWORD_HASH" ] || die "failed to generate the bcrypt hash"
-  info "Generated CATENCE_CONSOLE_PASSWORD_HASH."
+  write_env
+  info "Generated CATENCE_CONSOLE_PASSWORD_HASH and saved it to $DEPLOY_DIR/.env."
 fi
 
-if [ -z "$PASSWORD_HASH" ] || [ -z "$USERNAME" ] || [ -z "$AUTH_SECRET" ]; then
-  die "CATENCE_CONSOLE_USERNAME, CATENCE_CONSOLE_PASSWORD_HASH, and CHAINLIT_AUTH_SECRET must all be set (rerun without --no-secrets to generate them)."
+# ---------------------------------------------------------------------------
+# Start only once the required login variables are all present
+# ---------------------------------------------------------------------------
+missing=""
+[ -n "$USERNAME" ]      || missing="$missing CATENCE_CONSOLE_USERNAME"
+[ -n "$PASSWORD_HASH" ] || missing="$missing CATENCE_CONSOLE_PASSWORD_HASH"
+[ -n "$AUTH_SECRET" ]   || missing="$missing CHAINLIT_AUTH_SECRET"
+
+if [ -n "$missing" ]; then
+  info ""
+  info "Scaffolding is ready in $DEPLOY_DIR/ (project $PROJECT, image $IMAGE_NAME)."
+  info "Fill in the missing values in $DEPLOY_DIR/.env:$missing"
+  info "and a model-provider key (OPENAI_API_KEY or ANTHROPIC_API_KEY), then start it."
+  info ""
+  info "Generate the bcrypt hash for CATENCE_CONSOLE_PASSWORD_HASH with:"
+  info "  docker run --rm -it --entrypoint /opt/catence-console/bin/catence-console $IMAGE_NAME auth hash-password"
+  info ""
+  info "Then start the stack:"
+  info "  $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env up -d"
+  info "  (or re-run this script, which reads the values you saved in .env)"
+  exit 0
 fi
 
-write_env
-
-# ---------------------------------------------------------------------------
-# Start the stack
-# ---------------------------------------------------------------------------
 info "Starting $PROJECT..."
 $COMPOSE -f "$DEPLOY_DIR/docker-compose.yml" --env-file "$DEPLOY_DIR/.env" up -d
 
