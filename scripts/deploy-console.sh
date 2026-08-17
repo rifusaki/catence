@@ -165,6 +165,9 @@ if [ -f "$DEPLOY_DIR/.env" ]; then
   [ -n "${OPENAI_API_KEY:-}" ]    || OPENAI_API_KEY="$(dotenv_get OPENAI_API_KEY "$DEPLOY_DIR/.env")"
   [ -n "${OPENAI_API_BASE:-}" ]   || OPENAI_API_BASE="$(dotenv_get OPENAI_API_BASE "$DEPLOY_DIR/.env")"
   [ -n "${ANTHROPIC_API_KEY:-}" ] || ANTHROPIC_API_KEY="$(dotenv_get ANTHROPIC_API_KEY "$DEPLOY_DIR/.env")"
+  [ -n "${OPENCODE_GO_API_KEY:-}" ]          || OPENCODE_GO_API_KEY="$(dotenv_get OPENCODE_GO_API_KEY "$DEPLOY_DIR/.env")"
+  [ -n "${OPENCODE_GO_API_BASE:-}" ]         || OPENCODE_GO_API_BASE="$(dotenv_get OPENCODE_GO_API_BASE "$DEPLOY_DIR/.env")"
+  [ -n "${OPENCODE_GO_MESSAGES_API_BASE:-}" ] || OPENCODE_GO_MESSAGES_API_BASE="$(dotenv_get OPENCODE_GO_MESSAGES_API_BASE "$DEPLOY_DIR/.env")"
 fi
 
 USERNAME="${USERNAME:-coach}"
@@ -340,6 +343,9 @@ services:
       OPENAI_API_KEY: "\${OPENAI_API_KEY:-}"
       OPENAI_API_BASE: "\${OPENAI_API_BASE:-}"
       ANTHROPIC_API_KEY: "\${ANTHROPIC_API_KEY:-}"
+      OPENCODE_GO_API_KEY: "\${OPENCODE_GO_API_KEY:-}"
+      OPENCODE_GO_API_BASE: "\${OPENCODE_GO_API_BASE:-}"
+      OPENCODE_GO_MESSAGES_API_BASE: "\${OPENCODE_GO_MESSAGES_API_BASE:-}"
     volumes:
       - ${volume_spec}:/data
 
@@ -359,6 +365,9 @@ CHAINLIT_AUTH_SECRET=${AUTH_SECRET}
 OPENAI_API_KEY=${OPENAI_API_KEY:-}
 OPENAI_API_BASE=${OPENAI_API_BASE:-}
 ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+OPENCODE_GO_API_KEY=${OPENCODE_GO_API_KEY:-}
+OPENCODE_GO_API_BASE=${OPENCODE_GO_API_BASE:-https://opencode.ai/zen/go/v1}
+OPENCODE_GO_MESSAGES_API_BASE=${OPENCODE_GO_MESSAGES_API_BASE:-https://opencode.ai/zen/go}
 EOF
 }
 
@@ -431,7 +440,7 @@ if [ -n "$missing" ]; then
   info ""
   info "Scaffolding is ready in $DEPLOY_DIR/ (project $PROJECT, image $IMAGE_NAME)."
   info "Fill in the missing values in $DEPLOY_DIR/.env:$missing"
-  info "and a model-provider key (OPENAI_API_KEY or ANTHROPIC_API_KEY), then start it."
+  info "and a model-provider key (OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENCODE_GO_API_KEY), then start it."
   info ""
   info "Generate the bcrypt hash for CATENCE_CONSOLE_PASSWORD_HASH with:"
   info "  docker run --rm -it --entrypoint /opt/catence-console/bin/catence-console $IMAGE_NAME auth hash-password"

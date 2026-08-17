@@ -22,7 +22,7 @@ Catence helps explore recovery, training load, trends, activity detail, swimming
 
 ## Quick start
 
-Install Catence and create the first athlete. The default catalog home is `~/.catence`; set `CATENCE_HOME` or pass `--home` to use a different location.
+Install Catence and create the first athlete. The default catalog home is `~/.catence`; set `CATENCE_HOME` or pass `--home` to use a different location. For the full local or Docker deployment walkthrough, see [deployment notes](docs/deployment.md).
 
 ```sh
 npm install --global catence@0.2.0
