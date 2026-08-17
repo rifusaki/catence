@@ -248,8 +248,9 @@ volume and your `config.json` are preserved.
 - **"No Catence config exists"** — should not happen after a seeded deploy or
   wizard run; ensure `/data/config.json` (Docker) or `~/.catence/config.json`
   exists and contains a `console` section.
-- **"Refusing to initialize"** — the data home contains unrelated files;
-  `config.json` and `console/` are allowed, anything else blocks `setup`.
+- **"Refusing to initialize"** — the data home contains unrelated files; the
+  error lists them. Console artifacts (`config.json`, `console/`, and Chainlit's
+  `.files/`, `.chainlit/`, `public/`) are allowed; anything else blocks `setup`.
 - **Settings panel has no Model dropdown** — the Console loads profiles from
   `config.json`; write one via the wizard, a manual copy, or the discovery
   script.

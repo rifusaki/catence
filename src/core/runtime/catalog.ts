@@ -56,7 +56,7 @@ function legacyStoreMessage(paths: CatalogPaths): string {
 }
 
 /** Home-directory entries the Console creates on its own and must not block catalog initialization. */
-const CONSOLE_ARTIFACTS = new Set(['config.json', 'console']);
+const CONSOLE_ARTIFACTS = new Set(['config.json', 'console', '.files', '.chainlit', 'public']);
 
 export async function loadCatalog(paths = resolveCatalogPaths()): Promise<CatenceCatalog> {
   const contents = await readFile(paths.catalog, 'utf8').catch((error: NodeJS.ErrnoException) => {
@@ -89,8 +89,11 @@ export async function initializeCatalog(paths = resolveCatalogPaths(), athlete: 
     else throw error;
   }
   if (entries.includes('catence.duckdb')) throw new Error(legacyStoreMessage(paths));
-  if (entries.some((entry) => !CONSOLE_ARTIFACTS.has(entry))) {
-    throw new Error(`Refusing to initialize ${paths.root}: choose an empty --home directory or remove its unrelated contents.`);
+  const unrelated = entries.filter((entry) => !CONSOLE_ARTIFACTS.has(entry));
+  if (unrelated.length > 0) {
+    throw new Error(
+      `Refusing to initialize ${paths.root}: found ${unrelated.join(', ')}. Remove these or choose an empty --home directory.`
+    );
   }
   const id = athleteIdSchema.parse(athlete.id);
   const record: Athlete = { id, label: athlete.label.trim(), createdAt: new Date().toISOString() };

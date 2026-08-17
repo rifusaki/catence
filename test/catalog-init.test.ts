@@ -9,11 +9,11 @@ async function temporaryHome(): Promise<string> {
 }
 
 describe('initializeCatalog', () => {
-  it('refuses a home with unrelated contents', async () => {
+  it('refuses a home with unrelated contents and lists them', async () => {
     const home = await temporaryHome();
     await writeFile(path.join(home, 'notes.txt'), 'keep me');
     await expect(initializeCatalog(resolveCatalogPaths(home), { id: 'alex', label: 'Alex' })).rejects.toThrow(
-      'Refusing to initialize'
+      'found notes.txt'
     );
   });
 
@@ -29,6 +29,8 @@ describe('initializeCatalog', () => {
     const home = await temporaryHome();
     await writeFile(path.join(home, 'config.json'), '{"console": {"profiles": {}}}');
     await mkdir(path.join(home, 'console'));
+    await mkdir(path.join(home, '.files'));
+    await mkdir(path.join(home, '.chainlit'));
     const catalog = await initializeCatalog(resolveCatalogPaths(home), { id: 'alex', label: 'Alex' });
     expect(catalog.defaultAthleteId).toBe('alex');
   });
