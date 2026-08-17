@@ -55,9 +55,8 @@ function legacyStoreMessage(paths: CatalogPaths): string {
   return `Catence 0.2 uses a catalog at ${paths.root}. The existing directory looks like a 0.1 data store and cannot be migrated automatically. Create a fresh catalog and re-sync each athlete.`;
 }
 
-async function hasEntries(directory: string): Promise<boolean> {
-  return (await readdir(directory).catch((error: NodeJS.ErrnoException) => error.code === 'ENOENT' ? [] : Promise.reject(error))).length > 0;
-}
+/** Home-directory entries the Console creates on its own and must not block catalog initialization. */
+const CONSOLE_ARTIFACTS = new Set(['config.json', 'console']);
 
 export async function loadCatalog(paths = resolveCatalogPaths()): Promise<CatenceCatalog> {
   const contents = await readFile(paths.catalog, 'utf8').catch((error: NodeJS.ErrnoException) => {
@@ -82,8 +81,15 @@ async function writeCatalog(paths: CatalogPaths, catalog: CatenceCatalog): Promi
 
 export async function initializeCatalog(paths = resolveCatalogPaths(), athlete: { id: string; label: string }): Promise<CatenceCatalog> {
   if (existsSync(paths.catalog)) return loadCatalog(paths);
-  if (await hasEntries(paths.root)) {
-    if (existsSync(path.join(paths.root, 'catence.duckdb'))) throw new Error(legacyStoreMessage(paths));
+  let entries: string[];
+  try {
+    entries = await readdir(paths.root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') entries = [];
+    else throw error;
+  }
+  if (entries.includes('catence.duckdb')) throw new Error(legacyStoreMessage(paths));
+  if (entries.some((entry) => !CONSOLE_ARTIFACTS.has(entry))) {
     throw new Error(`Refusing to initialize ${paths.root}: choose an empty --home directory or remove its unrelated contents.`);
   }
   const id = athleteIdSchema.parse(athlete.id);

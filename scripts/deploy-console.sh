@@ -19,10 +19,11 @@
 #   ./deploy-console.sh --home /mnt/d/catence-data --no-build
 #
 # The script writes the complete scaffold (Dockerfile, docker-compose.yml, and a
-# .env with placeholders) and builds the image without needing any secrets. Add
-# the Console password hash and one model-provider key to .env afterwards, then
-# run `docker compose up -d` or re-run this script. Pass --generate-secrets to
-# be prompted for the password and have the hash written for you.
+# .env with placeholders), seeds a starter Console configuration into the data
+# volume, and builds the image without needing any secrets. Add the Console
+# password hash and one model-provider key to .env afterwards, then run
+# `docker compose up -d` or re-run this script. Pass --generate-secrets to be
+# prompted for the password and have the hash written for you.
 
 set -euo pipefail
 
@@ -387,6 +388,18 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Seed a starter Console configuration into the data volume so the settings
+# panel works before any chat starts. The image ships config.example.json in
+# the npm package; copy it once and keep whatever the user later edits.
+# ---------------------------------------------------------------------------
+info "Seeding starter /data/config.json (Console model profiles)..."
+if ! $COMPOSE -f "$DEPLOY_DIR/docker-compose.yml" --env-file "$DEPLOY_DIR/.env" run --rm \
+  --entrypoint sh console -c \
+  'test -f /data/config.json || cp /usr/local/lib/node_modules/catence/config.example.json /data/config.json'; then
+  warn "Could not seed the starter config; the Console will ask for a model on the first chat instead."
+fi
+
+# ---------------------------------------------------------------------------
 # Optionally generate the bcrypt password hash from the built image
 # ---------------------------------------------------------------------------
 if [ -z "$PASSWORD_HASH" ] && [ "$GENERATE_SECRETS" = "1" ]; then
@@ -448,6 +461,11 @@ info "  Initialize an athlete store:"
 info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env run --rm --entrypoint catence-data console setup --athlete alex --label \"Alex\""
 info "  Set a provider secret (stdin, never in shell history):"
 info "    printf %s 'value' | $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env run --rm -T --entrypoint catence-data console --athlete alex secret set --provider intervals --field apiKey --value-stdin"
+info "  Edit the seeded Console model config (profiles and defaults):"
+info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env run --rm --entrypoint sh console -c 'cat > /data/config.json'"
+info "    (or, with --home, edit <home>/config.json on the host; model keys stay in .env)"
+info "  Discover OpenCode Go models into the config:"
+info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env run --rm --entrypoint node console /usr/local/lib/node_modules/catence/scripts/discover-opencode-go.mjs --write /data/config.json"
 info "  Check status / logs:"
 info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml ps"
 info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml logs -f"
