@@ -306,6 +306,14 @@ prints credential values.
 catence-console doctor --home "$HOME/.catence" --mcp-url http://127.0.0.1:8787/mcp
 ```
 
+On Docker, the deploy scaffold includes a helper that runs it inside the
+running container (`exec`, not `run` — the container's loopback hosts the live
+MCP server and the `.env` provider keys are in its environment):
+
+```sh
+./catence-deploy/doctor.sh
+```
+
 ## Docker: generating the Console login hash
 
 `deploy-console.sh` writes a small helper into the deployment directory. Run it

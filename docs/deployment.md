@@ -59,12 +59,23 @@ that already holds only Console artifacts (`config.json`, `console/`).
 
 ### 3. Store provider credentials (stdin only, never shell history)
 
+Garmin (`email`, `password`), Intervals.icu (`apiKey`, `athleteId`), and Strava
+(`clientId`, `clientSecret`):
+
 ```sh
+# Garmin
 printf %s 'alex@example.com' | catence-data --athlete alex secret set --provider garmin --field email --value-stdin
 printf %s 'your-garmin-password' | catence-data --athlete alex secret set --provider garmin --field password --value-stdin
+# Intervals.icu
 printf %s 'intervals-api-key' | catence-data --athlete alex secret set --provider intervals --field apiKey --value-stdin
 printf %s '12345' | catence-data --athlete alex secret set --provider intervals --field athleteId --value-stdin
+# Strava (create an API application at https://www.strava.com/settings/api)
+printf %s 'strava-client-id' | catence-data --athlete alex secret set --provider strava --field clientId --value-stdin
+printf %s 'strava-client-secret' | catence-data --athlete alex secret set --provider strava --field clientSecret --value-stdin
 ```
+
+Set only the providers you actually sync; `secret set` accepts each field
+independently.
 
 ### 4. Sync data and build retrieval context
 
@@ -153,14 +164,35 @@ docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.e
 
 ### 4. Store provider credentials
 
+Garmin (`email`, `password`), Intervals.icu (`apiKey`, `athleteId`), and Strava
+(`clientId`, `clientSecret`), one `printf` per field:
+
 ```sh
-printf %s 'value' | docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env run --rm -T \
+# Garmin
+printf %s 'alex@example.com' | docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env run --rm -T \
+  --entrypoint catence-data console --athlete alex secret set \
+  --provider garmin --field email --value-stdin
+printf %s 'your-garmin-password' | docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env run --rm -T \
+  --entrypoint catence-data console --athlete alex secret set \
+  --provider garmin --field password --value-stdin
+# Intervals.icu
+printf %s 'intervals-api-key' | docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env run --rm -T \
   --entrypoint catence-data console --athlete alex secret set \
   --provider intervals --field apiKey --value-stdin
+printf %s '12345' | docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env run --rm -T \
+  --entrypoint catence-data console --athlete alex secret set \
+  --provider intervals --field athleteId --value-stdin
+# Strava (create an API application at https://www.strava.com/settings/api)
+printf %s 'strava-client-id' | docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env run --rm -T \
+  --entrypoint catence-data console --athlete alex secret set \
+  --provider strava --field clientId --value-stdin
+printf %s 'strava-client-secret' | docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env run --rm -T \
+  --entrypoint catence-data console --athlete alex secret set \
+  --provider strava --field clientSecret --value-stdin
 ```
 
-Use the same `--entrypoint catence-data` pattern for `sync`, `backfill`, and
-`auth strava`.
+Set only the providers you actually sync. Use the same `--entrypoint
+catence-data` pattern for `sync`, `backfill`, and `auth strava`.
 
 ### 5. Configure the model
 
@@ -176,7 +208,30 @@ docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.e
 With `--home <dir>` (bind mount), edit `<dir>/config.json` on the host
 instead. To add OpenCode Go models, see [model discovery](#model-discovery-opencode-go).
 
-### 6. Expose the Console safely
+### 6. Verify with doctor
+
+`catence-console doctor` checks each profile's environment variables and the
+local Catence runtime. The deploy scaffold includes a helper for it:
+
+```sh
+./catence-deploy/doctor.sh
+```
+
+The helper runs the doctor *inside the running container* with `exec` — the
+container's own loopback holds the live MCP server at `127.0.0.1:8787`, and the
+provider keys from `.env` are already in its environment. (A `docker compose
+run` container has a separate loopback and would report the runtime as
+unreachable.) The equivalent long form is:
+
+```sh
+docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env exec console \
+  /opt/catence-console/bin/catence-console doctor --home /data --mcp-url http://127.0.0.1:8787/mcp
+```
+
+Expect `"ready": true` once the model key is set; missing keys show up per
+profile without ever printing their values.
+
+### 7. Expose the Console safely
 
 Keep the Console port bound to `127.0.0.1` (the default) and front it with a
 Cloudflare Tunnel or reverse proxy at HTTPS. Never expose Catence's MCP port

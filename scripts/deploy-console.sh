@@ -384,10 +384,25 @@ EOF
   chmod +x "$DEPLOY_DIR/hash-password.sh"
 }
 
+write_doctor_helper() {
+  cat > "$DEPLOY_DIR/doctor.sh" <<'EOF'
+#!/bin/sh
+# Run catence-console doctor inside the running container: the container's own
+# loopback hosts the live MCP server, and the provider keys from .env are in
+# its environment. (A `docker compose run` container has a separate loopback.)
+set -eu
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" exec console \
+  /opt/catence-console/bin/catence-console doctor --home /data --mcp-url http://127.0.0.1:8787/mcp
+EOF
+  chmod +x "$DEPLOY_DIR/doctor.sh"
+}
+
 write_dockerfile
 write_compose
 write_env
 write_hash_helper
+write_doctor_helper
 
 # ---------------------------------------------------------------------------
 # Dry run stops after writing the scaffold
@@ -488,6 +503,8 @@ info "  Set a provider secret (stdin, never in shell history):"
 info "    printf %s 'value' | $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env run --rm -T --entrypoint catence-data console --athlete alex secret set --provider intervals --field apiKey --value-stdin"
 info "  Edit the seeded Console model config (profiles and defaults):"
 info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env run --rm --entrypoint sh console -c 'cat > /data/config.json'"
+info "  Verify the model profiles and env vars:"
+info "    $DEPLOY_DIR/doctor.sh"
 info "    (or, with --home, edit <home>/config.json on the host; model keys stay in .env)"
 info "  Discover OpenCode Go models into the config:"
 info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env run --rm --entrypoint node console /usr/local/lib/node_modules/catence/scripts/discover-opencode-go.mjs --write /data/config.json"
