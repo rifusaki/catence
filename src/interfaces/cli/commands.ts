@@ -5,17 +5,27 @@ import { Command } from 'commander';
 import {
   addAthlete,
   athleteStorePaths,
+  CATENCE_RUNTIME_VERSION,
+  channelForVersion,
   createDemoStore,
   dataStatus,
   defaultCatalogHome,
   disconnectStravaAccount,
+  fetchNpmDistTags,
+  fetchPypiReleases,
+  hasCommand,
   initializeCatalog,
+  isGlobalNpmInstall,
   linkActivity,
   loadCatalog,
+  npmGlobalPrefix,
+  planSelfUpdate,
+  readInstalledConsoleVersion,
   rebuildRetrievalIndex,
   resolveAthlete,
   resolveCatalogPaths,
   retryDataSync,
+  runSelfUpdateCommand,
   setAthleteSecret,
   syncData,
   connectStrava,
@@ -24,6 +34,7 @@ import {
   type CatalogPaths,
   type CatencePaths,
   type ProviderChoice,
+  type UpdateChannel,
 } from '../../runtime/index.js';
 
 const program = new Command()
@@ -177,6 +188,59 @@ program.command('status').action(async () => {
   const { paths } = await currentAthlete();
   process.stdout.write(`${JSON.stringify(await dataStatus(paths), null, 2)}\n`);
 });
+
+program.command('update')
+  .description('Check for and apply the newest Catence release on the tracked channel (runtime and Console).')
+  .option('--check', 'report available releases without changing anything')
+  .option('--channel <stable|beta>', 'release channel to track; defaults to the installed runtime channel')
+  .option('--runtime', 'only check or update the Catence runtime package')
+  .option('--console', 'only check or update the Catence Console package')
+  .action(async (options: { check?: boolean; channel?: string; runtime?: boolean; console?: boolean }) => {
+    if (options.channel !== undefined && options.channel !== 'stable' && options.channel !== 'beta') {
+      throw new Error('--channel must be stable or beta.');
+    }
+    const channel: UpdateChannel = options.channel ?? channelForVersion(CATENCE_RUNTIME_VERSION);
+    const runtimeOnly = options.runtime ?? false;
+    const consoleOnly = options.console ?? false;
+    const updateRuntime = runtimeOnly || !consoleOnly;
+    const updateConsole = consoleOnly || !runtimeOnly;
+    const [npmDistTags, pypiReleases, consoleInstalled] = await Promise.all([
+      fetchNpmDistTags('catence'),
+      fetchPypiReleases('catence-console'),
+      readInstalledConsoleVersion(),
+    ]);
+    const plan = planSelfUpdate({ runtimeVersion: CATENCE_RUNTIME_VERSION, channel, npmDistTags, pypiReleases, consoleInstalled });
+    const report = { channel, runtime: plan.runtime, console: plan.console };
+    if (options.check) {
+      process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      process.exit(plan.ok ? 0 : 1);
+    }
+    const applied: string[] = [];
+    if (plan.runtime.updateAvailable && updateRuntime) {
+      const runtimeTarget = plan.runtime.target;
+      if (runtimeTarget === undefined) throw new Error('No runtime update target is available.');
+      const npmPrefix = await npmGlobalPrefix();
+      if (isGlobalNpmInstall(import.meta.url, npmPrefix)) {
+        const exitCode = await runSelfUpdateCommand('npm', ['install', '--global', `catence@${runtimeTarget}`]);
+        if (exitCode !== 0) throw new Error(`npm failed to install catence@${runtimeTarget} (exit ${exitCode}).`);
+        applied.push(`runtime: catence@${runtimeTarget}`);
+      } else {
+        process.stderr.write(`Runtime is not a global npm install; run: npm install --global catence@${runtimeTarget}\n`);
+      }
+    }
+    if (plan.console.updateAvailable && updateConsole) {
+      const consoleTarget = plan.console.target;
+      if (consoleTarget === undefined) throw new Error('No Console update target is available.');
+      if (await hasCommand('uv')) {
+        const exitCode = await runSelfUpdateCommand('uv', ['tool', 'install', '--upgrade', `catence-console==${consoleTarget}`]);
+        if (exitCode !== 0) throw new Error(`uv failed to install catence-console==${consoleTarget} (exit ${exitCode}).`);
+        applied.push(`console: catence-console==${consoleTarget}`);
+      } else {
+        process.stderr.write(`uv is not installed; run: pip install --upgrade 'catence-console==${consoleTarget}'\n`);
+      }
+    }
+    process.stdout.write(`${JSON.stringify({ ...report, applied }, null, 2)}\n`);
+  });
 program.command('build-retrieval-index').description('Build derived local retrieval context for one athlete.').action(async () => {
   const { paths } = await currentAthlete();
   process.stdout.write(`${JSON.stringify(await rebuildRetrievalIndex(paths), null, 2)}\n`);

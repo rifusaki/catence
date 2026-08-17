@@ -198,6 +198,7 @@ def serve(args: argparse.Namespace) -> int:
 
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(prog="catence-console", description="Local Chainlit Console for Catence.")
+    command.add_argument("--version", action="version", version=f"catence-console {CATENCE_RELEASE_VERSION}")
     subcommands = command.add_subparsers(dest="command", required=True)
 
     def connection_options(subcommand: argparse.ArgumentParser) -> None:

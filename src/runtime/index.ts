@@ -7,6 +7,21 @@
  * without changing the public product adapters.
  */
 export type { CatencePaths } from '../contracts/runtime.js';
+export {
+  channelForVersion,
+  compareReleaseVersions,
+  fetchNpmDistTags,
+  fetchPypiReleases,
+  hasCommand,
+  isGlobalNpmInstall,
+  latestRelease,
+  npmGlobalPrefix,
+  parseReleaseVersion,
+  planSelfUpdate,
+  readInstalledConsoleVersion,
+  runSelfUpdateCommand,
+} from '../core/runtime/self-update.js';
+export type { SelfUpdatePlan, UpdateChannel } from '../core/runtime/self-update.js';
 export { CATENCE_PROTOCOL_VERSION, CATENCE_RUNTIME_VERSION, catenceRuntimeHealth } from '../contracts/release.js';
 
 export { configuredMcpRateLimit, loadCatenceConfig, resolvePaths } from '../core/runtime/configuration.js';

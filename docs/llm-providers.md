@@ -2,9 +2,11 @@
 
 Catence Console talks to a model through [LiteLLM](https://docs.litellm.ai/).
 There are exactly three provider shapes: **OpenAI**, **Anthropic**, and a
-generic **OpenAI-compatible** profile. Azure and Opencode are not special cases
-in the code: both are reached through the OpenAI-compatible profile, and the
-steps for each are documented below.
+generic **OpenAI-compatible** profile. Azure is not a special case in the code:
+it is reached through the OpenAI-compatible profile. OpenCode Go can be reached
+the same way through a local gateway, or directly at its own OpenAI-compatible
+endpoint with native `openai/…` and `anthropic/…` model names; the steps for
+each are documented below.
 
 ## How configuration is split
 
@@ -166,9 +168,77 @@ Notes:
 
 ### Opencode
 
-Opencode itself does not expose an OpenAI-compatible server; its `serve` command
-publishes Opencode's own API. To reuse the providers you already configured in
-Opencode, run an OpenAI-compatible gateway such as the
+[OpenCode Go](https://opencode.ai) publishes an OpenAI-compatible API at
+`https://opencode.ai/zen/go/v1`; its `GET /v1/models` listing is public and does
+not require a key. The Console can use it directly, so most setups do not need a
+local gateway.
+
+The repository includes a discovery script that fetches the live model list and
+merges ready-made Console profiles into `config.json`. From a Catence checkout:
+
+```sh
+npm run discover:opencode-go -- --write ~/.catence/config.json
+```
+
+The script adds two profiles, because OpenCode Go routes model families through
+different API shapes:
+
+- `opencode-go` — chat and responses models, base
+  `https://opencode.ai/zen/go/v1` (LiteLLM `openai/…` names).
+- `opencode-go-messages` — messages models, base `https://opencode.ai/zen/go`
+  (LiteLLM `anthropic/…` names).
+
+| Family | Profile prefix | Example |
+| --- | --- | --- |
+| Chat | `openai/<id>` | `openai/deepseek-v4-flash` |
+| Responses | `openai/responses/<id>` | `openai/responses/grok-4.5` |
+| Messages | `anthropic/<id>` | `anthropic/minimax-m2.5` |
+
+The script warns on stderr and skips any model that does not fit one of these
+families. Rerun it to refresh the model lists; existing profiles, limits, and
+`defaultProfile` are preserved unless `--set-default` is passed.
+
+```sh
+export OPENCODE_GO_API_KEY='…'                      # any non-empty value satisfies the key check
+export OPENCODE_GO_API_BASE='https://opencode.ai/zen/go/v1'
+export OPENCODE_GO_MESSAGES_API_BASE='https://opencode.ai/zen/go'
+```
+
+```jsonc
+{
+  "console": {
+    "defaultProfile": "opencode-go",
+    "profiles": {
+      "opencode-go": {
+        "label": "OpenCode Go",
+        "defaultModel": "flash",
+        "models": {
+          "flash": { "label": "DeepSeek V4 flash", "model": "openai/deepseek-v4-flash" },
+          "grok": { "label": "Grok 4.5", "model": "openai/responses/grok-4.5" }
+        },
+        "apiKeyEnv": "OPENCODE_GO_API_KEY",
+        "apiBaseEnv": "OPENCODE_GO_API_BASE"
+      },
+      "opencode-go-messages": {
+        "label": "OpenCode Go messages",
+        "defaultModel": "minimax",
+        "models": {
+          "minimax": { "label": "MiniMax M2.5", "model": "anthropic/minimax-m2.5" }
+        },
+        "apiKeyEnv": "OPENCODE_GO_API_KEY",
+        "apiBaseEnv": "OPENCODE_GO_MESSAGES_API_BASE"
+      }
+    }
+  }
+}
+```
+
+Verify with `catence-console doctor`. The `responses` models
+(`openai/responses/…`) go through LiteLLM's responses bridge and are the least
+battle-tested path; smoke-test one chat turn before relying on them.
+
+If you instead want to reuse the providers already configured in your local
+Opencode CLI, run an OpenAI-compatible gateway such as the
 [`opencode-llm-proxy`](https://github.com/KochC/opencode-llm-proxy) plugin, which
 serves Chat Completions at `http://127.0.0.1:4010/v1` and lists every configured
 model as `provider/model`.

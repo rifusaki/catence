@@ -93,10 +93,20 @@ catence-data --athlete alex retry --run <run-id>
 catence-data --athlete alex auth strava --callback
 catence-data --athlete alex disconnect strava
 
+# Update the runtime and Console together on the tracked release channel
+catence-data update --check
+catence-data update
+
 # Choose a non-default catalog location
 catence-data --home /srv/catence setup --athlete alex --label "Alex"
 catence --home /srv/catence
 ```
+
+`catence-data update` follows the channel of the installed runtime: a beta
+install tracks the npm `beta` tag and the matching PyPI prereleases, a stable
+install tracks `latest`. Pass `--channel stable` to move off a beta. The command
+replaces the global `catence` package and installs or upgrades
+`catence-console` with `uv tool` when `uv` is available; `--check` only reports.
 
 Register `http://127.0.0.1:8765/strava/callback` with the Strava application for the callback flow. The manual `auth strava --code <authorization-code>` flow remains available for headless environments.
 
@@ -185,6 +195,19 @@ docker run --rm -it -v catence-data:/data --entrypoint catence-data catence-cons
 ```
 
 Use the same `--entrypoint catence-data` pattern for `secret set` and `sync`. Route a Cloudflare Tunnel to `http://127.0.0.1:8000`; do not run a tunnel client in this image. Use HTTPS at the tunnel and retain the Console login—the dashboard is fetched through the authenticated Console origin rather than directly from port 8787.
+
+[`scripts/deploy-console.sh`](scripts/deploy-console.sh) deploys this stack from
+the public registries and seeds a starter `config.json` (the Console model
+profiles from [`config.example.json`](config.example.json)) into the data
+volume, so the settings panel works before the first chat. Edit
+`/data/config.json` in the volume (or the bind-mounted `--home` directory) to
+change models and defaults, or discover OpenCode Go profiles from the image:
+
+```sh
+docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env run --rm \
+  --entrypoint node console \
+  /usr/local/lib/node_modules/catence/scripts/discover-opencode-go.mjs --write /data/config.json
+```
 
 ## Configuration
 
