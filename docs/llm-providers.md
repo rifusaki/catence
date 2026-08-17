@@ -305,3 +305,26 @@ prints credential values.
 ```sh
 catence-console doctor --home "$HOME/.catence" --mcp-url http://127.0.0.1:8787/mcp
 ```
+
+## Docker: generating the Console login hash
+
+`deploy-console.sh` writes a small helper into the deployment directory. Run it
+once after the script to generate the bcrypt hash for
+`CATENCE_CONSOLE_PASSWORD_HASH` — it prompts for the password on the terminal,
+never echoes it, and uses the compose project so it works no matter what image
+tag the script built:
+
+```sh
+./catence-deploy/hash-password.sh
+```
+
+Paste the output into `CATENCE_CONSOLE_PASSWORD_HASH` in `catence-deploy/.env`,
+then start the stack (`./deploy-console.sh beta` again, or
+`docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env up -d`).
+
+If you prefer, re-run the deploy script with `--generate-secrets` instead and
+answer the interactive password prompt; it saves the hash to `.env` for you.
+Without the helper (for example an older deployment), the equivalent command
+is `docker run --rm -it --entrypoint /opt/catence-console/bin/catence-console
+<image-tag> auth hash-password`, where `<image-tag>` is the tag printed by the
+script.

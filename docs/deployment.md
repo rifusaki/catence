@@ -126,7 +126,7 @@ secrets are missing, prints the remaining steps and exits.
 
 ```sh
 CATENCE_CONSOLE_USERNAME=coach
-CATENCE_CONSOLE_PASSWORD_HASH='…'      # generate: docker compose ... run --rm --entrypoint /opt/catence-console/bin/catence-console console auth hash-password
+CATENCE_CONSOLE_PASSWORD_HASH='…'      # generate: ./catence-deploy/hash-password.sh
 CHAINLIT_AUTH_SECRET='…'               # generate: openssl rand -hex 32
 OPENAI_API_KEY='…'                     # or ANTHROPIC_API_KEY / OPENCODE_GO_API_KEY …
 OPENAI_API_BASE=''                     # only for OpenAI-compatible endpoints

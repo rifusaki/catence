@@ -371,9 +371,23 @@ OPENCODE_GO_MESSAGES_API_BASE=${OPENCODE_GO_MESSAGES_API_BASE:-https://opencode.
 EOF
 }
 
+write_hash_helper() {
+  cat > "$DEPLOY_DIR/hash-password.sh" <<'EOF'
+#!/bin/sh
+# Generate the bcrypt hash for CATENCE_CONSOLE_PASSWORD_HASH in .env.
+# The password is prompted for on the terminal and never echoed.
+set -eu
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" run --rm \
+  --entrypoint /opt/catence-console/bin/catence-console console auth hash-password
+EOF
+  chmod +x "$DEPLOY_DIR/hash-password.sh"
+}
+
 write_dockerfile
 write_compose
 write_env
+write_hash_helper
 
 # ---------------------------------------------------------------------------
 # Dry run stops after writing the scaffold
@@ -443,7 +457,9 @@ if [ -n "$missing" ]; then
   info "and a model-provider key (OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENCODE_GO_API_KEY), then start it."
   info ""
   info "Generate the bcrypt hash for CATENCE_CONSOLE_PASSWORD_HASH with:"
-  info "  docker run --rm -it --entrypoint /opt/catence-console/bin/catence-console $IMAGE_NAME auth hash-password"
+  info "  $DEPLOY_DIR/hash-password.sh"
+  info "  (or re-run this script with --generate-secrets to fill it interactively)"
+  info "  fallback: docker run --rm -it --entrypoint /opt/catence-console/bin/catence-console $IMAGE_NAME auth hash-password"
   info ""
   info "Then start the stack:"
   info "  $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env up -d"
