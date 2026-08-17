@@ -3,6 +3,7 @@ from argparse import Namespace
 from pathlib import Path
 
 from catence_console import cli
+from catence_console.release import CATENCE_RELEASE_VERSION
 
 
 class FakeResponse:
@@ -62,7 +63,7 @@ def test_runtime_command_uses_the_lockstep_npm_release(monkeypatch, tmp_path):
 
     command = cli._runtime_command(tmp_path, "127.0.0.1", 8787, 8000)
 
-    assert command[:4] == ["npx", "--yes", "catence@0.2.0-beta.7", "serve"]
+    assert command[:4] == ["npx", "--yes", f"catence@{CATENCE_RELEASE_VERSION}", "serve"]
     assert command[command.index("--home") + 1] == str(tmp_path)
 
 
