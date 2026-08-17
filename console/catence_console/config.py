@@ -30,6 +30,7 @@ class ModelOption:
     id: str
     label: str
     model: str
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,7 +77,10 @@ class ProviderProfile:
     def litellm_options(self, model_id: str | None = None) -> dict[str, str]:
         """Return only present credentials; values are never logged or persisted."""
 
-        options: dict[str, str] = {"model": self.model_option(model_id).model}
+        model_option = self.model_option(model_id)
+        options: dict[str, str] = {"model": model_option.model}
+        if model_option.reasoning_effort:
+            options["reasoning_effort"] = model_option.reasoning_effort
         mappings = (
             ("api_key", self.api_key_env),
             ("api_base", self.api_base_env),
@@ -177,7 +181,7 @@ def _limits(value: Any) -> ConsoleLimits:
 
 def _model_option(value: Any, profile_id: str, model_id: str) -> ModelOption:
     model = _object(value, f"console.profiles.{profile_id}.models.{model_id}")
-    unknown_fields = set(model) - {"label", "model"}
+    unknown_fields = set(model) - {"label", "model", "reasoningEffort"}
     if unknown_fields:
         raise ConsoleConfigurationError(
             f"console.profiles.{profile_id}.models.{model_id} contains unsupported fields: {', '.join(sorted(unknown_fields))}."
@@ -188,7 +192,10 @@ def _model_option(value: Any, profile_id: str, model_id: str) -> ModelOption:
     label = model.get("label", model_id)
     if not isinstance(label, str) or not label.strip():
         raise ConsoleConfigurationError(f"console.profiles.{profile_id}.models.{model_id}.label must be a non-empty string.")
-    return ModelOption(id=model_id, label=label, model=name)
+    reasoning_effort = model.get("reasoningEffort")
+    if reasoning_effort is not None and not isinstance(reasoning_effort, str):
+        raise ConsoleConfigurationError(f"console.profiles.{profile_id}.models.{model_id}.reasoningEffort must be a string.")
+    return ModelOption(id=model_id, label=label, model=name, reasoning_effort=reasoning_effort)
 
 
 def load_console_configuration(data_directory: Path) -> ConsoleConfiguration:

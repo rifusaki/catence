@@ -1,6 +1,6 @@
 {
   "name": "catence",
-  "version": "0.2.0-beta.7",
+  "version": "0.2.0-beta.8",
   "description": "Local MCP access to normalized Garmin, Intervals.icu, and targeted Strava fitness data.",
   "license": "AGPL-3.0-or-later",
   "repository": {
@@ -29,6 +29,7 @@
     "config.example.json",
     "docs",
     "scripts/discover-opencode-go.mjs",
+    "scripts/discover-opencode-zen.mjs",
     "pyproject.toml",
     "uv.lock",
     "python/__init__.py",
@@ -57,6 +58,7 @@
     "console": "uv run --project console catence-console serve",
     "console:doctor": "uv run --project console catence-console doctor",
     "discover:opencode-go": "node scripts/discover-opencode-go.mjs",
+    "discover:opencode-zen": "node scripts/discover-opencode-zen.mjs",
     "package:check": "npm pack --dry-run",
     "release:check": "node scripts/release-artifacts.mjs check",
     "mcpb:validate": "npm exec --yes --package @anthropic-ai/mcpb -- mcpb validate mcpb/manifest.json",

@@ -238,3 +238,17 @@ data.
 Garmin is the primary source for activity and wellness data; Intervals.icu supplements training analysis; Strava is used for targeted segments, efforts, and gear. Missing fields mean a provider did not supply a value. The source credentials and source APIs determine the data available. Catence does not use the official Garmin API; Garmin sync relies on the selected athlete’s email/password credentials.
 
 See [distribution notes](docs/distribution.md) for release artifacts, including APM and MCPB demo bundles.
+
+##
+
+```bash
+cd catence-deploy
+docker compose -f docker-compose.yml --env-file .env exec console \
+  catence-data sync --athlete martina --provider all --home /data        # incremental sync, all providers
+docker compose -f docker-compose.yml --env-file .env exec console \
+  catence-data backfill --athlete martina --from 2026-01-01 --home /data # full backfill from a date
+docker compose -f docker-compose.yml --env-file .env exec console \
+  catence-data status --athlete martina --home /data                     # coverage/errors
+docker compose -f docker-compose.yml --env-file .env exec console \
+  catence-data athlete list --home /data                                 # list athlete IDs
+```

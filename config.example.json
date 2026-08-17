@@ -44,6 +44,27 @@
         "label": "Anthropic",
         "model": "anthropic/claude-sonnet-4-5",
         "apiKeyEnv": "ANTHROPIC_API_KEY"
+      },
+      "opencode-zen": {
+        "label": "OpenCode Zen",
+        "defaultModel": "deepseek-v4-flash-free",
+        "models": {
+          "deepseek-v4-flash-free": { "label": "DeepSeek V4 Flash Free", "model": "openai/deepseek-v4-flash-free" },
+          "nemotron-3-ultra-free": { "label": "Nemotron 3 Ultra Free", "model": "openai/nemotron-3-ultra-free" },
+          "big-pickle": { "label": "Big Pickle", "model": "openai/big-pickle" }
+        },
+        "apiKeyEnv": "OPENCODE_API_KEY",
+        "apiBaseEnv": "OPENCODE_ZEN_API_BASE"
+      },
+      "opencode-zen-responses": {
+        "label": "OpenCode Zen (Responses)",
+        "defaultModel": "gpt-5.6-luna",
+        "models": {
+          "gpt-5.6-luna": { "label": "GPT 5.6 Luna", "model": "openai/responses/gpt-5.6-luna" },
+          "gpt-5.6-terra": { "label": "GPT 5.6 Terra", "model": "openai/responses/gpt-5.6-terra" }
+        },
+        "apiKeyEnv": "OPENCODE_API_KEY",
+        "apiBaseEnv": "OPENCODE_ZEN_RESPONSES_API_BASE"
       }
     }
   }

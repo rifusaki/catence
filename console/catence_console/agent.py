@@ -227,6 +227,10 @@ async def respond(
 ) -> str:
     """Run one bounded Chat turn, displaying each evidence-producing MCP call."""
 
+    # Resolve reasoning_effort priority: model option > profile default > explicit parameter
+    model_option = profile.model_option(model_id)
+    effective_reasoning_effort = model_option.reasoning_effort or reasoning_effort
+
     try:
         async with streamablehttp_client(mcp_url) as transport:
             read_stream, write_stream = transport[:2]
@@ -262,8 +266,9 @@ async def respond(
                         "tools": tools,
                         "tool_choice": "auto",
                     }
-                    if reasoning_effort:
-                        options["reasoning_effort"] = reasoning_effort
+                    if effective_reasoning_effort:
+                        options["reasoning_effort"] = effective_reasoning_effort
+                        options["allowed_openai_params"] = ["reasoning_effort"]
                     completion = await complete(**options)
                     message = completion.choices[0].message
                     content = getattr(message, "content", None)

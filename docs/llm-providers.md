@@ -272,6 +272,83 @@ Notes:
   `OPENCODE_LLM_PROXY_TOKEN`; otherwise any non-empty value satisfies the
   profile's required-environment check.
 
+### Opencode Zen
+
+[OpenCode Zen](https://opencode.ai/zen) is a hosted model API with a curated
+selection of coding and reasoning models. It exposes an OpenAI-compatible
+endpoint at `https://opencode.ai/zen/v1` with a public `GET /v1/models`
+listing. Several models are available for free (no billing details required);
+paid models require an API key from [opencode.ai/auth](https://opencode.ai/auth).
+
+The repository includes a discovery script that fetches the live model list and
+merges ready-made Console profiles into `config.json`. From a Catence checkout:
+
+```sh
+npm run discover:opencode-zen -- --write ~/.catence/config.json
+```
+
+Add `--free-only` to include only the free models.
+
+The script adds two profiles, because OpenCode Zen routes model families through
+different API shapes:
+
+- `opencode-zen` — chat/completions models (most models, including all free
+  models), base `https://opencode.ai/zen/v1` (LiteLLM `openai/<id>` names).
+- `opencode-zen-responses` — responses API models (GPT-5.x series), base
+  `https://opencode.ai/zen/v1` (LiteLLM `openai/responses/<id>` names).
+
+| Family | Profile prefix | Example |
+| --- | --- | --- |
+| Chat | `openai/<id>` | `openai/deepseek-v4-flash-free` |
+| Responses | `openai/responses/<id>` | `openai/responses/gpt-5.6-luna` |
+
+Free models carry a `-free` suffix (e.g., `deepseek-v4-flash-free`,
+`nemotron-3-ultra-free`, `big-pickle`). The discovery script recognises them
+automatically; `--free-only` filters the list to free models only.
+
+```sh
+export OPENCODE_API_KEY='…'                         # required for paid models; any non-empty value for free
+export OPENCODE_ZEN_API_BASE='https://opencode.ai/zen/v1'
+export OPENCODE_ZEN_RESPONSES_API_BASE='https://opencode.ai/zen/v1'
+```
+
+```jsonc
+{
+  "console": {
+    "defaultProfile": "opencode-zen",
+    "profiles": {
+      "opencode-zen": {
+        "label": "OpenCode Zen",
+        "defaultModel": "deepseek-v4-flash-free",
+        "models": {
+          "deepseek-v4-flash-free": { "label": "DeepSeek V4 Flash Free", "model": "openai/deepseek-v4-flash-free" },
+          "nemotron-3-ultra-free": { "label": "Nemotron 3 Ultra Free", "model": "openai/nemotron-3-ultra-free" },
+          "big-pickle": { "label": "Big Pickle", "model": "openai/big-pickle" }
+        },
+        "apiKeyEnv": "OPENCODE_API_KEY",
+        "apiBaseEnv": "OPENCODE_ZEN_API_BASE"
+      },
+      "opencode-zen-responses": {
+        "label": "OpenCode Zen (Responses)",
+        "defaultModel": "gpt-5.6-luna",
+        "models": {
+          "gpt-5.6-luna": { "label": "GPT 5.6 Luna", "model": "openai/responses/gpt-5.6-luna" },
+          "gpt-5.6-terra": { "label": "GPT 5.6 Terra", "model": "openai/responses/gpt-5.6-terra" }
+        },
+        "apiKeyEnv": "OPENCODE_API_KEY",
+        "apiBaseEnv": "OPENCODE_ZEN_RESPONSES_API_BASE"
+      }
+    }
+  }
+}
+```
+
+Verify with `catence-console doctor`. The `responses` models
+(`openai/responses/…`) go through LiteLLM's responses bridge and are the least
+battle-tested path; smoke-test one chat turn before relying on them.
+
+The same `OPENCODE_API_KEY` works for both Opencode Go and Opencode Zen.
+
 ## Multiple deployments per provider
 
 A profile can list several models under one set of credentials; the Console
