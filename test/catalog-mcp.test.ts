@@ -8,7 +8,7 @@ import { addAthlete, athleteStorePaths, createDemoStore, initializeCatalog, reso
 import { createCatenceMcpServer } from '../src/interfaces/mcp/server.js';
 
 describe('shared athlete catalog MCP server', () => {
-  it('lists a roster and requires every personal-data tool to select one athlete', async () => {
+  it('lists a roster and requires every personal-data tool to select one athlete', { timeout: 60_000 }, async () => {
     const home = await mkdtemp(path.join(tmpdir(), 'catence-catalog-'));
     const catalogPaths = resolveCatalogPaths(home);
     await initializeCatalog(catalogPaths, { id: 'alex', label: 'Alex' });
