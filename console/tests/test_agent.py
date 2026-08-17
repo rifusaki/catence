@@ -1,6 +1,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from catence_console import agent
 from catence_console.config import ProviderProfile
 from catence_console.persistence import tool_call_store
@@ -37,6 +39,13 @@ class FakeSession:
                 }
             ]
         )
+
+
+class WrappingSession(FakeSession):
+    async def __aexit__(self, exc_type, exc, tb):
+        if exc is not None:
+            raise ExceptionGroup("unhandled errors in a TaskGroup (1 sub-exception)", [exc]) from None
+        return False
 
 
 def test_respond_normalizes_mcp_tools_for_litellm(monkeypatch):
@@ -193,3 +202,48 @@ def test_respond_records_completed_mcp_calls(monkeypatch, tmp_path):
         ("new-call", "daily_recovery_review", {"date": "2026-08-10"})
     ]
     assert store.result("thread-1", "new-call") == {"content": [{"type": "text", "text": "fresh evidence"}]}
+
+
+def test_respond_unwraps_client_session_task_group_exception(monkeypatch):
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", WrappingSession)
+
+    async def complete(**kwargs):
+        raise RuntimeError("ProviderError: upstream refused the request")
+
+    with pytest.raises(RuntimeError, match="ProviderError: upstream refused the request"):
+        asyncio.run(
+            agent.respond(
+                profile=ProviderProfile(id="local", label="Local", model="openai/example"),
+                model_id="default",
+                reasoning_effort=None,
+                history=[],
+                mcp_url="http://example.test/mcp",
+                complete=complete,
+            )
+        )
+
+
+def test_respond_keeps_multi_error_groups_grouped(monkeypatch):
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", WrappingSession)
+
+    async def complete(**kwargs):
+        raise ExceptionGroup(
+            "provider fan-out",
+            [RuntimeError("first provider failed"), ValueError("second provider failed")],
+        )
+
+    with pytest.raises(ExceptionGroup) as captured:
+        asyncio.run(
+            agent.respond(
+                profile=ProviderProfile(id="local", label="Local", model="openai/example"),
+                model_id="default",
+                reasoning_effort=None,
+                history=[],
+                mcp_url="http://example.test/mcp",
+                complete=complete,
+            )
+        )
+
+    assert {type(exception) for exception in captured.value.exceptions} == {RuntimeError, ValueError}

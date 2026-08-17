@@ -46,6 +46,22 @@ def _as_json(value: Any) -> Any:
     return value
 
 
+def _flatten_exception_groups(exc: BaseException) -> list[BaseException]:
+    if isinstance(exc, BaseExceptionGroup):
+        leaves: list[BaseException] = []
+        for sub in exc.exceptions:
+            leaves.extend(_flatten_exception_groups(sub))
+        return leaves
+    return [exc]
+
+
+def _unwrap_exception_group(exc: BaseException) -> BaseException:
+    leaves = _flatten_exception_groups(exc)
+    if len(leaves) == 1:
+        return leaves[0]
+    return ExceptionGroup("Catence agent failed with multiple errors", leaves)
+
+
 def _tool_definitions(tools: list[Any]) -> list[dict[str, Any]]:
     definitions: list[dict[str, Any]] = []
     for tool in tools:
@@ -211,82 +227,86 @@ async def respond(
 ) -> str:
     """Run one bounded Chat turn, displaying each evidence-producing MCP call."""
 
-    async with streamablehttp_client(mcp_url) as transport:
-        read_stream, write_stream = transport[:2]
-        async with ClientSession(read_stream, write_stream) as session:
-            initialized = await session.initialize()
-            listed_tools = await session.list_tools()
-            tools = _tool_definitions(list(listed_tools.tools))
-            messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
-            if athlete_id:
-                messages.insert(
-                    1,
-                    {
-                        "role": "system",
-                        "content": (
-                            f"This Console chat is scoped to athleteId {athlete_id!r}. "
-                            "Every Catence data tool call is forced to that athlete; do not try to select or compare another athlete."
-                        ),
-                    },
-                )
-            initialized_raw = _as_json(initialized)
-            server_instructions = initialized_raw.get("instructions") if isinstance(initialized_raw, dict) else None
-            if isinstance(server_instructions, str) and server_instructions.strip():
-                messages.insert(1, {"role": "system", "content": f"Catence MCP server instructions:\n{server_instructions}"})
-            if tool_call_store is not None and thread_id:
-                tool_history = _tool_history_message(tool_call_store.list(thread_id, limit=_TOOL_HISTORY_LIMIT))
-                if tool_history:
-                    messages.insert(1, {"role": "system", "content": tool_history})
-
-            for _ in range(tool_round_limit):
-                options: dict[str, Any] = {
-                    **profile.litellm_options(model_id),
-                    "messages": messages,
-                    "tools": tools,
-                    "tool_choice": "auto",
-                }
-                if reasoning_effort:
-                    options["reasoning_effort"] = reasoning_effort
-                completion = await complete(**options)
-                message = completion.choices[0].message
-                content = getattr(message, "content", None)
-                tool_calls = list(getattr(message, "tool_calls", None) or [])
-                if not tool_calls:
-                    return content or "The provider finished without a written response."
-
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": content,
-                        "tool_calls": _as_json(tool_calls),
-                    }
-                )
-                for tool_call in tool_calls:
-                    call_id, name, arguments = _tool_call_parts(tool_call)
-                    arguments = _scoped_tool_arguments(name, arguments, athlete_id)
-                    payload = await _invoke_tool(
-                        session,
-                        name,
-                        arguments,
-                        tool_result_character_limit,
-                        tool_call_store=tool_call_store,
-                        thread_id=thread_id,
-                        athlete_id=None,
+    try:
+        async with streamablehttp_client(mcp_url) as transport:
+            read_stream, write_stream = transport[:2]
+            async with ClientSession(read_stream, write_stream) as session:
+                initialized = await session.initialize()
+                listed_tools = await session.list_tools()
+                tools = _tool_definitions(list(listed_tools.tools))
+                messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+                if athlete_id:
+                    messages.insert(
+                        1,
+                        {
+                            "role": "system",
+                            "content": (
+                                f"This Console chat is scoped to athleteId {athlete_id!r}. "
+                                "Every Catence data tool call is forced to that athlete; do not try to select or compare another athlete."
+                            ),
+                        },
                     )
-                    if tool_call_store is not None and thread_id and name != _RECALL_SAVED_TOOL_RESULT:
-                        tool_call_store.record(
-                            thread_id=thread_id,
-                            call_id=call_id,
-                            name=name,
-                            arguments=arguments,
-                            result=payload,
-                        )
+                initialized_raw = _as_json(initialized)
+                server_instructions = initialized_raw.get("instructions") if isinstance(initialized_raw, dict) else None
+                if isinstance(server_instructions, str) and server_instructions.strip():
+                    messages.insert(1, {"role": "system", "content": f"Catence MCP server instructions:\n{server_instructions}"})
+                if tool_call_store is not None and thread_id:
+                    tool_history = _tool_history_message(tool_call_store.list(thread_id, limit=_TOOL_HISTORY_LIMIT))
+                    if tool_history:
+                        messages.insert(1, {"role": "system", "content": tool_history})
+
+                for _ in range(tool_round_limit):
+                    options: dict[str, Any] = {
+                        **profile.litellm_options(model_id),
+                        "messages": messages,
+                        "tools": tools,
+                        "tool_choice": "auto",
+                    }
+                    if reasoning_effort:
+                        options["reasoning_effort"] = reasoning_effort
+                    completion = await complete(**options)
+                    message = completion.choices[0].message
+                    content = getattr(message, "content", None)
+                    tool_calls = list(getattr(message, "tool_calls", None) or [])
+                    if not tool_calls:
+                        return content or "The provider finished without a written response."
+
                     messages.append(
                         {
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": json.dumps(payload, ensure_ascii=False, default=str),
+                            "role": "assistant",
+                            "content": content,
+                            "tool_calls": _as_json(tool_calls),
                         }
                     )
+                    for tool_call in tool_calls:
+                        call_id, name, arguments = _tool_call_parts(tool_call)
+                        arguments = _scoped_tool_arguments(name, arguments, athlete_id)
+                        payload = await _invoke_tool(
+                            session,
+                            name,
+                            arguments,
+                            tool_result_character_limit,
+                            tool_call_store=tool_call_store,
+                            thread_id=thread_id,
+                            athlete_id=None,
+                        )
+                        if tool_call_store is not None and thread_id and name != _RECALL_SAVED_TOOL_RESULT:
+                            tool_call_store.record(
+                                thread_id=thread_id,
+                                call_id=call_id,
+                                name=name,
+                                arguments=arguments,
+                                result=payload,
+                            )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": json.dumps(payload, ensure_ascii=False, default=str),
+                            }
+                        )
+
+    except BaseExceptionGroup as group:
+        raise _unwrap_exception_group(group) from None
 
     return f"I stopped after {tool_round_limit} Catence tool calls. Please narrow the question or raise the tool-round limit in settings."
