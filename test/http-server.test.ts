@@ -36,7 +36,7 @@ describe('Catence Streamable HTTP server', () => {
     await expect(health.json()).resolves.toEqual({
       status: 'ok',
       service: 'catence',
-      runtimeVersion: '0.2.0-beta.4',
+      runtimeVersion: '0.2.0-beta.5',
       protocolVersion: 1,
       capabilities: { mcp: true, dashboardApi: 1, demoStore: true },
     });

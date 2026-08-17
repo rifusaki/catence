@@ -1,7 +1,7 @@
 {
-  "version": "0.2.0-beta.4",
-  "pythonVersion": "0.2.0b4",
-  "chainlitVersion": "0.2.0b4",
+  "version": "0.2.0-beta.5",
+  "pythonVersion": "0.2.0b5",
+  "chainlitVersion": "0.2.0b5",
   "channel": "beta",
   "protocolVersion": 1,
   "node": ">=22",

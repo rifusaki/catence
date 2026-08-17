@@ -62,7 +62,7 @@ def test_runtime_command_uses_the_lockstep_npm_release(monkeypatch, tmp_path):
 
     command = cli._runtime_command(tmp_path, "127.0.0.1", 8787, 8000)
 
-    assert command[:4] == ["npx", "--yes", "catence@0.2.0-beta.4", "serve"]
+    assert command[:4] == ["npx", "--yes", "catence@0.2.0-beta.5", "serve"]
     assert command[command.index("--home") + 1] == str(tmp_path)
 
 
