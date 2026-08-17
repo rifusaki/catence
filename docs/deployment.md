@@ -231,7 +231,31 @@ docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.e
 Expect `"ready": true` once the model key is set; missing keys show up per
 profile without ever printing their values.
 
-### 7. Expose the Console safely
+### 7. Sync, backfill, and inspect athlete data
+
+The deploy scaffold includes a helper that runs `catence-data` *inside the
+running container* with `exec`, so the athlete's provider secrets from the
+data volume are already available:
+
+```sh
+./catence-deploy/sync.sh --athlete alex sync                  # incremental sync, all providers
+./catence-deploy/sync.sh --athlete alex backfill 2026-01-01   # full backfill from a date
+./catence-deploy/sync.sh --athlete alex status                # coverage and errors
+./catence-deploy/sync.sh athletes                             # list athlete IDs
+```
+
+`sync` defaults to `--provider all`; extra flags pass through, for example
+`./catence-deploy/sync.sh --athlete alex sync --refresh` or
+`./catence-deploy/sync.sh --athlete alex backfill 2026-01-01 --provider garmin`.
+Set a default athlete with `export CATENCE_ATHLETE=alex` to drop the
+`--athlete` argument. The equivalent long form is:
+
+```sh
+docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env exec console \
+  catence-data sync --athlete alex --provider all --home /data
+```
+
+### 8. Expose the Console safely
 
 Keep the Console port bound to `127.0.0.1` (the default) and front it with a
 Cloudflare Tunnel or reverse proxy at HTTPS. Never expose Catence's MCP port

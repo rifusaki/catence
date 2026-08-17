@@ -398,11 +398,97 @@ EOF
   chmod +x "$DEPLOY_DIR/doctor.sh"
 }
 
+write_sync_helper() {
+  cat > "$DEPLOY_DIR/sync.sh" <<'EOF'
+#!/bin/sh
+# Run catence-data inside the running console container: the container's own
+# environment already holds the provider secrets, so incremental sync, full
+# backfill, coverage status, and athlete listing need no extra credentials.
+# (A `docker compose run` container would need the secrets piped in again.)
+set -eu
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ATHLETE="${CATENCE_ATHLETE:-}"
+
+print_help() {
+  cat <<'USAGE'
+usage: sync.sh [--athlete <id>] <command> [args...]
+
+commands:
+  sync                   incremental sync of all providers
+  backfill <date>        full backfill from an ISO date (for example 2026-01-01)
+  status                 per-provider coverage and errors
+  athletes               list athlete IDs in the catalog
+
+options:
+  --athlete <id>         athlete ID (default: $CATENCE_ATHLETE)
+  -h, --help             show this help
+
+examples:
+  ./sync.sh --athlete martina sync
+  ./sync.sh --athlete martina backfill 2026-01-01
+  ./sync.sh --athlete martina status
+  ./sync.sh athletes
+USAGE
+}
+
+usage() {
+  print_help >&2
+  exit 1
+}
+
+if [ "${1:-}" = "--athlete" ]; then
+  ATHLETE="$2"
+  shift 2
+elif [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  print_help
+  exit 0
+fi
+
+command="${1:-}"
+[ -n "$command" ] || usage
+[ "$command" = "athletes" ] || [ -n "$ATHLETE" ] || usage
+
+case "$command" in
+  sync)
+    shift
+    exec docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" exec console \
+      catence-data sync --athlete "$ATHLETE" --provider all --home /data "$@"
+    ;;
+  backfill)
+    shift
+    from="${1:-}"
+    case "$from" in
+      ""|--*)
+        echo "error: backfill needs an ISO from date (for example: ./sync.sh --athlete martina backfill 2026-01-01)" >&2
+        exit 1
+        ;;
+    esac
+    shift
+    exec docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" exec console \
+      catence-data backfill --athlete "$ATHLETE" --from "$from" --home /data "$@"
+    ;;
+  status)
+    shift
+    exec docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" exec console \
+      catence-data status --athlete "$ATHLETE" --home /data "$@"
+    ;;
+  athletes)
+    shift
+    exec docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" exec console \
+      catence-data athlete list --home /data "$@"
+    ;;
+  *) usage ;;
+esac
+EOF
+  chmod +x "$DEPLOY_DIR/sync.sh"
+}
+
 write_dockerfile
 write_compose
 write_env
 write_hash_helper
 write_doctor_helper
+write_sync_helper
 
 # ---------------------------------------------------------------------------
 # Dry run stops after writing the scaffold
@@ -506,6 +592,11 @@ info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env
 info "  Verify the model profiles and env vars:"
 info "    $DEPLOY_DIR/doctor.sh"
 info "    (or, with --home, edit <home>/config.json on the host; model keys stay in .env)"
+info "  Sync / backfill / inspect one athlete's data:"
+info "    $DEPLOY_DIR/sync.sh --athlete alex sync"
+info "    $DEPLOY_DIR/sync.sh --athlete alex backfill 2026-01-01"
+info "    $DEPLOY_DIR/sync.sh --athlete alex status"
+info "    $DEPLOY_DIR/sync.sh athletes"
 info "  Discover OpenCode Go models into the config:"
 info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env run --rm --entrypoint node console /usr/local/lib/node_modules/catence/scripts/discover-opencode-go.mjs --write /data/config.json"
 info "  Check status / logs:"
