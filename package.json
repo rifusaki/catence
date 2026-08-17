@@ -1,6 +1,6 @@
 {
   "name": "catence",
-  "version": "0.2.0-beta.5",
+  "version": "0.2.0-beta.6",
   "description": "Local MCP access to normalized Garmin, Intervals.icu, and targeted Strava fitness data.",
   "license": "AGPL-3.0-or-later",
   "repository": {
