@@ -213,6 +213,34 @@ docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.e
 
 [`config.example.json`](config.example.json) documents rate limits, Strava budgets, and Console model profiles. It intentionally contains environment-variable names rather than credential values. Keep per-athlete provider values in `catence-data secret set`, not in `.env` or `config.json`.
 
+### Per-model reasoning effort
+
+Models that support reasoning effort (e.g., DeepSeek V4 Flash on Opencode Zen) can set it per deployment in `config.json`:
+
+```json
+{
+  "console": {
+    "profiles": {
+      "opencode-zen": {
+        "label": "OpenCode Zen",
+        "defaultModel": "deepseek-v4-flash-free",
+        "models": {
+          "deepseek-v4-flash-free": {
+            "label": "DeepSeek V4 Flash Free",
+            "model": "openai/deepseek-v4-flash-free",
+            "reasoningEffort": "high"
+          }
+        },
+        "apiKeyEnv": "OPENCODE_API_KEY",
+        "apiBaseEnv": "OPENCODE_ZEN_API_BASE"
+      }
+    }
+  }
+}
+```
+
+Supported values: `minimal`, `low`, `medium`, `high` (OpenAI standard). The model-level value overrides any profile-level `defaultReasoningEffort`. If neither is set, the provider default is used.
+
 For source development:
 
 ```sh
