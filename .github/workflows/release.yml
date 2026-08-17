@@ -104,6 +104,15 @@ jobs:
       - name: Verify the matching Catence Chainlit wheel is published
         run: |
           version=$(node -p "require('./release/manifest.json').chainlitVersion")
+          # PyPI's CDN can lag a few minutes behind the upload; retry before failing.
+          for attempt in 1 2 3 4 5 6; do
+            if uv pip install --system "catence-chainlit==$version" 2>/dev/null; then
+              echo "catence-chainlit==$version is published (attempt $attempt)"
+              exit 0
+            fi
+            echo "catence-chainlit==$version not visible yet (attempt $attempt); waiting 30s"
+            sleep 30
+          done
           uv pip install --system "catence-chainlit==$version"
       - run: uv build console --wheel --out-dir dist/console
       - uses: actions/upload-artifact@v4
