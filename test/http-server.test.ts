@@ -2,6 +2,7 @@ import type { AddressInfo } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterEach, describe, expect, it } from 'vitest';
+import { CATENCE_PROTOCOL_VERSION, CATENCE_RUNTIME_VERSION } from '../src/contracts/release.js';
 import { createCatenceHttpServer } from '../src/interfaces/http/server.js';
 import { temporaryDatabase } from './helpers.js';
 
@@ -36,8 +37,8 @@ describe('Catence Streamable HTTP server', () => {
     await expect(health.json()).resolves.toEqual({
       status: 'ok',
       service: 'catence',
-      runtimeVersion: '0.2.0-beta.7',
-      protocolVersion: 1,
+      runtimeVersion: CATENCE_RUNTIME_VERSION,
+      protocolVersion: CATENCE_PROTOCOL_VERSION,
       capabilities: { mcp: true, dashboardApi: 1, demoStore: true },
     });
 
