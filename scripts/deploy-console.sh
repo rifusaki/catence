@@ -314,7 +314,7 @@ EXPOSE 8000 8787
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:8000/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
-ENTRYPOINT ["/opt/catence-console/bin/catence-console", "serve", "--ui-host", "0.0.0.0", "--mcp-host", "${CATENCE_MCP_BIND}"]
+ENTRYPOINT ["/bin/sh", "-c", "/opt/catence-console/bin/catence-console serve --ui-host 0.0.0.0 --host \"${CATENCE_MCP_BIND:-127.0.0.1}\""]
 EOF
 }
 
@@ -347,6 +347,7 @@ services:
       - "\${CATENCE_MCP_BIND:-${MCP_BIND}}:${MCP_PORT}:8787"
     environment:
       CATENCE_HOME: /data
+      CATENCE_MCP_BIND: "\${CATENCE_MCP_BIND:-${MCP_BIND}}"
       CATENCE_CONSOLE_USERNAME: "\${CATENCE_CONSOLE_USERNAME:-}"
       CATENCE_CONSOLE_PASSWORD_HASH: "\${CATENCE_CONSOLE_PASSWORD_HASH:-}"
       CHAINLIT_AUTH_SECRET: "\${CHAINLIT_AUTH_SECRET:-}"
