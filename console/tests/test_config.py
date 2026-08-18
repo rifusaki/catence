@@ -234,6 +234,17 @@ def test_confirming_custom_settings_persists_them_and_confirming_reset_clears_th
 
     monkeypatch.setattr(app.cl, "Message", FakeMessage)
 
+    refreshes: list[dict] = []
+
+    class FakeChatSettings:
+        def __init__(self, inputs):
+            self.inputs = inputs
+
+        async def refresh(self):
+            refreshes.append({input_.id: input_ for input_ in self.inputs})
+
+    monkeypatch.setattr(app.cl, "ChatSettings", FakeChatSettings)
+
     asyncio.run(
         app.update_settings(
             {
@@ -252,6 +263,9 @@ def test_confirming_custom_settings_persists_them_and_confirming_reset_clears_th
         tool_result_characters=48_000,
         athlete_id="athlete-a",
     )
+    assert len(refreshes) == 1
+    assert refreshes[0]["reasoningEffort"].disabled is False
+    assert refreshes[0]["model"].initial_value == "openai-compatible:luna"
 
     asyncio.run(
         app.update_settings(
@@ -264,6 +278,8 @@ def test_confirming_custom_settings_persists_them_and_confirming_reset_clears_th
         )
     )
     assert store.load("athlete-a") is None
+    assert len(refreshes) == 2
+    assert refreshes[1]["model"].initial_value == "openai-compatible:terra"
 
 
 def test_model_variants_map_dropdown_labels_to_reasoning_effort_values(tmp_path):
@@ -335,6 +351,96 @@ def test_model_variants_reach_the_chat_settings_dropdown(tmp_path):
     assert effort["initial"] == "high"
 
 
+def test_empty_variants_disable_reasoning_effort_for_a_model(tmp_path):
+    write_config(
+        tmp_path,
+        {
+            "defaultProfile": "opencode-go",
+            "profiles": {
+                "opencode-go": {
+                    "models": {
+                        "mimo-v2.5": {
+                            "label": "MiMo V2.5",
+                            "model": "openai/mimo-v2.5",
+                            "variants": {},
+                        }
+                    },
+                    "defaultModel": "mimo-v2.5",
+                }
+            },
+        },
+    )
+
+    configuration = load_console_configuration(tmp_path)
+    profile, model_id = configuration.selected_model("opencode-go:mimo-v2.5")
+    model = profile.model_option(model_id)
+
+    assert model.reasoning_effort_disabled is True
+    assert profile.reasoning_effort_choices(model_id) == {}
+    assert profile.valid_reasoning_effort(model_id) == {"default"}
+    assert profile.litellm_options(model_id) == {"model": "openai/mimo-v2.5"}
+
+
+def test_rejects_fixed_reasoning_effort_combined_with_empty_variants(tmp_path):
+    write_config(
+        tmp_path,
+        {
+            "profiles": {
+                "opencode-go": {
+                    "models": {
+                        "mimo-v2.5": {
+                            "label": "MiMo V2.5",
+                            "model": "openai/mimo-v2.5",
+                            "reasoningEffort": "high",
+                            "variants": {},
+                        }
+                    },
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ConsoleConfigurationError, match="empty variants"):
+        load_console_configuration(tmp_path)
+
+
+def test_disabled_reasoning_effort_disables_the_dropdown(tmp_path):
+    write_config(
+        tmp_path,
+        {
+            "defaultProfile": "opencode-go",
+            "profiles": {
+                "opencode-go": {
+                    "models": {
+                        "mimo-v2.5": {
+                            "label": "MiMo V2.5",
+                            "model": "openai/mimo-v2.5",
+                            "variants": {},
+                        }
+                    },
+                    "defaultModel": "mimo-v2.5",
+                }
+            },
+        },
+    )
+    configuration = load_console_configuration(tmp_path)
+    settings = _chat_settings(
+        configuration,
+        model_choice="opencode-go:mimo-v2.5",
+        reasoning_effort=None,
+        tool_rounds=8,
+        tool_result_characters=24_000,
+        athlete_id="athlete-a",
+        athletes={"Athlete A": "athlete-a"},
+        default_athlete_id="athlete-a",
+    )
+    values = {input["id"]: input for input in settings._inputs_as_dicts()}
+    effort = values["reasoningEffort"]
+    assert effort["disabled"] is True
+    assert effort["items"] == [{"label": "Provider default", "value": "default"}]
+    assert effort["initial"] == "default"
+
+
 def test_session_settings_validate_reasoning_effort_against_model_variants(tmp_path, monkeypatch):
     write_config(
         tmp_path,
@@ -370,7 +476,6 @@ def test_session_settings_validate_reasoning_effort_against_model_variants(tmp_p
 @pytest.mark.parametrize(
     "variants",
     [
-        {},
         {"High": ""},
         {"High": 3},
         {"High": None},

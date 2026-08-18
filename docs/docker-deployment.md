@@ -91,6 +91,25 @@ docker compose -f docker-compose.yml --env-file .env exec console \
 docker compose -f docker-compose.yml --env-file .env exec console \
   catence-data disconnect strava --athlete alex --home /data
 
+# Strava OAuth via SSH (remote Docker host accessed over SSH/Tailscale)
+## Option 1: SSH Port Forwarding (recommended)
+# On your LOCAL machine, forward the callback port to the remote Docker host:
+ssh -L 8765:127.0.0.1:8765 user@docker-host
+# Then run the standard callback flow on the REMOTE host (uses http://127.0.0.1:8765/strava/callback)
+docker compose -f docker-compose.yml --env-file .env exec console \
+  catence-data auth strava --athlete alex --callback --home /data
+
+## Option 2: Manual code exchange with http://localhost
+# On the REMOTE host, get the authorization URL:
+docker compose -f docker-compose.yml --env-file .env run --rm \
+  --entrypoint catence-data console auth strava \
+  --athlete alex --redirect-uri "http://localhost" --home /data
+# Open the printed URL in YOUR LOCAL BROWSER, approve Strava, then copy the 'code' from the redirect URL
+# Exchange the code on the REMOTE host:
+docker compose -f docker-compose.yml --env-file .env run --rm \
+  --entrypoint catence-data console auth strava \
+  --athlete alex --code "THE_CODE_FROM_URL" --redirect-uri "http://localhost" --home /data
+
 # Update the runtime and Console (re-run deploy script on the same channel)
 curl -fsSL https://raw.githubusercontent.com/rifusaki/catence/beta/scripts/deploy-console.sh | bash -s beta
 # or from checkout: ./scripts/deploy-console.sh beta

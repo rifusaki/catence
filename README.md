@@ -253,7 +253,19 @@ Models that support reasoning effort can set a fixed level per model in `config.
 
 With `variants`, the chat **Thinking effort** dropdown shows `Provider default` plus each label; selecting one sends that exact value (e.g. `reasoning_effort: "high"`). Without `variants`, the dropdown falls back to the OpenAI-standard set (`minimal`, `low`, `medium`, `high`, `xhigh`).
 
-A fixed `reasoningEffort` overrides any profile-level `defaultReasoningEffort`; the per-chat dropdown selection (a variant value) overrides both. If nothing is set, the provider default is used.
+**Disabling reasoning effort**: an explicitly empty `variants` map (`"variants": {}`) disables the feature for that model — no `reasoning_effort` is ever sent and the **Thinking effort** dropdown is greyed out. This is how models that reject the parameter (for example MiMo, which expects its own `thinking` toggle) are configured:
+
+```json
+"mimo-v2.5": {
+  "label": "MiMo V2.5",
+  "model": "openai/mimo-v2.5",
+  "variants": {}
+}
+```
+
+A model cannot combine `variants: {}` with a fixed `reasoningEffort`.
+
+A fixed `reasoningEffort` overrides any profile-level `defaultReasoningEffort`; the per-chat dropdown selection (a variant value) overrides both. If nothing is set, the provider default is used. The dropdown options always follow the model currently selected in the **Model** dropdown.
 
 For source development:
 

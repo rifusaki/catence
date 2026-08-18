@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from catence_console import agent
-from catence_console.config import ProviderProfile
+from catence_console.config import ModelOption, ProviderProfile
 from catence_console.persistence import tool_call_store
 
 
@@ -81,6 +81,41 @@ def test_respond_normalizes_mcp_tools_for_litellm(monkeypatch):
         },
     }
     assert captured["tools"][1]["function"]["name"] == "recall_saved_tool_result"
+
+
+def test_respond_never_sends_reasoning_effort_for_disabled_models(monkeypatch):
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", FakeSession)
+    captured = {}
+
+    async def complete(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Evidence summary", tool_calls=[]))])
+
+    profile = ProviderProfile(
+        id="opencode-go",
+        label="OpenCode Go",
+        model="openai/mimo-v2.5",
+        models={
+            "mimo-v2.5": ModelOption(id="mimo-v2.5", label="MiMo V2.5", model="openai/mimo-v2.5", variants={}),
+        },
+        default_model="mimo-v2.5",
+    )
+    answer = asyncio.run(
+        agent.respond(
+            profile=profile,
+            model_id="mimo-v2.5",
+            reasoning_effort="high",
+            history=[{"role": "user", "content": "How am I recovering?"}],
+            mcp_url="http://example.test/mcp",
+            complete=complete,
+        )
+    )
+
+    assert answer == "Evidence summary"
+    assert captured["model"] == "openai/mimo-v2.5"
+    assert "reasoning_effort" not in captured
+    assert "allowed_openai_params" not in captured
 
 
 def test_tool_result_limit_marks_truncated_evidence():

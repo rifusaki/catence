@@ -287,6 +287,7 @@ def _chat_settings(
     except ConsoleConfigurationError:
         profile, model_id = configuration.selected_model(defaults.model_choice)
     effort_choices = {"Provider default": "default", **profile.reasoning_effort_choices(model_id)}
+    effort_disabled = profile.reasoning_effort_disabled(model_id)
     return cl.ChatSettings(
         [
             Select(
@@ -311,7 +312,12 @@ def _chat_settings(
                 items=effort_choices,
                 initial_value=reasoning_effort or "default",
                 reset_value=defaults.reasoning_effort,
-                description="Reasoning-effort level for this model. Variants come from the model's config, falling back to the OpenAI-standard set.",
+                disabled=effort_disabled,
+                description=(
+                    "This model does not expose reasoning-effort levels; the provider default is always used."
+                    if effort_disabled
+                    else "Reasoning-effort level for this model. Variants come from the model's config, falling back to the OpenAI-standard set."
+                ),
             ),
             NumberInput(
                 id="toolRounds",
@@ -493,6 +499,17 @@ async def update_settings(settings: dict[str, Any]) -> None:
     )
     _apply_preferences(preferences)
     _persist_preferences(configuration, preferences)
+    settings_widgets = _chat_settings(
+        configuration,
+        model_choice=preferences.model_choice,
+        reasoning_effort=preferences.reasoning_effort,
+        tool_rounds=preferences.tool_rounds,
+        tool_result_characters=preferences.tool_result_characters,
+        athlete_id=preferences.athlete_id,
+        athletes=athletes,
+        default_athlete_id=default_athlete_id,
+    )
+    await settings_widgets.refresh()
     selected_model = profile.model_option(model_id)
     await cl.Message(
         content=(

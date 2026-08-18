@@ -229,8 +229,11 @@ async def respond(
 
     # Resolve reasoning_effort priority: per-chat selection > model option >
     # profile default (the profile default is resolved upstream by _session_settings).
+    # Models with reasoning effort disabled never receive the parameter.
     model_option = profile.model_option(model_id)
-    effective_reasoning_effort = reasoning_effort or model_option.reasoning_effort
+    effective_reasoning_effort = (
+        None if model_option.reasoning_effort_disabled else reasoning_effort or model_option.reasoning_effort
+    )
 
     try:
         async with streamablehttp_client(mcp_url) as transport:

@@ -33,21 +33,33 @@ class ModelOption:
     reasoning_effort: str | None = None
     variants: dict[str, str] | None = None
 
+    @property
+    def reasoning_effort_disabled(self) -> bool:
+        """True when the model explicitly exposes no reasoning-effort levels."""
+
+        return self.variants == {}
+
     def reasoning_effort_values(self) -> set[str]:
         """Valid reasoning-effort values for this model, including the "default" sentinel.
 
         When the model declares ``variants`` they become the only accepted
-        values; otherwise the OpenAI-standard set applies.
+        values; an explicitly empty ``variants`` map disables the feature and
+        accepts only the "default" sentinel; otherwise the OpenAI-standard set
+        applies.
         """
 
-        if self.variants:
+        if self.variants is not None:
             return set(self.variants.values()) | {"default"}
         return set(REASONING_EFFORTS) | {"default"}
 
     def reasoning_effort_choices(self) -> dict[str, str]:
-        """Dropdown options mapping a visible label to the value sent to the API."""
+        """Dropdown options mapping a visible label to the value sent to the API.
 
-        if self.variants:
+        Empty for disabled models (the caller prepends the "Provider default"
+        sentinel); the OpenAI-standard set otherwise.
+        """
+
+        if self.variants is not None:
             return self.variants
         return {effort: effort for effort in REASONING_EFFORTS}
 
@@ -103,12 +115,17 @@ class ProviderProfile:
 
         return self.model_option(model_id).reasoning_effort_values()
 
+    def reasoning_effort_disabled(self, model_id: str | None = None) -> bool:
+        """True when the selected model exposes no reasoning-effort levels."""
+
+        return self.model_option(model_id).reasoning_effort_disabled
+
     def litellm_options(self, model_id: str | None = None) -> dict[str, str]:
         """Return only present credentials; values are never logged or persisted."""
 
         model_option = self.model_option(model_id)
         options: dict[str, str] = {"model": model_option.model}
-        if model_option.reasoning_effort:
+        if model_option.reasoning_effort and not model_option.reasoning_effort_disabled:
             options["reasoning_effort"] = model_option.reasoning_effort
         mappings = (
             ("api_key", self.api_key_env),
@@ -225,6 +242,10 @@ def _model_option(value: Any, profile_id: str, model_id: str) -> ModelOption:
     if reasoning_effort is not None and not isinstance(reasoning_effort, str):
         raise ConsoleConfigurationError(f"console.profiles.{profile_id}.models.{model_id}.reasoningEffort must be a string.")
     variants = _model_variants(model.get("variants"), profile_id, model_id)
+    if reasoning_effort is not None and variants == {}:
+        raise ConsoleConfigurationError(
+            f"console.profiles.{profile_id}.models.{model_id} cannot combine a fixed reasoningEffort with empty variants."
+        )
     return ModelOption(id=model_id, label=label, model=name, reasoning_effort=reasoning_effort, variants=variants)
 
 
@@ -233,16 +254,14 @@ def _model_variants(value: Any, profile_id: str, model_id: str) -> dict[str, str
 
     Values are intentionally free-form so non-OpenAI models (for example
     DeepSeek V4 Flash with its own Default/High/Max scheme) can expose their own
-    reasoning-effort levels instead of the OpenAI-standard list.
+    reasoning-effort levels instead of the OpenAI-standard list. An explicitly
+    empty ``variants`` map disables the reasoning-effort feature for that model:
+    no effort is sent and the dropdown is disabled.
     """
 
     if value is None:
         return None
     variants = _object(value, f"console.profiles.{profile_id}.models.{model_id}.variants")
-    if not variants:
-        raise ConsoleConfigurationError(
-            f"console.profiles.{profile_id}.models.{model_id}.variants must not be empty."
-        )
     parsed: dict[str, str] = {}
     for option_label, option_value in variants.items():
         if not isinstance(option_label, str) or not option_label.strip():

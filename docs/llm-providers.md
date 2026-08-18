@@ -411,10 +411,19 @@ Selecting a variant sends that value verbatim as `reasoning_effort` (with
 `allowed_openai_params` so LiteLLM forwards it for OpenAI-compatible models).
 The `Provider default` option sends no reasoning effort at all.
 
+An explicitly empty `variants` map disables reasoning effort for that model:
+no `reasoning_effort` is sent (the agent guards against it) and the chat
+**Thinking effort** dropdown is disabled in the UI. This suits models that
+reject the parameter, such as MiMo, which expects its own `thinking` toggle
+instead. `variants: {}` cannot be combined with a fixed `reasoningEffort` on
+the same model.
+
 You can also pin a fixed level with `reasoningEffort` on the model, or a
 profile-wide default with `defaultReasoningEffort` (OpenAI-standard values
 only). Precedence: per-chat dropdown selection > model `reasoningEffort` >
-profile `defaultReasoningEffort` > provider default.
+profile `defaultReasoningEffort` > provider default. The **Thinking effort**
+dropdown is rebuilt whenever the **Model** dropdown changes, so its options
+(and disabled state) always reflect the selected model.
 
 ## Verifying a profile
 
