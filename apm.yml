@@ -1,5 +1,5 @@
 name: catence
-version: 0.2.0-beta.9
+version: 0.2.0-beta.10
 description: Local, source-aware Garmin, Intervals.icu, and Strava fitness data for MCP clients.
 author: Rifusaki
 license: AGPL-3.0-or-later
@@ -11,7 +11,7 @@ dependencies:
       registry: false
       transport: stdio
       command: npx
-      args: ["-y", "catence@0.2.0-beta.9"]
+      args: ["-y", "catence@0.2.0-beta.10"]
       tools: ["*"]
     - name: catence-demo
       registry: false
