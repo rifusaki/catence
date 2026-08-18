@@ -215,7 +215,9 @@ docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.e
 
 ### Per-model reasoning effort
 
-Models that support reasoning effort (e.g., DeepSeek V4 Flash on Opencode Zen) can set it per deployment in `config.json`:
+Models that support reasoning effort can set a fixed level per model in `config.json`, or expose a per-chat **Thinking effort** dropdown with custom levels via `variants`.
+
+**Fixed level** (all requests for the model use it):
 
 ```json
 {
@@ -239,7 +241,19 @@ Models that support reasoning effort (e.g., DeepSeek V4 Flash on Opencode Zen) c
 }
 ```
 
-Supported values: `minimal`, `low`, `medium`, `high` (OpenAI standard). The model-level value overrides any profile-level `defaultReasoningEffort`. If neither is set, the provider default is used.
+**Custom variants** (per-chat dropdown): `variants` maps each dropdown label to the value sent to the provider. This is how non-OpenAI models (for example DeepSeek V4 Flash, which uses its own Default/High/Max scheme rather than the OpenAI-standard list) expose their native levels:
+
+```json
+"deepseek-v4-flash-free": {
+  "label": "DeepSeek V4 Flash Free",
+  "model": "openai/deepseek-v4-flash-free",
+  "variants": { "High": "high", "Max": "max" }
+}
+```
+
+With `variants`, the chat **Thinking effort** dropdown shows `Provider default` plus each label; selecting one sends that exact value (e.g. `reasoning_effort: "high"`). Without `variants`, the dropdown falls back to the OpenAI-standard set (`minimal`, `low`, `medium`, `high`, `xhigh`).
+
+A fixed `reasoningEffort` overrides any profile-level `defaultReasoningEffort`; the per-chat dropdown selection (a variant value) overrides both. If nothing is set, the provider default is used.
 
 For source development:
 

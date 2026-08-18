@@ -16,6 +16,7 @@
 #   ./deploy-console.sh beta                  # latest beta
 #   ./deploy-console.sh beta --generate-secrets  # prompt for a password hash
 #   ./deploy-console.sh --port 8080 --bind 0.0.0.0
+#   ./deploy-console.sh --mcp-bind 0.0.0.0     # expose MCP on Tailscale interface
 #   ./deploy-console.sh --home /mnt/d/catence-data --no-build
 #
 # The script writes the complete scaffold (Dockerfile, docker-compose.yml, and a
@@ -33,6 +34,8 @@ set -euo pipefail
 CHANNEL="${CATENCE_CHANNEL:-stable}"            # stable | beta
 PORT="${CATENCE_CONSOLE_PORT:-8000}"
 BIND="${CATENCE_BIND_ADDRESS:-127.0.0.1}"
+MCP_BIND="${CATENCE_MCP_BIND:-127.0.0.1}"
+MCP_PORT="${CATENCE_MCP_PORT:-8787}"
 DEPLOY_DIR="${CATENCE_DEPLOY_DIR:-catence-deploy}"
 USERNAME="${CATENCE_CONSOLE_USERNAME:-}"
 NPM_VERSION="${CATENCE_NPM_VERSION:-}"           # optional pin
@@ -61,7 +64,8 @@ Usage: curl -fsSL <raw-url> | bash -s [stable|beta] [options]
   stable|beta           channel (default: stable)
   --generate-secrets    prompt for a Console password and write its bcrypt hash
   --port N              host port to publish (default: 8000)
-  --bind ADDR           bind address (default: 127.0.0.1)
+  --bind ADDR           bind address for Console UI (default: 127.0.0.1)
+  --mcp-bind ADDR       bind address for MCP server (default: 127.0.0.1; use 0.0.0.0 for Tailscale)
   --dir DIR             deployment directory (default: ./catence-deploy)
   --home DIR            bind-mount DIR as the Catence data volume
   --volume NAME         named volume for Catence data (default: catence[-channel]-data)
@@ -97,6 +101,7 @@ while [ "$#" -gt 0 ]; do
     --channel)    shift; CHANNEL="$1" ;;
     --port)       shift; PORT="$1" ;;
     --bind)       shift; BIND="$1" ;;
+    --mcp-bind)   shift; MCP_BIND="$1" ;;
     --dir)        shift; DEPLOY_DIR="$1" ;;
     --username)   shift; USERNAME="$1" ;;
     --npm-version)    shift; NPM_VERSION="$1" ;;
@@ -168,6 +173,7 @@ if [ -f "$DEPLOY_DIR/.env" ]; then
   [ -n "${OPENCODE_GO_API_KEY:-}" ]          || OPENCODE_GO_API_KEY="$(dotenv_get OPENCODE_GO_API_KEY "$DEPLOY_DIR/.env")"
   [ -n "${OPENCODE_GO_API_BASE:-}" ]         || OPENCODE_GO_API_BASE="$(dotenv_get OPENCODE_GO_API_BASE "$DEPLOY_DIR/.env")"
   [ -n "${OPENCODE_GO_MESSAGES_API_BASE:-}" ] || OPENCODE_GO_MESSAGES_API_BASE="$(dotenv_get OPENCODE_GO_MESSAGES_API_BASE "$DEPLOY_DIR/.env")"
+  [ -n "${MCP_BIND:-}" ]            || MCP_BIND="$(dotenv_get CATENCE_MCP_BIND "$DEPLOY_DIR/.env")"
 fi
 
 USERNAME="${USERNAME:-coach}"
@@ -276,6 +282,7 @@ FROM node:22-bookworm-slim
 
 ARG CATENCE_NPM_VERSION
 ARG CATENCE_CONSOLE_VERSION
+ARG CATENCE_MCP_BIND
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_LINK_MODE=copy \
     UV_PYTHON_INSTALL_DIR=/usr/local/uv/python \
@@ -283,6 +290,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN test -n "$CATENCE_NPM_VERSION" \
     && test -n "$CATENCE_CONSOLE_VERSION" \
+    && test -n "$CATENCE_MCP_BIND" \
     && apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
@@ -301,12 +309,12 @@ RUN useradd --create-home --uid 10001 catence \
 USER catence
 WORKDIR /data
 VOLUME ["/data"]
-EXPOSE 8000
+EXPOSE 8000 8787
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:8000/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
-ENTRYPOINT ["/opt/catence-console/bin/catence-console", "serve", "--ui-host", "0.0.0.0", "--mcp-host", "127.0.0.1"]
+ENTRYPOINT ["/opt/catence-console/bin/catence-console", "serve", "--ui-host", "0.0.0.0", "--mcp-host", "${CATENCE_MCP_BIND}"]
 EOF
 }
 
@@ -331,10 +339,12 @@ services:
       args:
         CATENCE_NPM_VERSION: "${NPM_VERSION}"
         CATENCE_CONSOLE_VERSION: "${CONSOLE_VERSION}"
+        CATENCE_MCP_BIND: "\${CATENCE_MCP_BIND:-${MCP_BIND}}"
     image: ${IMAGE_NAME}
     restart: unless-stopped
     ports:
       - "${BIND}:${PORT}:8000"
+      - "\${CATENCE_MCP_BIND:-${MCP_BIND}}:${MCP_PORT}:8787"
     environment:
       CATENCE_HOME: /data
       CATENCE_CONSOLE_USERNAME: "\${CATENCE_CONSOLE_USERNAME:-}"
@@ -362,6 +372,7 @@ CATENCE_CONSOLE_VERSION=${CONSOLE_VERSION}
 CATENCE_CONSOLE_USERNAME=${USERNAME}
 CATENCE_CONSOLE_PASSWORD_HASH=${PASSWORD_HASH}
 CHAINLIT_AUTH_SECRET=${AUTH_SECRET}
+CATENCE_MCP_BIND=${MCP_BIND}
 OPENAI_API_KEY=${OPENAI_API_KEY:-}
 OPENAI_API_BASE=${OPENAI_API_BASE:-}
 ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -581,6 +592,11 @@ info "  image:    $IMAGE_NAME"
 info "  project:  $PROJECT"
 info "  data:     $([ -n "$DATA_HOME" ] && printf '%s' "$DATA_HOME" || printf 'named volume %s' "$DATA_VOLUME")"
 info "  console:  http://${BIND}:${PORT}  (login: $USERNAME)"
+if [ "${MCP_BIND}" != "127.0.0.1" ]; then
+  info "  mcp:      http://${MCP_BIND}:${MCP_PORT}/mcp  (exposed on ${MCP_BIND})"
+else
+  info "  mcp:      loopback only (use SSH port forwarding: ssh -L 8787:127.0.0.1:8787 <host>)"
+fi
 info ""
 info "Next steps:"
 info "  Initialize an athlete store:"
@@ -603,5 +619,10 @@ info "  Check status / logs:"
 info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml ps"
 info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml logs -f"
 info ""
-info "Keep the Console on loopback and front it with Cloudflare Tunnel (or a reverse"
-info "proxy); do not expose Catence port 8787 to the internet."
+if [ "${MCP_BIND}" != "127.0.0.1" ]; then
+  info "MCP server is exposed on ${MCP_BIND}:${MCP_PORT}. Restrict access via Tailscale ACLs or firewall."
+  info "The MCP server has no authentication — it trusts the caller's athleteId parameter."
+else
+  info "Keep the Console on loopback and front it with Cloudflare Tunnel (or a reverse"
+  info "proxy); do not expose Catence port 8787 to the internet."
+fi

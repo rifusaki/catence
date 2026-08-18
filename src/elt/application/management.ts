@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import type { CatencePaths } from '../../contracts/runtime.js';
 import { buildRetrievalIndex } from '../../core/retrieval/index.js';
 import { defaultFromDate, ensurePaths, requireIntervalsConfig } from '../../core/runtime/configuration.js';
+import { createSyncLogger, type SyncLogger } from '../../core/logging.js';
 import { athleteProviderEnvironment } from '../../core/runtime/secrets.js';
 import { importJsonl } from '../ingestion/importer.js';
 import { IntervalsExtractor } from '../ingestion/providers/intervals.js';
@@ -42,7 +43,7 @@ function packageRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 }
 
-async function syncProvider(database: CatenceDatabase, paths: CatencePaths, provider: SyncProviderChoice, options: { explicitFrom?: string; toDate: string; advanceCursor: boolean; refreshActivities: boolean; backfill: boolean }): Promise<SyncResult> {
+async function syncProvider(database: CatenceDatabase, paths: CatencePaths, provider: SyncProviderChoice, options: { explicitFrom?: string; toDate: string; advanceCursor: boolean; refreshActivities: boolean; backfill: boolean }, log: SyncLogger): Promise<SyncResult> {
   const explicitWindow: DateWindow | null = options.explicitFrom ? { fromDate: options.explicitFrom, toDate: options.toDate, source: 'explicit' } : null;
   const uncoveredExplicitWindow = async (cursorName: 'daily' | 'activities'): Promise<DateWindow | null> => {
     if (!explicitWindow) return null;
@@ -54,6 +55,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
   const activityWindow = explicitWindow ? await uncoveredExplicitWindow('activities') : await database.resolveIncrementalWindow(provider, 'activities', options.toDate, defaultFromDate(), 14);
   const hasProviderWork = provider === 'intervals' ? activityWindow !== null : dailyWindow !== null || activityWindow !== null;
   if (!hasProviderWork) {
+    log.debug('No uncovered work; skipping provider', { provider, daily: dailyWindow ?? null, activities: activityWindow ?? null });
     return {
       runId: null, provider, fromDate: null,
       dailyFromDate: dailyWindow?.fromDate ?? null, dailyToDate: dailyWindow?.toDate ?? null,
@@ -64,13 +66,19 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
   }
   const fromDate = [dailyWindow?.fromDate, activityWindow?.fromDate].filter((date): date is string => Boolean(date)).sort()[0]!;
   const runId = await database.beginRun(provider, fromDate);
+  log.info('Starting sync run', {
+    runId, provider, fromDate, toDate: options.toDate,
+    dailyFrom: dailyWindow?.fromDate ?? null, dailyTo: dailyWindow?.toDate ?? null,
+    activityFrom: activityWindow?.fromDate ?? null, activityTo: activityWindow?.toDate ?? null,
+    backfill: options.backfill, refreshActivities: options.refreshActivities,
+  });
   let extractionStarted = false;
   try {
     if (provider === 'intervals') {
       const environment = await athleteProviderEnvironment(paths);
       const config = requireIntervalsConfig(environment);
       extractionStarted = true;
-      await new IntervalsExtractor(database, paths, config.apiKey, config.athleteId).sync(runId, activityWindow, !options.backfill || options.refreshActivities);
+      await new IntervalsExtractor(database, paths, config.apiKey, config.athleteId, log).sync(runId, activityWindow, !options.backfill || options.refreshActivities);
     } else {
       const output = path.join(paths.staging, 'garmin', `${runId}.jsonl`);
       const knownActivities = path.join(paths.staging, 'garmin', `${runId}.known-activities.json`);
@@ -91,12 +99,19 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
         env: { ...(await athleteProviderEnvironment(paths)), UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT ?? path.join(paths.root, 'python-venv') },
       });
       if (!existsSync(output)) throw new Error('Garmin staging worker completed without writing a JSONL manifest.');
-      await importJsonl(database, runId, output);
+      await importJsonl(database, runId, output, log);
     }
   } catch (error) {
-    await database.addError(runId, provider, 'sync', null, error instanceof Error ? error.message : String(error), true);
+    const message = error instanceof Error ? error.message : String(error);
+    log.error('Sync run failed', { runId, provider, error: message, stack: error instanceof Error ? error.stack : undefined });
+    await database.addError(runId, provider, 'sync', null, message, true);
   } finally {
     await database.finishRun(runId);
+    const [run] = await database.rows<{ status: string; error_count: number }>(
+      'SELECT status, error_count FROM sync_runs WHERE run_id = $runId',
+      { runId },
+    );
+    log.info('Sync run finished', { runId, provider, status: run?.status ?? 'unknown', errorCount: run?.error_count ?? 0 });
   }
   if (options.advanceCursor && !options.explicitFrom && extractionStarted) {
     await database.advanceIncrementalCursor(provider, 'daily', runId, options.toDate, 3);
@@ -122,11 +137,12 @@ export async function syncData(paths: CatencePaths, provider: ProviderChoice, ex
   await ensurePaths(paths);
   if (provider === 'strava') return { provider, result: await syncStravaGear(paths) };
   const database = await CatenceDatabase.open(paths);
+  const log = createSyncLogger(paths);
   try {
     const providers: SyncProviderChoice[] = provider === 'all' ? ['intervals', 'garmin'] : [provider];
     const toDate = new Date().toISOString().slice(0, 10);
     const runs: SyncResult[] = [];
-    for (const source of providers) runs.push(await syncProvider(database, paths, source, { explicitFrom, toDate, advanceCursor, refreshActivities, backfill }));
+    for (const source of providers) runs.push(await syncProvider(database, paths, source, { explicitFrom, toDate, advanceCursor, refreshActivities, backfill }, log));
     return { runIds: runs.flatMap((run) => run.runId ? [run.runId] : []), runs };
   } finally {
     await database.close();
@@ -140,7 +156,8 @@ export async function retryDataSync(paths: CatencePaths, previousRunId: string):
     const previous = await database.getRun(previousRunId);
     if (!previous) throw new Error(`No sync run found for ${previousRunId}.`);
     if (previous.provider === 'strava') throw new Error('Retry Strava gear sync with `catence-data sync --provider strava`.');
-    const run = await syncProvider(database, paths, previous.provider, { explicitFrom: previous.from_date, toDate: new Date().toISOString().slice(0, 10), advanceCursor: false, refreshActivities: false, backfill: false });
+    const log = createSyncLogger(paths);
+    const run = await syncProvider(database, paths, previous.provider, { explicitFrom: previous.from_date, toDate: new Date().toISOString().slice(0, 10), advanceCursor: false, refreshActivities: false, backfill: false }, log);
     return { retriedRun: previousRunId, runId: run.runId, run };
   } finally {
     await database.close();

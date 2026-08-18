@@ -373,6 +373,49 @@ settings then offer a per-deployment choice.
 }
 ```
 
+## Reasoning effort
+
+Models expose a per-chat **Thinking effort** dropdown in the Console settings.
+By default it offers the OpenAI-standard levels — `minimal`, `low`, `medium`,
+`high`, `xhigh` — which suit OpenAI and most OpenAI-compatible endpoints.
+
+Some models (for example DeepSeek V4 Flash) use their own reasoning-effort
+scheme rather than the OpenAI-standard list. For those, declare `variants` on
+the model: a mapping of dropdown label to the exact value sent to the provider.
+The chat dropdown then shows `Provider default` plus each label instead of the
+OpenAI-standard list.
+
+```jsonc
+{
+  "console": {
+    "profiles": {
+      "opencode-zen": {
+        "label": "OpenCode Zen",
+        "defaultModel": "deepseek-v4-flash-free",
+        "models": {
+          "deepseek-v4-flash-free": {
+            "label": "DeepSeek V4 Flash Free",
+            "model": "openai/deepseek-v4-flash-free",
+            "variants": { "High": "high", "Max": "max" }
+          }
+        },
+        "apiKeyEnv": "OPENCODE_API_KEY",
+        "apiBaseEnv": "OPENCODE_ZEN_API_BASE"
+      }
+    }
+  }
+}
+```
+
+Selecting a variant sends that value verbatim as `reasoning_effort` (with
+`allowed_openai_params` so LiteLLM forwards it for OpenAI-compatible models).
+The `Provider default` option sends no reasoning effort at all.
+
+You can also pin a fixed level with `reasoningEffort` on the model, or a
+profile-wide default with `defaultReasoningEffort` (OpenAI-standard values
+only). Precedence: per-chat dropdown selection > model `reasoningEffort` >
+profile `defaultReasoningEffort` > provider default.
+
 ## Verifying a profile
 
 `catence-console doctor` reports, for each profile, which environment variables

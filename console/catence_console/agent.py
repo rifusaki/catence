@@ -227,9 +227,10 @@ async def respond(
 ) -> str:
     """Run one bounded Chat turn, displaying each evidence-producing MCP call."""
 
-    # Resolve reasoning_effort priority: model option > profile default > explicit parameter
+    # Resolve reasoning_effort priority: per-chat selection > model option >
+    # profile default (the profile default is resolved upstream by _session_settings).
     model_option = profile.model_option(model_id)
-    effective_reasoning_effort = model_option.reasoning_effort or reasoning_effort
+    effective_reasoning_effort = reasoning_effort or model_option.reasoning_effort
 
     try:
         async with streamablehttp_client(mcp_url) as transport:

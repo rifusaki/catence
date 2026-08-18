@@ -8,8 +8,9 @@ import { importSourceEntity, refreshActivityQuality } from '../normalization/nor
 import { normalizeStravaEntity } from '../normalization/segments/strava-normalizer.js';
 import { reconcileActivityLink } from '../normalization/activities/linking.js';
 import { json } from '../storage/sql.js';
+import type { SyncLogger } from '../../core/logging.js';
 
-export async function importRecord(database: CatenceDatabase, runId: string, record: StagingRecord): Promise<void> {
+export async function importRecord(database: CatenceDatabase, runId: string, record: StagingRecord, log?: SyncLogger): Promise<void> {
   if (record.kind === 'run_manifest') {
     if (record.runId !== runId) throw new Error(`Staging manifest run ${record.runId} does not match importer run ${runId}.`);
     return;
@@ -57,16 +58,17 @@ export async function importRecord(database: CatenceDatabase, runId: string, rec
     return;
   }
   await database.addError(runId, record.provider, record.endpoint, record.remoteId, record.message, record.retryable);
+  log?.warn('Staging record reported an extraction error', { runId, provider: record.provider, endpoint: record.endpoint, remoteId: record.remoteId, error: record.message });
 }
 
-export async function importJsonl(database: CatenceDatabase, runId: string, filePath: string): Promise<number> {
+export async function importJsonl(database: CatenceDatabase, runId: string, filePath: string, log?: SyncLogger): Promise<number> {
   let count = 0;
   const file = createReadStream(filePath, { encoding: 'utf8' });
   const lines = createInterface({ input: file, crlfDelay: Infinity });
   for await (const line of lines) {
     if (!line.trim()) continue;
     const record = stagingRecordSchema.parse(JSON.parse(line));
-    await importRecord(database, runId, record);
+    await importRecord(database, runId, record, log);
     count += 1;
   }
   return count;

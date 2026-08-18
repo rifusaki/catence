@@ -168,8 +168,11 @@ def _session_settings(
         model_choice = configuration.default_model_choice()
         profile, model_id = configuration.selected_model(model_choice)
     reasoning_effort = cl.user_session.get("catence_reasoning_effort")
-    if reasoning_effort not in {"default", "minimal", "low", "medium", "high", "xhigh"}:
+    valid = profile.valid_reasoning_effort(model_id)
+    if reasoning_effort not in valid:
         reasoning_effort = profile.default_reasoning_effort
+        if reasoning_effort not in valid:
+            reasoning_effort = "default"
     if reasoning_effort == "default":
         reasoning_effort = None
     tool_rounds = cl.user_session.get("catence_tool_rounds")
@@ -216,12 +219,14 @@ def _normalized_preferences(
 ) -> SavedConsolePreferences:
     default = _configured_preferences(configuration, default_athlete_id)
     try:
-        configuration.selected_model(preferences.model_choice)
+        profile, model_id = configuration.selected_model(preferences.model_choice)
         model_choice = preferences.model_choice
     except ConsoleConfigurationError:
+        profile, model_id = configuration.selected_model(default.model_choice)
         model_choice = default.model_choice
     reasoning_effort = preferences.reasoning_effort
-    if reasoning_effort not in {"default", "minimal", "low", "medium", "high", "xhigh"}:
+    valid = profile.valid_reasoning_effort(model_id)
+    if reasoning_effort not in valid:
         reasoning_effort = default.reasoning_effort
     return SavedConsolePreferences(
         model_choice=model_choice,
@@ -277,6 +282,11 @@ def _chat_settings(
     default_athlete_id: str,
 ) -> cl.ChatSettings:
     defaults = _configured_preferences(configuration, default_athlete_id)
+    try:
+        profile, model_id = configuration.selected_model(model_choice)
+    except ConsoleConfigurationError:
+        profile, model_id = configuration.selected_model(defaults.model_choice)
+    effort_choices = {"Provider default": "default", **profile.reasoning_effort_choices(model_id)}
     return cl.ChatSettings(
         [
             Select(
@@ -298,13 +308,10 @@ def _chat_settings(
             Select(
                 id="reasoningEffort",
                 label="Thinking effort",
-                items={
-                    "Provider default": "default",
-                    **{effort.title(): effort for effort in ("minimal", "low", "medium", "high", "xhigh")},
-                },
+                items=effort_choices,
                 initial_value=reasoning_effort or "default",
                 reset_value=defaults.reasoning_effort,
-                description="Passed to models that support OpenAI reasoning effort.",
+                description="Reasoning-effort level for this model. Variants come from the model's config, falling back to the OpenAI-standard set.",
             ),
             NumberInput(
                 id="toolRounds",
@@ -465,8 +472,9 @@ async def update_settings(settings: dict[str, Any]) -> None:
         profile, model_id = configuration.selected_model(current.model_choice)
         model_choice = current.model_choice
     reasoning_effort = settings.get("reasoningEffort", current.reasoning_effort)
-    if reasoning_effort not in {"default", "minimal", "low", "medium", "high", "xhigh"}:
-        reasoning_effort = current.reasoning_effort
+    valid = profile.valid_reasoning_effort(model_id)
+    if reasoning_effort not in valid:
+        reasoning_effort = current.reasoning_effort if current.reasoning_effort in valid else "default"
     tool_rounds = _limit_setting(settings.get("toolRounds"), MIN_TOOL_ROUND_LIMIT, MAX_TOOL_ROUND_LIMIT)
     tool_result_characters = _limit_setting(
         settings.get("toolResultCharacters"), MIN_TOOL_RESULT_CHARACTER_LIMIT, MAX_TOOL_RESULT_CHARACTER_LIMIT

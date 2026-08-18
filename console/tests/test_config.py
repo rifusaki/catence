@@ -264,3 +264,134 @@ def test_confirming_custom_settings_persists_them_and_confirming_reset_clears_th
         )
     )
     assert store.load("athlete-a") is None
+
+
+def test_model_variants_map_dropdown_labels_to_reasoning_effort_values(tmp_path):
+    write_config(
+        tmp_path,
+        {
+            "defaultProfile": "opencode-go",
+            "profiles": {
+                "opencode-go": {
+                    "models": {
+                        "deepseek-v4-flash": {
+                            "label": "DeepSeek V4 Flash",
+                            "model": "openai/deepseek-v4-flash",
+                            "variants": {"High": "high", "Max": "max"},
+                        }
+                    },
+                    "defaultModel": "deepseek-v4-flash",
+                }
+            },
+        },
+    )
+
+    configuration = load_console_configuration(tmp_path)
+    profile, model_id = configuration.selected_model("opencode-go:deepseek-v4-flash")
+    model = profile.model_option(model_id)
+
+    assert model.variants == {"High": "high", "Max": "max"}
+    assert profile.reasoning_effort_choices(model_id) == {"High": "high", "Max": "max"}
+    assert profile.valid_reasoning_effort(model_id) == {"high", "max", "default"}
+
+
+def test_model_variants_reach_the_chat_settings_dropdown(tmp_path):
+    write_config(
+        tmp_path,
+        {
+            "defaultProfile": "opencode-go",
+            "profiles": {
+                "opencode-go": {
+                    "models": {
+                        "deepseek-v4-flash": {
+                            "label": "DeepSeek V4 Flash",
+                            "model": "openai/deepseek-v4-flash",
+                            "variants": {"High": "high", "Max": "max"},
+                        }
+                    },
+                    "defaultModel": "deepseek-v4-flash",
+                }
+            },
+        },
+    )
+    configuration = load_console_configuration(tmp_path)
+    settings = _chat_settings(
+        configuration,
+        model_choice="opencode-go:deepseek-v4-flash",
+        reasoning_effort="high",
+        tool_rounds=8,
+        tool_result_characters=24_000,
+        athlete_id="athlete-a",
+        athletes={"Athlete A": "athlete-a"},
+        default_athlete_id="athlete-a",
+    )
+    values = {input["id"]: input for input in settings._inputs_as_dicts()}
+    effort = values["reasoningEffort"]
+    assert effort["items"] == [
+        {"label": "Provider default", "value": "default"},
+        {"label": "High", "value": "high"},
+        {"label": "Max", "value": "max"},
+    ]
+    assert effort["initial"] == "high"
+
+
+def test_session_settings_validate_reasoning_effort_against_model_variants(tmp_path, monkeypatch):
+    write_config(
+        tmp_path,
+        {
+            "defaultProfile": "opencode-go",
+            "profiles": {
+                "opencode-go": {
+                    "models": {
+                        "deepseek-v4-flash": {
+                            "label": "DeepSeek V4 Flash",
+                            "model": "openai/deepseek-v4-flash",
+                            "variants": {"High": "high", "Max": "max"},
+                        }
+                    },
+                    "defaultModel": "deepseek-v4-flash",
+                }
+            },
+        },
+    )
+    configuration = load_console_configuration(tmp_path)
+
+    from catence_console import app
+
+    monkeypatch.setattr(app.cl.user_session, "get", lambda key: "opencode-go:deepseek-v4-flash" if key == "catence_model" else "high")
+    _, _, reasoning_effort, _, _, _ = _session_settings(configuration, "athlete-a", {"athlete-a"})
+    assert reasoning_effort == "high"
+
+    monkeypatch.setattr(app.cl.user_session, "get", lambda key: "opencode-go:deepseek-v4-flash" if key == "catence_model" else "minimal")
+    _, _, reasoning_effort, _, _, _ = _session_settings(configuration, "athlete-a", {"athlete-a"})
+    assert reasoning_effort is None
+
+
+@pytest.mark.parametrize(
+    "variants",
+    [
+        {},
+        {"High": ""},
+        {"High": 3},
+        {"High": None},
+    ],
+)
+def test_rejects_invalid_model_variants(tmp_path, variants):
+    write_config(
+        tmp_path,
+        {
+            "profiles": {
+                "opencode-go": {
+                    "models": {
+                        "deepseek-v4-flash": {
+                            "model": "openai/deepseek-v4-flash",
+                            "variants": variants,
+                        }
+                    }
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ConsoleConfigurationError, match="variants"):
+        load_console_configuration(tmp_path)

@@ -31,6 +31,25 @@ class ModelOption:
     label: str
     model: str
     reasoning_effort: str | None = None
+    variants: dict[str, str] | None = None
+
+    def reasoning_effort_values(self) -> set[str]:
+        """Valid reasoning-effort values for this model, including the "default" sentinel.
+
+        When the model declares ``variants`` they become the only accepted
+        values; otherwise the OpenAI-standard set applies.
+        """
+
+        if self.variants:
+            return set(self.variants.values()) | {"default"}
+        return set(REASONING_EFFORTS) | {"default"}
+
+    def reasoning_effort_choices(self) -> dict[str, str]:
+        """Dropdown options mapping a visible label to the value sent to the API."""
+
+        if self.variants:
+            return self.variants
+        return {effort: effort for effort in REASONING_EFFORTS}
 
 
 @dataclass(frozen=True)
@@ -73,6 +92,16 @@ class ProviderProfile:
             return self.models[selected_id or ""]
         except KeyError as error:
             raise ConsoleConfigurationError(f"Unknown model {model_id!r} for Console profile {self.id!r}.") from error
+
+    def reasoning_effort_choices(self, model_id: str | None = None) -> dict[str, str]:
+        """Dropdown options for the selected model, from its variants or the standard set."""
+
+        return self.model_option(model_id).reasoning_effort_choices()
+
+    def valid_reasoning_effort(self, model_id: str | None = None) -> set[str]:
+        """Accepted reasoning-effort values (plus the "default" sentinel) for the selected model."""
+
+        return self.model_option(model_id).reasoning_effort_values()
 
     def litellm_options(self, model_id: str | None = None) -> dict[str, str]:
         """Return only present credentials; values are never logged or persisted."""
@@ -181,7 +210,7 @@ def _limits(value: Any) -> ConsoleLimits:
 
 def _model_option(value: Any, profile_id: str, model_id: str) -> ModelOption:
     model = _object(value, f"console.profiles.{profile_id}.models.{model_id}")
-    unknown_fields = set(model) - {"label", "model", "reasoningEffort"}
+    unknown_fields = set(model) - {"label", "model", "reasoningEffort", "variants"}
     if unknown_fields:
         raise ConsoleConfigurationError(
             f"console.profiles.{profile_id}.models.{model_id} contains unsupported fields: {', '.join(sorted(unknown_fields))}."
@@ -195,7 +224,37 @@ def _model_option(value: Any, profile_id: str, model_id: str) -> ModelOption:
     reasoning_effort = model.get("reasoningEffort")
     if reasoning_effort is not None and not isinstance(reasoning_effort, str):
         raise ConsoleConfigurationError(f"console.profiles.{profile_id}.models.{model_id}.reasoningEffort must be a string.")
-    return ModelOption(id=model_id, label=label, model=name, reasoning_effort=reasoning_effort)
+    variants = _model_variants(model.get("variants"), profile_id, model_id)
+    return ModelOption(id=model_id, label=label, model=name, reasoning_effort=reasoning_effort, variants=variants)
+
+
+def _model_variants(value: Any, profile_id: str, model_id: str) -> dict[str, str] | None:
+    """Parse per-model reasoning-effort variants: a dropdown label to the value sent to the API.
+
+    Values are intentionally free-form so non-OpenAI models (for example
+    DeepSeek V4 Flash with its own Default/High/Max scheme) can expose their own
+    reasoning-effort levels instead of the OpenAI-standard list.
+    """
+
+    if value is None:
+        return None
+    variants = _object(value, f"console.profiles.{profile_id}.models.{model_id}.variants")
+    if not variants:
+        raise ConsoleConfigurationError(
+            f"console.profiles.{profile_id}.models.{model_id}.variants must not be empty."
+        )
+    parsed: dict[str, str] = {}
+    for option_label, option_value in variants.items():
+        if not isinstance(option_label, str) or not option_label.strip():
+            raise ConsoleConfigurationError(
+                f"console.profiles.{profile_id}.models.{model_id}.variants keys must be non-empty labels."
+            )
+        if not isinstance(option_value, str) or not option_value.strip():
+            raise ConsoleConfigurationError(
+                f"console.profiles.{profile_id}.models.{model_id}.variants.{option_label} must be a non-empty reasoning-effort value."
+            )
+        parsed[option_label] = option_value
+    return parsed
 
 
 def load_console_configuration(data_directory: Path) -> ConsoleConfiguration:

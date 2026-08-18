@@ -109,9 +109,13 @@ export class CatenceDatabase implements WriteDataStore {
     const rawObjects = await this.rows('SELECT count(*)::INTEGER AS count FROM raw_objects');
     const activities = await this.rows('SELECT count(*)::INTEGER AS count FROM activities');
     const streams = await this.rows('SELECT count(*)::INTEGER AS count FROM stream_manifest');
+    const errorDetails = await this.rows<{ run_id: string; provider: string; endpoint: string; remote_id: string | null; message: string; created_at: string }>(
+      'SELECT run_id, provider, endpoint, remote_id, message, cast(created_at AS VARCHAR) AS created_at FROM normalization_errors WHERE resolved_at IS NULL ORDER BY created_at DESC LIMIT 100',
+    );
     const cursors = await this.rows<{ provider: string; cursor_name: string; covered_through_date: string; latest_source_date: string | null; lookback_days: number; last_successful_run_id: string | null; last_completed_at: string; status: string }>('SELECT provider, cursor_name, cast(covered_through_date AS VARCHAR) AS covered_through_date, cast(latest_source_date AS VARCHAR) AS latest_source_date, lookback_days, last_successful_run_id, cast(last_completed_at AS VARCHAR) AS last_completed_at, status FROM sync_cursors ORDER BY provider, cursor_name');
     return {
       runs, unresolvedErrors: errors[0]?.count ?? 0, rawObjects: rawObjects[0]?.count ?? 0, activities: activities[0]?.count ?? 0, streams: streams[0]?.count ?? 0,
+      errors: errorDetails,
       cursors: cursors.map((cursor) => ({ ...cursor, next_from_date: subtractDays(cursor.covered_through_date, Number(cursor.lookback_days)) })),
     };
   }

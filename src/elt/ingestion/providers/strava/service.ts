@@ -9,6 +9,7 @@ import { ensurePaths, loadCatenceConfig } from '../../../../core/runtime/configu
 import { athleteProviderEnvironment } from '../../../../core/runtime/secrets.js';
 import { CatenceDatabase, openReadOnlyRepository } from '../../../storage/database.js';
 import { importJsonl } from '../../importer.js';
+import { createSyncLogger } from '../../../../core/logging.js';
 import { withDataWriteLock } from '../../../storage/write-lock.js';
 
 const execFileAsync = promisify(execFile);
@@ -139,6 +140,7 @@ async function cachedState(database: CatenceDatabase, resourceType: string, remo
 async function runReadOperation(paths: CatencePaths, operation: 'gear' | 'activity' | 'segment-history', extraArgs: string[], resource: { type: string; id: string }, refresh = false): Promise<WorkerResult | Record<string, unknown>> {
   return withDataWriteLock(paths, async () => {
     await ensurePaths(paths);
+    const log = createSyncLogger(paths);
     const database = await CatenceDatabase.open(paths);
     try {
       if (!refresh) {
@@ -147,21 +149,28 @@ async function runReadOperation(paths: CatencePaths, operation: 'gear' | 'activi
       }
       await checkBudget(database, paths);
       const runId = await database.beginRun('strava', new Date().toISOString().slice(0, 10));
+      log.info('Starting Strava read operation', { runId, operation, resource: resource.id });
       const directory = path.join(paths.staging, 'strava');
       const stagingPath = path.join(directory, `${runId}.jsonl`);
       const resultPath = path.join(directory, `${runId}.result.json`);
       let result: WorkerResult;
       try {
         result = await invokeWorker(paths, ['--mode', operation, '--run-id', runId, '--output', stagingPath, ...extraArgs], resultPath);
-        if (existsSync(stagingPath)) await importJsonl(database, runId, stagingPath);
+        if (existsSync(stagingPath)) await importJsonl(database, runId, stagingPath, log);
         await storeRateState(database, result);
         await writeState(database, resource.type, resource.id, result);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        log.error('Strava read operation failed', { runId, operation, resource: resource.id, error: message, stack: error instanceof Error ? error.stack : undefined });
         await database.addError(runId, 'strava', operation, resource.id, message, true);
         throw error;
       } finally {
         await database.finishRun(runId);
+        const [run] = await database.rows<{ status: string; error_count: number }>(
+          'SELECT status, error_count FROM sync_runs WHERE run_id = $runId',
+          { runId },
+        );
+        log.info('Strava read operation finished', { runId, operation, status: run?.status ?? 'unknown', errorCount: run?.error_count ?? 0 });
       }
       if (result.status === 'error') throw new StravaEnrichmentError(result.message ?? 'Strava did not complete the requested enrichment.');
       return result;

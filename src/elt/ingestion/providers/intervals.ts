@@ -7,6 +7,7 @@ import { importRecord, queueWorkItem, completeWorkItem, failWorkItem } from '../
 import { intervalsActivityReadEndpoints, intervalsSecondaryReadRegistry, assertReadOnlyRegistry } from './registry.js';
 import { intervalsStreamsToSamples, writeParquetSamples } from '../../streams.js';
 import type { SourceEntity } from '../../../contracts/staging.js';
+import type { SyncLogger } from '../../../core/logging.js';
 
 type JsonObject = Record<string, unknown>;
 
@@ -53,6 +54,7 @@ export class IntervalsExtractor {
     private readonly paths: CatencePaths,
     private readonly apiKey: string,
     private readonly athleteId: string,
+    private readonly log: SyncLogger,
   ) {
     // The typed client is used for provider-compatible authentication and the
     // primary identity request. Manifest-only calls below intentionally use
@@ -191,6 +193,7 @@ export class IntervalsExtractor {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await failWorkItem(this.database, workId, message);
+      this.log.warn('Endpoint capture failed', { runId, provider: 'intervals', endpoint, remoteId, error: message });
       await this.database.addError(runId, 'intervals', endpoint, remoteId, message, true);
       return undefined;
     }
