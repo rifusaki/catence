@@ -1,6 +1,33 @@
+import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import type { SyncProgressState } from '../src/contracts/progress.js';
+import { openReadOnlyRepository } from '../src/elt/storage/database.js';
+import {
+  mergeProgress,
+  progressSidecarPath,
+  readProgressSidecars,
+  readRunningProgress,
+  removeProgressSidecar,
+  writeProgressSidecar,
+} from '../src/elt/storage/progress-sidecar.js';
 import { temporaryDatabase } from './helpers.js';
+
+function sampleState(runId: string, overrides: Partial<SyncProgressState> = {}): SyncProgressState {
+  return {
+    runId,
+    provider: 'garmin',
+    stage: 'daily',
+    currentStep: null,
+    completedUnits: 1,
+    totalUnits: 10,
+    percentComplete: 10,
+    elapsedSeconds: 30,
+    estimatedRemainingSeconds: 270,
+    heartbeatAt: new Date().toISOString(),
+    ...overrides,
+  };
+}
 
 describe('sync run progress tracking', () => {
   it('migration 14 creates sync_run_progress', async () => {
@@ -114,6 +141,68 @@ describe('sync run progress tracking', () => {
       expect(snapshot.running[0].runId).toBe(freshRunId);
     } finally {
       await database.close();
+    }
+  });
+});
+
+describe('sync run progress sidecars', () => {
+  it('writeProgressSidecar writes a readable file and removeProgressSidecar deletes it', async () => {
+    const { paths } = await temporaryDatabase();
+    const runId = 'sidecar-write';
+    await writeProgressSidecar(paths, runId, sampleState(runId));
+
+    const target = progressSidecarPath(paths, runId);
+    expect(existsSync(target)).toBe(true);
+    const state = JSON.parse(await readFile(target, 'utf8')) as SyncProgressState;
+    expect(state).toMatchObject({ runId, stage: 'daily', completedUnits: 1, totalUnits: 10 });
+
+    await removeProgressSidecar(paths, runId);
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it('readRunningProgress filters terminal stages and stale heartbeats', async () => {
+    const { paths } = await temporaryDatabase();
+    const liveRunId = 'sidecar-live';
+    const terminalRunId = 'sidecar-terminal';
+    const staleRunId = 'sidecar-stale';
+    await writeProgressSidecar(paths, liveRunId, sampleState(liveRunId));
+    await writeProgressSidecar(paths, terminalRunId, sampleState(terminalRunId, { stage: 'interrupted' }));
+    await writeProgressSidecar(paths, staleRunId, sampleState(staleRunId, { heartbeatAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() }));
+
+    const running = await readRunningProgress(paths);
+    expect(running.map((state) => state.runId)).toEqual([liveRunId]);
+
+    const all = await readProgressSidecars(paths);
+    expect(all).toHaveLength(3);
+  });
+
+  it('mergeProgress lets sidecar state win for running runs and sorts recent by heartbeat', async () => {
+    const runId = 'sidecar-merge';
+    const dbRunning = [sampleState(runId, { completedUnits: 2, percentComplete: 20 })];
+    const dbRecent = [
+      sampleState('recent-a', { stage: 'completed' }),
+      sampleState(runId, { completedUnits: 2, percentComplete: 20, heartbeatAt: new Date(Date.now() - 5 * 60 * 1000).toISOString() }),
+    ];
+    const sidecars = [sampleState(runId, { completedUnits: 8, percentComplete: 80, heartbeatAt: new Date(Date.now() - 5 * 60 * 1000).toISOString() })];
+
+    const merged = mergeProgress(dbRunning, dbRecent, sidecars);
+    expect(merged.running[0]).toMatchObject({ runId, completedUnits: 8, percentComplete: 80 });
+    expect(merged.recent[0].runId).toBe('recent-a');
+    expect(merged.recent.map((state) => state.runId)).toEqual(['recent-a', runId]);
+  });
+
+  it('repository.progress() surfaces a sidecar-backed run without a database entry', async () => {
+    const { paths, database } = await temporaryDatabase();
+    await writeProgressSidecar(paths, 'sidecar-only', sampleState('sidecar-only', { stage: 'collections' }));
+    await database.close();
+
+    const repository = await openReadOnlyRepository(paths);
+    try {
+      const snapshot = await repository.progress();
+      expect(snapshot.running).toHaveLength(1);
+      expect(snapshot.running[0]).toMatchObject({ runId: 'sidecar-only', stage: 'collections' });
+    } finally {
+      await repository.close();
     }
   });
 });

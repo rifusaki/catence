@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { CatencePaths } from '../../contracts/runtime.js';
 import { SYNC_STAGES, type SyncProgressSnapshot, type SyncProgressState } from '../../contracts/progress.js';
+import { mergeProgress, readProgressSidecars } from '../../elt/storage/progress-sidecar.js';
 import type { QueryValues, ReadDataStore } from '../../contracts/storage.js';
 import { sqlString } from './sql.js';
 import { DATASET_CATALOG, getDataset, type DatasetDefinition } from './catalog.js';
@@ -166,7 +167,10 @@ export class ReadOnlyRepository {
       ORDER BY heartbeat_at DESC
       LIMIT 10
     `);
-    return { running: running.map(toSyncProgressState), recent: recent.map(toSyncProgressState) };
+    // Merge with sidecar heartbeat files so an active Garmin run stays visible
+    // even while the same process holds the single-writer database lock.
+    const sidecars = await readProgressSidecars(this.paths);
+    return mergeProgress(running.map(toSyncProgressState), recent.map(toSyncProgressState), sidecars);
   }
 
   async coverage(): Promise<Record<string, unknown>> {

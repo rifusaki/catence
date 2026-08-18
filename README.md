@@ -22,14 +22,14 @@ Catence helps explore recovery, training load, trends, activity detail, swimming
 
 ## Quick start
 
-Install Catence and create the first athlete. The default catalog home is `~/.catence`; set `CATENCE_HOME` or pass `--home` to use a different location. For the full local or Docker deployment walkthrough, see [deployment notes](docs/deployment.md).
+Install Catence and create the first athlete. The default catalog home is `~/.catence`; set `CATENCE_HOME` or pass `--home` to use a different location.
 
 ```sh
-npm install --global catence@0.2.0
+npm install --global catence@beta          # or catence@latest for stable
 catence-data setup --athlete alex --label "Alex"
 ```
 
-Store each provider value through stdin so it does not enter shell history. Values are written to the selected athlete’s owner-only local secret file.
+Store each provider value through stdin so it does not enter shell history. Values are written to the selected athlete's owner-only local secret file.
 
 ```sh
 printf %s 'alex@example.com' | catence-data --athlete alex secret set --provider garmin --field email --value-stdin
@@ -63,108 +63,42 @@ catence-data --athlete sam sync --provider garmin
 catence-data athlete list
 ```
 
-The catalog layout is deliberately simple:
-
-```text
-~/.catence/
-  catalog.json
-  config.json                     # shared Console configuration; no secrets
-  console/chat-history.sqlite3
-  athletes/
-    alex/                         # isolated DuckDB, raw data, and tokens
-      secrets/providers.json      # mode 0600
-    sam/
-      ...
-```
-
-Garmin, Intervals, and Strava client credentials are isolated per athlete. Strava OAuth tokens remain in that athlete’s own store. The old 0.1 single-store directory cannot be migrated safely: create a fresh home and re-sync each athlete.
+Garmin, Intervals, and Strava client credentials are isolated per athlete. Strava OAuth tokens remain in that athlete's own store. The old 0.1 single-store directory cannot be migrated safely: create a fresh home and re-sync each athlete.
 
 ### Common operations
 
 ```sh
-# Incremental or explicit data work for one athlete
 catence-data --athlete alex status
 catence-data --athlete alex sync --provider intervals
 catence-data --athlete alex sync --provider garmin --from 2025-07-29
 catence-data --athlete alex backfill --provider garmin --from 2020-01-01 --refresh
 catence-data --athlete alex retry --run <run-id>
-catence-data --athlete alex progress --watch    # follow an active sync run live
-
-# Strava OAuth uses clientId and clientSecret previously stored for this athlete
+catence-data --athlete alex progress --watch
 catence-data --athlete alex auth strava --callback
 catence-data --athlete alex disconnect strava
-
-# Update the runtime and Console together on the tracked release channel
 catence-data update --check
 catence-data update
-
-# Choose a non-default catalog location
-catence-data --home /srv/catence setup --athlete alex --label "Alex"
-catence --home /srv/catence
 ```
 
-`catence-data update` follows the channel of the installed runtime: a beta
-install tracks the npm `beta` tag and the matching PyPI prereleases, a stable
-install tracks `latest`. Pass `--channel stable` to move off a beta. The command
-replaces the global `catence` package and installs or upgrades
-`catence-console` with `uv tool` when `uv` is available; `--check` only reports.
+## Documentation
 
-Register `http://127.0.0.1:8765/strava/callback` with the Strava application for the callback flow. The manual `auth strava --code <authorization-code>` flow remains available for headless environments.
-
-## Background sync and live progress
-
-Long Garmin backfills fetch hundreds of days of data and can take 20-30+ minutes. Sync runs stream worker output to the console in real time, tolerate Ctrl+C and SSH/terminal deaths cleanly, and expose a live progress heartbeat you can follow from the CLI, the MCP server, or a Docker helper.
-
-### What happens during a run
-
-When a sync starts, Catence creates a row in `sync_runs` with status `running` and begins persisting heartbeats to the `sync_run_progress` table (schema migration 14). The Garmin staging worker emits one compact JSON progress record every few seconds on stdout; the runtime parses it, normalizes it, and upserts it. Even if the worker cannot emit — for example while stuck in login — the runtime persists a 30-second fallback heartbeat so a run is always observable and never falsely looks stale.
-
-Each progress record follows the same contract:
-
-- `runId`, `provider` — which run the record belongs to
-- `stage` — `starting`, `login`, `singletons`, `daily`, `range`, `ftp_history`, `max_metrics`, `hrv_history`, `scores`, `activities`, `collections` while extracting; `completed` on success; `failed`, `interrupted`, or `timed_out` as terminal states written by the runtime
-- `currentStep` — the endpoint, date, or activity being fetched right now
-- `completedUnits` / `totalUnits` — for example days fetched out of the total days in the window
-- `percentComplete` — 0 to 100
-- `elapsedSeconds` / `estimatedRemainingSeconds` — the ETA is computed once the run has a known total and has completed at least one unit
-- `heartbeatAt` — UTC ISO timestamp of the record
-
-### Interruption and stale-run recovery
-
-- SIGINT, SIGTERM, and SIGHUP (Ctrl+C, terminal close, `kill`) are trapped on both the Node runtime and the Python worker. The child stops between days and the run is marked `interrupted` in `sync_runs` — never a zombie `running` row — and the process exits with 130/143/129.
-- Before every sync or retry, runs still stuck in `running` for more than 15 minutes are marked `timed_out` (with `completed_at` set), so a dead SSH session cannot block later syncs.
-- Resume a failed or interrupted run without re-reading history with `retry --run <run-id>`.
-
-### Watching progress
-
-```sh
-catence-data --athlete alex progress          # one-shot JSON snapshot
-catence-data --athlete alex progress --watch  # live view; exits when no run is active
-```
-
-`--watch` renders a compact progress table on a TTY and exits when the last active run finishes; piped output stays JSON.
-
-The read-only MCP tool `catence_sync_progress` returns the same snapshot — active runs with their latest heartbeat plus the most recent runs — and takes `athleteId` like every other personal-data tool.
-
-### Docker deployments
-
-`scripts/deploy-console.sh` generates a `sync.sh` helper that gained a `progress` command and a `--detach` flag:
-
-```sh
-cd catence-deploy
-./sync.sh --athlete alex sync --detach     # start the run in the background and return
-./sync.sh --athlete alex progress --watch  # follow it live
-./sync.sh --athlete alex progress          # one-shot snapshot
-```
-
-`--detach` works with `backfill` too. A detached run keeps streaming into the container logs (`docker compose -f catence-deploy/docker-compose.yml logs -f console`) and keeps writing heartbeats, so it survives the shell that started it and is recoverable by the next sync.
+| Document | Covers |
+| --- | --- |
+| [Deployment: local MCP](docs/deployment/local-mcp.md) | Install, catalog, secrets, sync, background progress, stdio/HTTP MCP, demo, common operations |
+| [Deployment: local Console](docs/deployment/local-console.md) | Local web chat setup, model config, doctor, updates, troubleshooting |
+| [Deployment: Docker](docs/deployment/docker.md) | One-container stack: deploy script, `.env`, sync.sh, MCP exposure (SSH/Tailscale), Cloudflare Tunnel |
+| [Configuration](docs/configuration.md) | Complete `config.json` schema: rate limits, Strava budget, Console profiles, environment variables |
+| [LLM providers](docs/llm-providers.md) | Model providers (OpenAI, Anthropic, OpenAI-compatible/Azure, Opencode Go/Zen), reasoning effort |
+| [Architecture](docs/architecture.md) | Design rationale, layers, data flow, serving |
+| [MCP activity retrieval](docs/mcp-activity-retrieval.md) | Implementation contract for answering questions, current tools, planned endpoints |
+| [Distribution](docs/distribution.md) | Release artifacts: npm, PyPI, APM, MCPB |
 
 ## Safe demo and Glama
 
 Run a clearly marked generated dataset without provider accounts:
 
 ```sh
-npx --yes catence@0.2.0 demo
+npx --yes catence@beta demo
 ```
 
 It creates or reuses `~/.catence-demo` with one `demo` athlete. The generated data has explicit caveats in every tool response and never contains personal measurements. The Glama registry entry uses this command for **Try in Browser**, so the hosted sandbox has no access to local credentials or personal data.
@@ -196,125 +130,11 @@ Optional local Streamable HTTP MCP and dashboard APIs:
 catence serve --host 127.0.0.1 --port 8787
 ```
 
-`GET /api/v1/athletes` returns IDs and labels only. `GET /api/v1/dashboard` requires `athleteId`, for example `http://127.0.0.1:8787/api/v1/dashboard?athleteId=alex&days=28`. Browser origins must be listed with `--allow-origin`; the packaged Console instead proxies the dashboard through its authenticated same-origin route.
-
-## Catence Console
-
-The Console is a local web chat that starts a matching Catence HTTP server on loopback. It uses Chainlit password login and fails closed unless all three authentication variables are supplied.
-
-```sh
-export CATENCE_HOME="$HOME/.catence"
-export CATENCE_CONSOLE_USERNAME='coach'
-export CATENCE_CONSOLE_PASSWORD_HASH="$(catence-console auth hash-password)"
-export CHAINLIT_AUTH_SECRET="$(openssl rand -hex 32)"
-export OPENAI_API_KEY='…'
-
-uvx catence-console@0.2.0 serve
-```
-
-On the first authenticated visit, the Console wizard asks for an OpenAI-compatible, OpenAI, or Anthropic model and writes only the non-secret model configuration to `~/.catence/config.json`. The `openai-compatible` option covers Azure and Opencode; see [`docs/llm-providers.md`](docs/llm-providers.md). Model-provider keys remain process environment variables. The Console settings include an athlete selector; the server overwrites model-supplied athlete scope with that selected value on every personal-data call.
-
-To preflight the Console and a running runtime:
-
-```sh
-uvx catence-console@0.2.0 doctor --home "$HOME/.catence" --mcp-url http://127.0.0.1:8787/mcp
-```
-
-Console chats and saved tool context are local at `~/.catence/console/chat-history.sqlite3`.
-
-### Docker and Cloudflare Tunnel
-
-The Console image contains the Node runtime, Catence, and Console. Its MCP server remains loopback-only inside the container; only the Console port is exposed.
-
-```sh
-docker build -f console/Dockerfile -t catence-console .
-docker run --rm -p 127.0.0.1:8000:8000 -v catence-data:/data \
-  -e CATENCE_CONSOLE_USERNAME='coach' \
-  -e CATENCE_CONSOLE_PASSWORD_HASH='replace-with-bcrypt-hash' \
-  -e CHAINLIT_AUTH_SECRET='replace-with-a-long-random-secret' \
-  -e OPENAI_API_KEY='…' \
-  catence-console
-```
-
-Initialize the mounted volume before its first production sync, for example:
-
-```sh
-docker run --rm -it -v catence-data:/data --entrypoint catence-data catence-console \
-  setup --athlete alex --label "Alex"
-```
-
-Use the same `--entrypoint catence-data` pattern for `secret set` and `sync`. Route a Cloudflare Tunnel to `http://127.0.0.1:8000`; do not run a tunnel client in this image. Use HTTPS at the tunnel and retain the Console login—the dashboard is fetched through the authenticated Console origin rather than directly from port 8787.
-
-[`scripts/deploy-console.sh`](scripts/deploy-console.sh) deploys this stack from
-the public registries and seeds a starter `config.json` (the Console model
-profiles from [`config.example.json`](config.example.json)) into the data
-volume, so the settings panel works before the first chat. Edit
-`/data/config.json` in the volume (or the bind-mounted `--home` directory) to
-change models and defaults, or discover OpenCode Go profiles from the image:
-
-```sh
-docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env run --rm \
-  --entrypoint node console \
-  /usr/local/lib/node_modules/catence/scripts/discover-opencode-go.mjs --write /data/config.json
-```
+`GET /api/v1/athletes` returns IDs and labels only. `GET /api/v1/dashboard` requires `athleteId`, for example `http://127.0.0.1:8787/api/v1/dashboard?athleteId=alex&days=28`. Browser origins must be listed with `--allow-origin`; the packaged Console instead proxies the dashboard through its authenticated same-origin route. The MCP server has no authentication of its own — keep it on loopback or restrict it at the network layer (see [Docker MCP exposure](docs/deployment/docker.md#connecting-to-the-docker-based-mcp-from-outside) for the remote-access patterns).
 
 ## Configuration
 
-[`config.example.json`](config.example.json) documents rate limits, Strava budgets, and Console model profiles. It intentionally contains environment-variable names rather than credential values. Keep per-athlete provider values in `catence-data secret set`, not in `.env` or `config.json`.
-
-### Per-model reasoning effort
-
-Models that support reasoning effort can set a fixed level per model in `config.json`, or expose a per-chat **Thinking effort** dropdown with custom levels via `variants`.
-
-**Fixed level** (all requests for the model use it):
-
-```json
-{
-  "console": {
-    "profiles": {
-      "opencode-zen": {
-        "label": "OpenCode Zen",
-        "defaultModel": "deepseek-v4-flash-free",
-        "models": {
-          "deepseek-v4-flash-free": {
-            "label": "DeepSeek V4 Flash Free",
-            "model": "openai/deepseek-v4-flash-free",
-            "reasoningEffort": "high"
-          }
-        },
-        "apiKeyEnv": "OPENCODE_API_KEY",
-        "apiBaseEnv": "OPENCODE_ZEN_API_BASE"
-      }
-    }
-  }
-}
-```
-
-**Custom variants** (per-chat dropdown): `variants` maps each dropdown label to the value sent to the provider. This is how non-OpenAI models (for example DeepSeek V4 Flash, which uses its own Default/High/Max scheme rather than the OpenAI-standard list) expose their native levels:
-
-```json
-"deepseek-v4-flash-free": {
-  "label": "DeepSeek V4 Flash Free",
-  "model": "openai/deepseek-v4-flash-free",
-  "variants": { "High": "high", "Max": "max" }
-}
-```
-
-With `variants`, the chat **Thinking effort** dropdown shows `Provider default` plus each label; selecting one sends that exact value (e.g. `reasoning_effort: "high"`). Without `variants`, the dropdown falls back to the OpenAI-standard set (`minimal`, `low`, `medium`, `high`, `xhigh`).
-
-**Disabling reasoning effort**: an explicitly empty `variants` map (`"variants": {}`) disables the feature for that model — no `reasoning_effort` is ever sent and the **Thinking effort** dropdown is greyed out. This is how models that reject the parameter (for example MiMo, which expects its own `thinking` toggle) are configured:
-
-```json
-"mimo-v2.5": {
-  "label": "MiMo V2.5",
-  "model": "openai/mimo-v2.5",
-  "variants": {}
-}
-```
-
-A model cannot combine `variants: {}` with a fixed `reasoningEffort`.
-
-A fixed `reasoningEffort` overrides any profile-level `defaultReasoningEffort`; the per-chat dropdown selection (a variant value) overrides both. If nothing is set, the provider default is used. The dropdown options always follow the model currently selected in the **Model** dropdown.
+[`config.example.json`](config.example.json) documents rate limits, Strava budgets, and Console model profiles. It intentionally contains environment-variable names rather than credential values. Keep per-athlete provider values in `catence-data secret set`, not in `.env` or `config.json`. The full `config.json` schema — including per-model reasoning effort — is documented in [`docs/configuration.md`](docs/configuration.md) and [`docs/llm-providers.md`](docs/llm-providers.md).
 
 For source development:
 
@@ -338,22 +158,6 @@ data.
 
 ## Data and caveats
 
-Garmin is the primary source for activity and wellness data; Intervals.icu supplements training analysis; Strava is used for targeted segments, efforts, and gear. Missing fields mean a provider did not supply a value. The source credentials and source APIs determine the data available. Catence does not use the official Garmin API; Garmin sync relies on the selected athlete’s email/password credentials.
+Garmin is the primary source for activity and wellness data; Intervals.icu supplements training analysis; Strava is used for targeted segments, efforts, and gear. Missing fields mean a provider did not supply a value. The source credentials and source APIs determine the data available. Catence does not use the official Garmin API; Garmin sync relies on the selected athlete's email/password credentials.
 
 See [distribution notes](docs/distribution.md) for release artifacts, including APM and MCPB demo bundles.
-
-##
-
-```bash
-cd catence-deploy
-docker compose -f docker-compose.yml --env-file .env exec console \
-  catence-data sync --athlete martina --provider all --home /data        # incremental sync, all providers
-docker compose -f docker-compose.yml --env-file .env exec console \
-  catence-data backfill --athlete martina --from 2026-01-01 --home /data # full backfill from a date
-docker compose -f docker-compose.yml --env-file .env exec console \
-  catence-data status --athlete martina --home /data                     # coverage/errors
-docker compose -f docker-compose.yml --env-file .env exec console \
-  catence-data progress --athlete martina --home /data --watch           # live sync progress
-docker compose -f docker-compose.yml --env-file .env exec console \
-  catence-data athlete list --home /data                                 # list athlete IDs
-```

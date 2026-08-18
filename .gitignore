@@ -22,3 +22,7 @@ docs/*
 !docs/architecture.md
 !docs/mcp-activity-retrieval.md
 !docs/llm-providers.md
+!docs/configuration.md
+!docs/distribution.md
+!docs/deployment/
+!docs/deployment/*.md

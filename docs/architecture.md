@@ -87,7 +87,17 @@ The query layer has four shared pieces:
 
 ### 4. Serving and retrieval
 
-The server exposes `catence_status`, `describe_data`, `describe_dataset`, `read_series`, `aggregate_data`, `analyze_series`, `fit_series_model`, `query_read_only_data`, `find_activities`, `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, `power_coverage_report`, `latest_cycling_activities`, `cycling_progress_report`, `review_daily_recovery_load`, `review_weekly_training`, `review_activity_deep_dive`, `search_context`, `hydrate_strava_activity`, `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history`, plus resources for status, catalog, a single activity, and a date-range summary.
+The server exposes these tools, grouped by purpose:
+
+- Catalog and status: `list_athletes`, `catence_status`, `catence_sync_progress`.
+- Review workflows: `review_daily_recovery_load`, `review_weekly_training`, `review_activity_deep_dive`, plus the matching `daily_recovery_load_review`, `weekly_training_review`, and `activity_deep_dive` prompts.
+- General data and analytics: `describe_data`, `describe_dataset`, `read_series`, `aggregate_data`, `analyze_series`, `fit_series_model`, `query_read_only_data`, `search_context`.
+- Wellness: `wellness_correlate`, `wellness_baselines`, `wellness_anomalies`, `wellness_coverage`.
+- Fitness and progress: `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, `power_coverage_report`, `latest_cycling_activities`, `cycling_progress_report`, `get_swim_laps`, `swim_progress_report`.
+- Activity detail and segments: `find_activities`, `get_activity_segments`.
+- Strava hydration (the only writers): `hydrate_strava_activity`, `hydrate_recent_strava_activities`, `hydrate_strava_segment_history`.
+
+Resources are mode-dependent. In catalog mode the server registers only `athletes` (`catence://athletes`), the machine-readable roster of configured athlete IDs and labels; in a single-store (non-catalog) deployment it registers resources for status, catalog, a single activity template (`catence://activity/{activityId}`), and a date-range summary template (`catence://summary/{startDate}/{endDate}`).
 
 `catence serve` is a loopback-only-by-default Streamable HTTP adapter. It creates a stateless MCP server and transport for each `/mcp` request, so the HTTP and stdio surfaces use the same tool implementation. `GET /health` is a versioned client handshake with runtime version, protocol version, and capabilities; distributed Console builds reject an incompatible protocol before starting a chat. The same listener serves a small read-only `/api/v1/dashboard` snapshot for the local Console: canonical daily-health rows, weekly canonical activity aggregates, recent canonical activities, status, coverage, and explicit missing-data caveats.
 

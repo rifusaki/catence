@@ -15,7 +15,8 @@ import { importJsonl } from '../ingestion/importer.js';
 import { IntervalsExtractor } from '../ingestion/providers/intervals.js';
 import { completeStravaAuthorization, disconnectStrava, getStravaAuthorizationUrl, syncStravaGear } from '../ingestion/providers/strava/service.js';
 import { setManualActivityLink, unlinkActivitySource } from '../normalization/activities/linking.js';
-import { CatenceDatabase } from '../storage/database.js';
+import { CatenceDatabase, openReadOnlyRepository, ReadOnlyDatabaseError } from '../storage/database.js';
+import { mergeProgress, readRunningProgress, removeProgressSidecar, writeProgressSidecar } from '../storage/progress-sidecar.js';
 import { withDataWriteLock } from '../storage/write-lock.js';
 
 type SyncProviderChoice = 'intervals' | 'garmin';
@@ -62,6 +63,7 @@ function runGarminWorker(
   arguments_: string[],
   environment: { cwd: string; env: NodeJS.ProcessEnv },
   database: CatenceDatabase,
+  paths: CatencePaths,
   log: SyncLogger,
   onInterruptReady: (kill: () => void) => void,
 ): Promise<GarminWorkerOutcome> {
@@ -85,6 +87,9 @@ function runGarminWorker(
       lastHeartbeatAt = now;
       void database.heartbeatRun(runId, state).catch((error) => {
         log.debug('Progress heartbeat failed', { runId, error: error instanceof Error ? error.message : String(error) });
+      });
+      void writeProgressSidecar(paths, runId, state).catch((error) => {
+        log.debug('Progress sidecar write failed', { runId, error: error instanceof Error ? error.message : String(error) });
       });
     };
     const fallback = setInterval(() => {
@@ -135,6 +140,9 @@ function runGarminWorker(
     child.on('close', (code, signal) => {
       clearInterval(fallback);
       if (killTimer) clearTimeout(killTimer);
+      if (code === 0 && lastProgress) {
+        void writeProgressSidecar(paths, runId, { ...lastProgress, stage: 'importing' }).catch(() => undefined);
+      }
       resolve({ code, signal });
     });
   });
@@ -240,6 +248,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
             env: { ...(await athleteProviderEnvironment(paths)), UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT ?? path.join(paths.root, 'python-venv') },
           },
           database,
+          paths,
           log,
           (kill) => { interruptChild = kill; },
         );
@@ -266,6 +275,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
     } else {
       await database.finishRun(runId);
     }
+    await removeProgressSidecar(paths, runId).catch(() => undefined);
     const [run] = await database.rows<{ status: string; error_count: number }>(
       'SELECT status, error_count FROM sync_runs WHERE run_id = $runId',
       { runId },
@@ -301,6 +311,9 @@ export async function syncData(paths: CatencePaths, provider: ProviderChoice, ex
     const timedOutRuns = await database.interruptStaleSyncRuns(STALE_RUN_TIMEOUT_MS);
     if (timedOutRuns.runIds.length > 0) {
       log.warn('Marked stale sync runs as timed out', { runIds: timedOutRuns.runIds, timeoutMs: STALE_RUN_TIMEOUT_MS });
+    }
+    for (const runId of timedOutRuns.runIds) {
+      await removeProgressSidecar(paths, runId).catch(() => undefined);
     }
     const providers: SyncProviderChoice[] = provider === 'all' ? ['intervals', 'garmin'] : [provider];
     const toDate = new Date().toISOString().slice(0, 10);
@@ -457,8 +470,24 @@ export async function dataStatus(paths: CatencePaths): Promise<Record<string, un
 
 export async function syncProgress(paths: CatencePaths): Promise<SyncProgressSnapshot> {
   await ensurePaths(paths);
-  const database = await CatenceDatabase.open(paths);
-  try { return await database.syncProgress(); } finally { await database.close(); }
+  // Live progress must stay readable while a sync run holds the single-writer
+  // DuckDB lock, so the running set comes from sidecar heartbeat files first.
+  const sidecars = await readRunningProgress(paths);
+  let dbRunning: SyncProgressState[] = [];
+  let dbRecent: SyncProgressState[] = [];
+  try {
+    const repository = await openReadOnlyRepository(paths);
+    try {
+      const snapshot = await repository.progress();
+      dbRunning = snapshot.running;
+      dbRecent = snapshot.recent;
+    } finally {
+      await repository.close();
+    }
+  } catch (error) {
+    if (!(error instanceof ReadOnlyDatabaseError)) throw error;
+  }
+  return mergeProgress(dbRunning, dbRecent, sidecars);
 }
 
 export async function rebuildRetrievalIndex(paths: CatencePaths): Promise<Record<string, unknown>> {
