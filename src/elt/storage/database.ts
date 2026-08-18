@@ -5,6 +5,7 @@ import { ReadOnlyRepository } from '../../core/query/repository.js';
 import type { CatencePaths } from '../../contracts/runtime.js';
 import type { QueryBindings, WriteDataStore } from '../../contracts/storage.js';
 import type { Provider } from '../../contracts/staging.js';
+import { SYNC_STAGES, STALE_RUN_TIMEOUT_MS, type InterruptedRuns, type SyncProgressSnapshot, type SyncProgressState } from '../../contracts/progress.js';
 import { migrations } from './migrations.js';
 import { json } from './sql.js';
 
@@ -90,6 +91,77 @@ export class CatenceDatabase implements WriteDataStore {
   async finishRun(runId: string): Promise<void> {
     await this.run(`UPDATE sync_runs SET status = CASE WHEN error_count > 0 THEN 'completed_with_errors' ELSE 'completed' END, completed_at = now() WHERE run_id = $runId`, { runId });
     await this.run("UPDATE retrieval_index_state SET status = 'stale' WHERE index_name = 'context'");
+  }
+
+  async heartbeatRun(runId: string, progress: SyncProgressState): Promise<void> {
+    await this.run(
+      `INSERT INTO sync_run_progress (run_id, provider, stage, current_step, completed_units, total_units, percent, elapsed_seconds, estimated_remaining_seconds, heartbeat_at, detail_json)
+       VALUES ($runId, $provider, $stage, $currentStep, $completedUnits, $totalUnits, $percent, $elapsedSeconds, $estimatedRemainingSeconds, now(), '{}')
+       ON CONFLICT (run_id) DO UPDATE SET
+         provider = EXCLUDED.provider,
+         stage = EXCLUDED.stage,
+         current_step = EXCLUDED.current_step,
+         completed_units = EXCLUDED.completed_units,
+         total_units = EXCLUDED.total_units,
+         percent = EXCLUDED.percent,
+         elapsed_seconds = EXCLUDED.elapsed_seconds,
+         estimated_remaining_seconds = EXCLUDED.estimated_remaining_seconds,
+         heartbeat_at = now(),
+         detail_json = '{}'`,
+      {
+        runId,
+        provider: progress.provider,
+        stage: progress.stage,
+        currentStep: progress.currentStep,
+        completedUnits: progress.completedUnits,
+        totalUnits: progress.totalUnits,
+        percent: progress.percentComplete,
+        elapsedSeconds: progress.elapsedSeconds,
+        estimatedRemainingSeconds: progress.estimatedRemainingSeconds,
+      },
+    );
+  }
+
+  async markRunInterrupted(runId: string, stage = 'interrupted'): Promise<void> {
+    await this.run("UPDATE sync_runs SET status = 'interrupted', completed_at = now() WHERE run_id = $runId AND status = 'running'", { runId });
+    await this.run('UPDATE sync_run_progress SET stage = $stage, heartbeat_at = now() WHERE run_id = $runId', { runId, stage });
+  }
+
+  async interruptStaleSyncRuns(timeoutMs = STALE_RUN_TIMEOUT_MS): Promise<InterruptedRuns> {
+    const cutoff = new Date(Date.now() - timeoutMs).toISOString();
+    const stale = await this.rows<{ run_id: string }>(`SELECT run_id FROM sync_runs WHERE status = 'running' AND started_at < $cutoff`, { cutoff });
+    for (const row of stale) {
+      await this.run("UPDATE sync_runs SET status = 'timed_out', completed_at = now() WHERE run_id = $runId AND status = 'running'", { runId: row.run_id });
+      await this.run("UPDATE sync_run_progress SET stage = 'timed_out', heartbeat_at = now() WHERE run_id = $runId", { runId: row.run_id });
+    }
+    return { runIds: stale.map((row) => row.run_id) };
+  }
+
+  async syncProgress(): Promise<SyncProgressSnapshot> {
+    const running = await this.rows<SyncProgressRow>(
+      `SELECT runs.run_id, runs.provider,
+         coalesce(progress.stage, 'starting') AS stage,
+         progress.current_step AS current_step,
+         coalesce(progress.completed_units, 0) AS completed_units,
+         progress.total_units AS total_units,
+         coalesce(progress.percent, 0) AS percent,
+         coalesce(progress.elapsed_seconds, 0) AS elapsed_seconds,
+         progress.estimated_remaining_seconds AS estimated_remaining_seconds,
+         cast(coalesce(progress.heartbeat_at, runs.started_at) AS VARCHAR) AS heartbeat_at
+       FROM sync_runs AS runs
+       LEFT JOIN sync_run_progress AS progress USING (run_id)
+       WHERE runs.status = 'running'
+       ORDER BY runs.started_at DESC`,
+    );
+    const recent = await this.rows<SyncProgressRow>(
+      `SELECT progress.run_id, progress.provider, progress.stage, progress.current_step,
+         progress.completed_units, progress.total_units, progress.percent, progress.elapsed_seconds,
+         progress.estimated_remaining_seconds, cast(progress.heartbeat_at AS VARCHAR) AS heartbeat_at
+       FROM sync_run_progress AS progress
+       ORDER BY progress.heartbeat_at DESC
+       LIMIT 10`,
+    );
+    return { running: running.map(toSyncProgressState), recent: recent.map(toSyncProgressState) };
   }
 
   async addError(runId: string, provider: Provider, endpoint: string, remoteId: string | null, message: string, retryable: boolean): Promise<void> {
@@ -333,14 +405,42 @@ export class ReadOnlyCatenceDatabase {
   }
 }
 
-/** Compose core read services with the DuckDB-backed, read-only adapter. */
-export async function openReadOnlyRepository(paths: CatencePaths): Promise<ReadOnlyRepository> {
-  return new ReadOnlyRepository(await ReadOnlyCatenceDatabase.open(paths), paths);
-}
-
 export class ReadOnlyDatabaseError extends Error {
   constructor(readonly code: 'data_sync_in_progress' | 'data_unavailable', message: string) {
     super(message);
     this.name = 'ReadOnlyDatabaseError';
   }
+}
+
+/** Compose core read services with the DuckDB-backed, read-only adapter. */
+export async function openReadOnlyRepository(paths: CatencePaths): Promise<ReadOnlyRepository> {
+  return new ReadOnlyRepository(await ReadOnlyCatenceDatabase.open(paths), paths);
+}
+
+interface SyncProgressRow extends Record<string, unknown> {
+  run_id: string;
+  provider: string;
+  stage: string;
+  current_step: string | null;
+  completed_units: number;
+  total_units: number | null;
+  percent: number;
+  elapsed_seconds: number;
+  estimated_remaining_seconds: number | null;
+  heartbeat_at: string;
+}
+
+function toSyncProgressState(row: SyncProgressRow): SyncProgressState {
+  return {
+    runId: row.run_id,
+    provider: row.provider,
+    stage: SYNC_STAGES.includes(row.stage as SyncProgressState['stage']) ? (row.stage as SyncProgressState['stage']) : 'starting',
+    currentStep: row.current_step,
+    completedUnits: Math.max(0, Number(row.completed_units) || 0),
+    totalUnits: row.total_units === null || row.total_units === undefined ? null : Math.max(0, Number(row.total_units) || 0),
+    percentComplete: Math.min(100, Math.max(0, Number(row.percent) || 0)),
+    elapsedSeconds: Math.max(0, Number(row.elapsed_seconds) || 0),
+    estimatedRemainingSeconds: row.estimated_remaining_seconds === null || row.estimated_remaining_seconds === undefined ? null : Math.max(0, Number(row.estimated_remaining_seconds) || 0),
+    heartbeatAt: row.heartbeat_at,
+  };
 }

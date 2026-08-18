@@ -62,9 +62,11 @@ export {
   rebuildRetrievalIndex,
   retryDataSync,
   syncData,
+  syncProgress,
   unlinkActivity,
 } from '../elt/application/management.js';
 export type { ProviderChoice } from '../elt/application/management.js';
+export type { InterruptedRuns, SyncProgressSnapshot, SyncProgressState } from '../contracts/progress.js';
 export { openReadOnlyRepository, ReadOnlyDatabaseError } from '../elt/storage/database.js';
 export { DataWriteBusyError } from '../elt/storage/write-lock.js';
 export {

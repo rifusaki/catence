@@ -837,5 +837,30 @@ const swimFactsAndQualityMigration: Migration = {
   `,
 };
 
-export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration];
+const syncRunProgressMigration: Migration = {
+  version: 14,
+  name: 'sync_run_progress_heartbeats',
+  sql: `
+    -- Live progress heartbeats for in-flight sync runs. Written by the Node
+    -- side from progress records streamed by provider workers; read-only
+    -- surfaces (status, progress CLI, MCP) join against sync_runs.
+    CREATE TABLE IF NOT EXISTS sync_run_progress (
+      run_id VARCHAR PRIMARY KEY,
+      provider VARCHAR NOT NULL,
+      stage VARCHAR NOT NULL,
+      current_step VARCHAR,
+      completed_units INTEGER NOT NULL DEFAULT 0,
+      total_units INTEGER,
+      percent DOUBLE NOT NULL DEFAULT 0,
+      elapsed_seconds DOUBLE NOT NULL DEFAULT 0,
+      estimated_remaining_seconds DOUBLE,
+      heartbeat_at TIMESTAMPTZ NOT NULL,
+      detail_json JSON NOT NULL DEFAULT '{}'
+    );
+
+    UPDATE retrieval_index_state SET status = 'stale' WHERE index_name = 'context';
+  `,
+};
+
+export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration, syncRunProgressMigration];
 export type { Migration };

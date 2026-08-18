@@ -272,6 +272,14 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     provenance: { database: 'read-only DuckDB snapshot' }, query: {}, caveats: [],
   }))));
 
+  server.registerTool('catence_sync_progress', {
+    title: 'Catence sync progress',
+    description: 'Read live progress heartbeats for active sync runs, plus the most recent completed or interrupted runs. Read-only.',
+  }, tool('catence_sync_progress', async () => useRepository(activePaths(), async (repository) => ({
+    data: await repository.progress(),
+    provenance: { database: 'read-only DuckDB snapshot' }, query: {}, caveats: [],
+  }))));
+
   server.registerTool('review_daily_recovery_load', {
     title: 'Review daily recovery and training load',
     description: 'Return source-cited daily health, training, and nutrition facts for a recovery/load review. It does not prescribe a training plan.',

@@ -1,12 +1,12 @@
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import type { CatencePaths } from '../../contracts/runtime.js';
+import { normalizeProgress, STALE_RUN_TIMEOUT_MS, type SyncProgressSnapshot, type SyncProgressState, type SyncStage } from '../../contracts/progress.js';
 import { buildRetrievalIndex } from '../../core/retrieval/index.js';
 import { defaultFromDate, ensurePaths, requireIntervalsConfig } from '../../core/runtime/configuration.js';
 import { createSyncLogger, type SyncLogger } from '../../core/logging.js';
@@ -17,8 +17,6 @@ import { completeStravaAuthorization, disconnectStrava, getStravaAuthorizationUr
 import { setManualActivityLink, unlinkActivitySource } from '../normalization/activities/linking.js';
 import { CatenceDatabase } from '../storage/database.js';
 import { withDataWriteLock } from '../storage/write-lock.js';
-
-const execFileAsync = promisify(execFile);
 
 type SyncProviderChoice = 'intervals' | 'garmin';
 export type ProviderChoice = SyncProviderChoice | 'strava' | 'all';
@@ -41,6 +39,141 @@ type SyncResult = {
 
 function packageRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+}
+
+type GarminWorkerOutcome = { code: number | null; signal: NodeJS.Signals | null };
+
+function baseProgress(runId: string, provider: string, stage: SyncStage): SyncProgressState {
+  return {
+    runId, provider, stage, currentStep: null,
+    completedUnits: 0, totalUnits: null, percentComplete: 0, elapsedSeconds: 0,
+    estimatedRemainingSeconds: null, heartbeatAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Run the Garmin staging worker with streamed stdout/stderr so progress and
+ * errors surface in real time instead of buffering until the child exits.
+ * Progress NDJSON lines (kind 'progress') are normalized and persisted as
+ * throttled heartbeats; other output is forwarded to the sync logger.
+ */
+function runGarminWorker(
+  runId: string,
+  arguments_: string[],
+  environment: { cwd: string; env: NodeJS.ProcessEnv },
+  database: CatenceDatabase,
+  log: SyncLogger,
+  onInterruptReady: (kill: () => void) => void,
+): Promise<GarminWorkerOutcome> {
+  return new Promise((resolve) => {
+    const child = spawn('uv', arguments_, { ...environment, stdio: ['ignore', 'pipe', 'pipe'] });
+    let killTimer: NodeJS.Timeout | undefined;
+    onInterruptReady(() => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      child.kill('SIGTERM');
+      killTimer = setTimeout(() => {
+        if (child.exitCode !== null || child.signalCode !== null) return;
+        child.kill('SIGKILL');
+      }, 10_000);
+      killTimer.unref();
+    });
+    let lastProgress: SyncProgressState | null = null;
+    let lastHeartbeatAt = 0;
+    const heartbeat = (state: SyncProgressState): void => {
+      const now = Date.now();
+      if (now - lastHeartbeatAt < 2_000) return;
+      lastHeartbeatAt = now;
+      void database.heartbeatRun(runId, state).catch((error) => {
+        log.debug('Progress heartbeat failed', { runId, error: error instanceof Error ? error.message : String(error) });
+      });
+    };
+    const fallback = setInterval(() => {
+      heartbeat(lastProgress ?? baseProgress(runId, 'garmin', 'starting'));
+    }, 30_000);
+    fallback.unref();
+    const buffer = (stream: NodeJS.ReadableStream, sink: (line: string) => void): void => {
+      let pending = '';
+      stream.on('data', (chunk: Buffer) => {
+        pending += chunk.toString('utf8');
+        let newline: number;
+        while ((newline = pending.indexOf('\n')) >= 0) {
+          const line = pending.slice(0, newline).trim();
+          pending = pending.slice(newline + 1);
+          if (line) sink(line);
+        }
+      });
+      stream.on('end', () => {
+        const line = pending.trim();
+        if (line) sink(line);
+      });
+    };
+    buffer(child.stdout, (line) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        log.info(`[garmin] ${line}`);
+        return;
+      }
+      if (typeof parsed === 'object' && parsed !== null && (parsed as { kind?: unknown }).kind === 'progress') {
+        const state = normalizeProgress(parsed);
+        if (state) {
+          lastProgress = state;
+          heartbeat(state);
+        }
+        return;
+      }
+      log.info(`[garmin] ${line}`);
+    });
+    buffer(child.stderr, (line) => log.error(`[garmin] ${line}`));
+    child.on('error', (error) => {
+      clearInterval(fallback);
+      if (killTimer) clearTimeout(killTimer);
+      resolve({ code: 1, signal: null });
+      log.error('Garmin staging worker could not be started', { runId, error: error.message });
+    });
+    child.on('close', (code, signal) => {
+      clearInterval(fallback);
+      if (killTimer) clearTimeout(killTimer);
+      resolve({ code, signal });
+    });
+  });
+}
+
+/**
+ * Trap termination signals for the duration of a sync run so an interrupted
+ * run is marked 'interrupted' in sync_runs instead of being left as a zombie
+ * 'running' row. The process exit code mirrors the received signal.
+ */async function runWithInterruptGuard(
+  runId: string,
+  database: CatenceDatabase,
+  onInterrupt: () => void,
+  state: { interrupted: boolean },
+  work: () => Promise<void>,
+): Promise<void> {
+  let exitCode = 0;
+  const handler = (signal: NodeJS.Signals): void => {
+    if (state.interrupted) return;
+    state.interrupted = true;
+    exitCode = signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 129;
+    void database.markRunInterrupted(runId).catch(() => undefined);
+    try {
+      onInterrupt();
+    } catch {
+      // The child may not exist yet; the run is still marked interrupted.
+    }
+  };
+  process.once('SIGINT', handler);
+  process.once('SIGTERM', handler);
+  process.once('SIGHUP', handler);
+  try {
+    await work();
+  } finally {
+    process.removeListener('SIGINT', handler);
+    process.removeListener('SIGTERM', handler);
+    process.removeListener('SIGHUP', handler);
+    if (state.interrupted) process.exitCode = exitCode;
+  }
 }
 
 async function syncProvider(database: CatenceDatabase, paths: CatencePaths, provider: SyncProviderChoice, options: { explicitFrom?: string; toDate: string; advanceCursor: boolean; refreshActivities: boolean; backfill: boolean }, log: SyncLogger): Promise<SyncResult> {
@@ -73,12 +206,15 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
     backfill: options.backfill, refreshActivities: options.refreshActivities,
   });
   let extractionStarted = false;
+  const guard: { interrupted: boolean } = { interrupted: false };
   try {
     if (provider === 'intervals') {
       const environment = await athleteProviderEnvironment(paths);
       const config = requireIntervalsConfig(environment);
       extractionStarted = true;
-      await new IntervalsExtractor(database, paths, config.apiKey, config.athleteId, log).sync(runId, activityWindow, !options.backfill || options.refreshActivities);
+      await runWithInterruptGuard(runId, database, () => undefined, guard, async () => {
+        await new IntervalsExtractor(database, paths, config.apiKey, config.athleteId, log).sync(runId, activityWindow, !options.backfill || options.refreshActivities);
+      });
     } else {
       const output = path.join(paths.staging, 'garmin', `${runId}.jsonl`);
       const knownActivities = path.join(paths.staging, 'garmin', `${runId}.known-activities.json`);
@@ -94,26 +230,49 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       if (activityWindow) arguments_.push('--activity-from', activityWindow.fromDate, '--activity-to', activityWindow.toDate);
       else arguments_.push('--skip-activities');
       if (options.backfill && !options.refreshActivities) arguments_.push('--historical-only');
-      await execFileAsync('uv', arguments_, {
-        cwd: packageRoot(),
-        env: { ...(await athleteProviderEnvironment(paths)), UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT ?? path.join(paths.root, 'python-venv') },
+      let interruptChild: (() => void) | null = null;
+      await runWithInterruptGuard(runId, database, () => interruptChild?.(), guard, async () => {
+        const outcome = await runGarminWorker(
+          runId,
+          arguments_,
+          {
+            cwd: packageRoot(),
+            env: { ...(await athleteProviderEnvironment(paths)), UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT ?? path.join(paths.root, 'python-venv') },
+          },
+          database,
+          log,
+          (kill) => { interruptChild = kill; },
+        );
+        if (!guard.interrupted && outcome.code !== 0) {
+          throw new Error(`Garmin staging worker exited with code ${outcome.code}${outcome.signal ? ` (${outcome.signal})` : ''}.`);
+        }
       });
-      if (!existsSync(output)) throw new Error('Garmin staging worker completed without writing a JSONL manifest.');
-      await importJsonl(database, runId, output, log);
+      if (!guard.interrupted) {
+        if (!existsSync(output)) throw new Error('Garmin staging worker completed without writing a JSONL manifest.');
+        await importJsonl(database, runId, output, log);
+      }
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    log.error('Sync run failed', { runId, provider, error: message, stack: error instanceof Error ? error.stack : undefined });
-    await database.addError(runId, provider, 'sync', null, message, true);
+    if (!guard.interrupted) {
+      const message = error instanceof Error ? error.message : String(error);
+      log.error('Sync run failed', { runId, provider, error: message, stack: error instanceof Error ? error.stack : undefined });
+      await database.addError(runId, provider, 'sync', null, message, true);
+      await database.heartbeatRun(runId, baseProgress(runId, provider, 'failed')).catch(() => undefined);
+    }
   } finally {
-    await database.finishRun(runId);
+    if (guard.interrupted) {
+      await database.markRunInterrupted(runId);
+      log.warn('Sync run interrupted', { runId, provider });
+    } else {
+      await database.finishRun(runId);
+    }
     const [run] = await database.rows<{ status: string; error_count: number }>(
       'SELECT status, error_count FROM sync_runs WHERE run_id = $runId',
       { runId },
     );
     log.info('Sync run finished', { runId, provider, status: run?.status ?? 'unknown', errorCount: run?.error_count ?? 0 });
   }
-  if (options.advanceCursor && !options.explicitFrom && extractionStarted) {
+  if (!guard.interrupted && options.advanceCursor && !options.explicitFrom && extractionStarted) {
     await database.advanceIncrementalCursor(provider, 'daily', runId, options.toDate, 3);
     await database.advanceIncrementalCursor(provider, 'activities', runId, options.toDate, 14);
   }
@@ -139,11 +298,15 @@ export async function syncData(paths: CatencePaths, provider: ProviderChoice, ex
   const database = await CatenceDatabase.open(paths);
   const log = createSyncLogger(paths);
   try {
+    const timedOutRuns = await database.interruptStaleSyncRuns(STALE_RUN_TIMEOUT_MS);
+    if (timedOutRuns.runIds.length > 0) {
+      log.warn('Marked stale sync runs as timed out', { runIds: timedOutRuns.runIds, timeoutMs: STALE_RUN_TIMEOUT_MS });
+    }
     const providers: SyncProviderChoice[] = provider === 'all' ? ['intervals', 'garmin'] : [provider];
     const toDate = new Date().toISOString().slice(0, 10);
     const runs: SyncResult[] = [];
     for (const source of providers) runs.push(await syncProvider(database, paths, source, { explicitFrom, toDate, advanceCursor, refreshActivities, backfill }, log));
-    return { runIds: runs.flatMap((run) => run.runId ? [run.runId] : []), runs };
+    return { runIds: runs.flatMap((run) => run.runId ? [run.runId] : []), runs, timedOutRuns: timedOutRuns.runIds };
   } finally {
     await database.close();
   }
@@ -153,6 +316,7 @@ export async function retryDataSync(paths: CatencePaths, previousRunId: string):
   await ensurePaths(paths);
   const database = await CatenceDatabase.open(paths);
   try {
+    await database.interruptStaleSyncRuns(STALE_RUN_TIMEOUT_MS);
     const previous = await database.getRun(previousRunId);
     if (!previous) throw new Error(`No sync run found for ${previousRunId}.`);
     if (previous.provider === 'strava') throw new Error('Retry Strava gear sync with `catence-data sync --provider strava`.');
@@ -289,6 +453,12 @@ export async function dataStatus(paths: CatencePaths): Promise<Record<string, un
   await ensurePaths(paths);
   const database = await CatenceDatabase.open(paths);
   try { return await database.status(); } finally { await database.close(); }
+}
+
+export async function syncProgress(paths: CatencePaths): Promise<SyncProgressSnapshot> {
+  await ensurePaths(paths);
+  const database = await CatenceDatabase.open(paths);
+  try { return await database.syncProgress(); } finally { await database.close(); }
 }
 
 export async function rebuildRetrievalIndex(paths: CatencePaths): Promise<Record<string, unknown>> {

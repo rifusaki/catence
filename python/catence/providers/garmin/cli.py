@@ -4,11 +4,14 @@ import argparse
 import getpass
 import json
 import os
+import signal
+import sys
 from datetime import date
 from pathlib import Path
 
+from .progress import ProgressReporter
 from .staging import StagingWriter
-from .worker import GarminStagingWorker
+from .worker import GarminStagingWorker, WorkerInterrupted
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,19 +46,37 @@ def main() -> None:
     token_store.parent.mkdir(parents=True, exist_ok=True)
     client = Garmin(email, password, prompt_mfa=lambda: input("Garmin MFA code: "))
     client.login(str(token_store))
+    reporter = ProgressReporter(args.run_id)
+    reporter.set_stage("login")
+    reporter.finish("login")
     known_hashes: dict[str, str] = {}
     if args.known_activities and args.known_activities.exists():
         loaded = json.loads(args.known_activities.read_text(encoding="utf-8"))
         if isinstance(loaded, dict):
             known_hashes = {str(key): str(value) for key, value in loaded.items()}
-    GarminStagingWorker(client, writer, args.data_dir, known_hashes).sync(
-        daily_from_date=None if args.skip_daily else args.daily_from_date or args.from_date,
-        activity_from_date=None if args.skip_activities else args.activity_from_date or args.from_date,
-        to_date=args.to_date,
-        daily_to_date=args.daily_to_date,
-        activity_to_date=args.activity_to_date,
-        include_non_historical=not args.historical_only,
-    )
+    worker = GarminStagingWorker(client, writer, args.data_dir, known_hashes, progress=reporter)
+    interrupt_signal: int | None = None
+
+    def _request_interrupt(signum: int, _frame: object) -> None:
+        nonlocal interrupt_signal
+        interrupt_signal = signum
+        worker.request_interrupt()
+
+    signal.signal(signal.SIGINT, _request_interrupt)
+    signal.signal(signal.SIGTERM, _request_interrupt)
+    try:
+        worker.sync(
+            daily_from_date=None if args.skip_daily else args.daily_from_date or args.from_date,
+            activity_from_date=None if args.skip_activities else args.activity_from_date or args.from_date,
+            to_date=args.to_date,
+            daily_to_date=args.daily_to_date,
+            activity_to_date=args.activity_to_date,
+            include_non_historical=not args.historical_only,
+        )
+    except WorkerInterrupted:
+        reporter.finish("interrupted")
+        raise SystemExit(130 if interrupt_signal == signal.SIGINT else 143)
+    reporter.finish("completed")
 
 
 if __name__ == "__main__":

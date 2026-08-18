@@ -415,8 +415,9 @@ write_sync_helper() {
 #!/bin/sh
 # Run catence-data inside the running console container: the container's own
 # environment already holds the provider secrets, so incremental sync, full
-# backfill, coverage status, and athlete listing need no extra credentials.
-# (A `docker compose run` container would need the secrets piped in again.)
+# backfill, coverage status, live progress, and athlete listing need no extra
+# credentials. (A `docker compose run` container would need the secrets piped
+# in again.)
 set -eu
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ATHLETE="${CATENCE_ATHLETE:-}"
@@ -428,16 +429,20 @@ usage: sync.sh [--athlete <id>] <command> [args...]
 commands:
   sync                   incremental sync of all providers
   backfill <date>        full backfill from an ISO date (for example 2026-01-01)
+  progress               live progress for active sync runs (--watch to follow)
   status                 per-provider coverage and errors
   athletes               list athlete IDs in the catalog
 
 options:
   --athlete <id>         athlete ID (default: $CATENCE_ATHLETE)
+  --detach               run sync/backfill in the background and return
   -h, --help             show this help
 
 examples:
   ./sync.sh --athlete martina sync
   ./sync.sh --athlete martina backfill 2026-01-01
+  ./sync.sh --athlete martina progress --watch
+  ./sync.sh --athlete martina sync --detach
   ./sync.sh --athlete martina status
   ./sync.sh athletes
 USAGE
@@ -456,6 +461,19 @@ elif [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   exit 0
 fi
 
+# Strip --detach from the argument list (any position) and remember it; the
+# container command itself must never see it.
+detach=""
+_rest=""
+for _arg in "$@"; do
+  if [ "$_arg" = "--detach" ]; then
+    detach="-d"
+  else
+    _rest="$_rest $_arg"
+  fi
+done
+set -- $_rest
+
 command="${1:-}"
 [ -n "$command" ] || usage
 [ "$command" = "athletes" ] || [ -n "$ATHLETE" ] || usage
@@ -463,7 +481,7 @@ command="${1:-}"
 case "$command" in
   sync)
     shift
-    exec docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" exec console \
+    exec docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" exec $detach console \
       catence-data sync --athlete "$ATHLETE" --provider all --home /data "$@"
     ;;
   backfill)
@@ -476,8 +494,13 @@ case "$command" in
         ;;
     esac
     shift
-    exec docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" exec console \
+    exec docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" exec $detach console \
       catence-data backfill --athlete "$ATHLETE" --from "$from" --home /data "$@"
+    ;;
+  progress)
+    shift
+    exec docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" exec console \
+      catence-data progress --athlete "$ATHLETE" --home /data "$@"
     ;;
   status)
     shift
@@ -609,11 +632,13 @@ info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env
 info "  Verify the model profiles and env vars:"
 info "    $DEPLOY_DIR/doctor.sh"
 info "    (or, with --home, edit <home>/config.json on the host; model keys stay in .env)"
-info "  Sync / backfill / inspect one athlete's data:"
-info "    $DEPLOY_DIR/sync.sh --athlete alex sync"
-info "    $DEPLOY_DIR/sync.sh --athlete alex backfill 2026-01-01"
-info "    $DEPLOY_DIR/sync.sh --athlete alex status"
-info "    $DEPLOY_DIR/sync.sh athletes"
+  info "  Sync / backfill / inspect one athlete's data:"
+  info "    $DEPLOY_DIR/sync.sh --athlete alex sync"
+  info "    $DEPLOY_DIR/sync.sh --athlete alex backfill 2026-01-01"
+  info "    $DEPLOY_DIR/sync.sh --athlete alex sync --detach   (background run; follow with progress --watch)"
+  info "    $DEPLOY_DIR/sync.sh --athlete alex progress --watch"
+  info "    $DEPLOY_DIR/sync.sh --athlete alex status"
+  info "    $DEPLOY_DIR/sync.sh athletes"
 info "  Discover OpenCode Go models into the config:"
 info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env run --rm --entrypoint node console /usr/local/lib/node_modules/catence/scripts/discover-opencode-go.mjs --write /data/config.json"
 info "  Check status / logs:"

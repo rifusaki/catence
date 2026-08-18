@@ -88,6 +88,7 @@ catence-data --athlete alex sync --provider intervals
 catence-data --athlete alex sync --provider garmin --from 2025-07-29
 catence-data --athlete alex backfill --provider garmin --from 2020-01-01 --refresh
 catence-data --athlete alex retry --run <run-id>
+catence-data --athlete alex progress --watch    # follow an active sync run live
 
 # Strava OAuth uses clientId and clientSecret previously stored for this athlete
 catence-data --athlete alex auth strava --callback
@@ -109,6 +110,54 @@ replaces the global `catence` package and installs or upgrades
 `catence-console` with `uv tool` when `uv` is available; `--check` only reports.
 
 Register `http://127.0.0.1:8765/strava/callback` with the Strava application for the callback flow. The manual `auth strava --code <authorization-code>` flow remains available for headless environments.
+
+## Background sync and live progress
+
+Long Garmin backfills fetch hundreds of days of data and can take 20-30+ minutes. Sync runs stream worker output to the console in real time, tolerate Ctrl+C and SSH/terminal deaths cleanly, and expose a live progress heartbeat you can follow from the CLI, the MCP server, or a Docker helper.
+
+### What happens during a run
+
+When a sync starts, Catence creates a row in `sync_runs` with status `running` and begins persisting heartbeats to the `sync_run_progress` table (schema migration 14). The Garmin staging worker emits one compact JSON progress record every few seconds on stdout; the runtime parses it, normalizes it, and upserts it. Even if the worker cannot emit — for example while stuck in login — the runtime persists a 30-second fallback heartbeat so a run is always observable and never falsely looks stale.
+
+Each progress record follows the same contract:
+
+- `runId`, `provider` — which run the record belongs to
+- `stage` — `starting`, `login`, `singletons`, `daily`, `range`, `ftp_history`, `max_metrics`, `hrv_history`, `scores`, `activities`, `collections` while extracting; `completed` on success; `failed`, `interrupted`, or `timed_out` as terminal states written by the runtime
+- `currentStep` — the endpoint, date, or activity being fetched right now
+- `completedUnits` / `totalUnits` — for example days fetched out of the total days in the window
+- `percentComplete` — 0 to 100
+- `elapsedSeconds` / `estimatedRemainingSeconds` — the ETA is computed once the run has a known total and has completed at least one unit
+- `heartbeatAt` — UTC ISO timestamp of the record
+
+### Interruption and stale-run recovery
+
+- SIGINT, SIGTERM, and SIGHUP (Ctrl+C, terminal close, `kill`) are trapped on both the Node runtime and the Python worker. The child stops between days and the run is marked `interrupted` in `sync_runs` — never a zombie `running` row — and the process exits with 130/143/129.
+- Before every sync or retry, runs still stuck in `running` for more than 15 minutes are marked `timed_out` (with `completed_at` set), so a dead SSH session cannot block later syncs.
+- Resume a failed or interrupted run without re-reading history with `retry --run <run-id>`.
+
+### Watching progress
+
+```sh
+catence-data --athlete alex progress          # one-shot JSON snapshot
+catence-data --athlete alex progress --watch  # live view; exits when no run is active
+```
+
+`--watch` renders a compact progress table on a TTY and exits when the last active run finishes; piped output stays JSON.
+
+The read-only MCP tool `catence_sync_progress` returns the same snapshot — active runs with their latest heartbeat plus the most recent runs — and takes `athleteId` like every other personal-data tool.
+
+### Docker deployments
+
+`scripts/deploy-console.sh` generates a `sync.sh` helper that gained a `progress` command and a `--detach` flag:
+
+```sh
+cd catence-deploy
+./sync.sh --athlete alex sync --detach     # start the run in the background and return
+./sync.sh --athlete alex progress --watch  # follow it live
+./sync.sh --athlete alex progress          # one-shot snapshot
+```
+
+`--detach` works with `backfill` too. A detached run keeps streaming into the container logs (`docker compose -f catence-deploy/docker-compose.yml logs -f console`) and keeps writing heartbeats, so it survives the shell that started it and is recoverable by the next sync.
 
 ## Safe demo and Glama
 
@@ -303,6 +352,8 @@ docker compose -f docker-compose.yml --env-file .env exec console \
   catence-data backfill --athlete martina --from 2026-01-01 --home /data # full backfill from a date
 docker compose -f docker-compose.yml --env-file .env exec console \
   catence-data status --athlete martina --home /data                     # coverage/errors
+docker compose -f docker-compose.yml --env-file .env exec console \
+  catence-data progress --athlete martina --home /data --watch           # live sync progress
 docker compose -f docker-compose.yml --env-file .env exec console \
   catence-data athlete list --home /data                                 # list athlete IDs
 ```

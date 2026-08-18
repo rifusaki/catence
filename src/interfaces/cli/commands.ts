@@ -28,12 +28,14 @@ import {
   runSelfUpdateCommand,
   setAthleteSecret,
   syncData,
+  syncProgress,
   connectStrava,
   connectStravaWithCallback,
   unlinkActivity,
   type CatalogPaths,
   type CatencePaths,
   type ProviderChoice,
+  type SyncProgressSnapshot,
   type UpdateChannel,
 } from '../../runtime/index.js';
 
@@ -188,6 +190,38 @@ program.command('status').action(async () => {
   const { paths } = await currentAthlete();
   process.stdout.write(`${JSON.stringify(await dataStatus(paths), null, 2)}\n`);
 });
+
+function renderProgress(snapshot: SyncProgressSnapshot): string {
+  const lines = snapshot.running.map((run) => {
+    const pct = run.percentComplete.toFixed(1).padStart(5);
+    const units = run.totalUnits !== null ? `${run.completedUnits}/${run.totalUnits}` : String(run.completedUnits);
+    const eta = run.estimatedRemainingSeconds !== null ? `${Math.round(run.estimatedRemainingSeconds)}s` : '?';
+    const step = run.currentStep ?? '';
+    return `${pct}%  ${run.stage.padEnd(12)} ${units.padEnd(11)} ${eta.padEnd(6)} ${step}`;
+  });
+  return lines.length === 0 ? 'no active sync runs' : lines.join('\n');
+}
+
+program.command('progress')
+  .description('Show live progress for active sync runs.')
+  .option('--watch', 'refresh every few seconds until no sync runs are active')
+  .action(async (options: { watch?: boolean }) => {
+    const { paths } = await currentAthlete();
+    if (!options.watch) {
+      process.stdout.write(`${JSON.stringify(await syncProgress(paths), null, 2)}\n`);
+      return;
+    }
+    while (true) {
+      const snapshot = await syncProgress(paths);
+      if (output.isTTY) {
+        output.write(`\x1b[2J\x1b[H${renderProgress(snapshot)}\n`);
+      } else {
+        process.stdout.write(`${JSON.stringify(snapshot, null, 2)}\n`);
+      }
+      if (snapshot.running.length === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+  });
 
 program.command('update')
   .description('Check for and apply the newest Catence release on the tracked channel (runtime and Console).')

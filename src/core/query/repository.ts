@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { CatencePaths } from '../../contracts/runtime.js';
+import { SYNC_STAGES, type SyncProgressSnapshot, type SyncProgressState } from '../../contracts/progress.js';
 import type { QueryValues, ReadDataStore } from '../../contracts/storage.js';
 import { sqlString } from './sql.js';
 import { DATASET_CATALOG, getDataset, type DatasetDefinition } from './catalog.js';
@@ -140,6 +141,34 @@ export class ReadOnlyRepository {
     };
   }
 
+  async progress(): Promise<SyncProgressSnapshot> {
+    // Same sequential-read discipline as status(): the shared native
+    // connection must not run these small reads concurrently.
+    const running = await this.rows<ProgressRow>(`
+      SELECT runs.run_id, runs.provider, coalesce(progress.stage, 'starting') AS stage,
+        progress.current_step,
+        coalesce(progress.completed_units, 0) AS completed_units,
+        progress.total_units,
+        coalesce(progress.percent, 0) AS percent,
+        coalesce(progress.elapsed_seconds, 0) AS elapsed_seconds,
+        progress.estimated_remaining_seconds,
+        cast(coalesce(progress.heartbeat_at, runs.started_at) AS VARCHAR) AS heartbeat_at
+      FROM sync_runs AS runs
+      LEFT JOIN sync_run_progress AS progress USING (run_id)
+      WHERE runs.status = 'running'
+      ORDER BY runs.started_at DESC
+    `);
+    const recent = await this.rows<ProgressRow>(`
+      SELECT run_id, provider, stage, current_step, completed_units, total_units, percent,
+        elapsed_seconds, estimated_remaining_seconds,
+        cast(heartbeat_at AS VARCHAR) AS heartbeat_at
+      FROM sync_run_progress
+      ORDER BY heartbeat_at DESC
+      LIMIT 10
+    `);
+    return { running: running.map(toSyncProgressState), recent: recent.map(toSyncProgressState) };
+  }
+
   async coverage(): Promise<Record<string, unknown>> {
     const rows = await this.rows(`
       SELECT 'activities' AS dataset, min(cast(started_at_utc AS DATE)) AS start_date, max(cast(started_at_utc AS DATE)) AS end_date, count(*)::INTEGER AS row_count FROM activities
@@ -170,6 +199,34 @@ export class ReadOnlyRepository {
   catalog(): DatasetDefinition[] {
     return Object.values(DATASET_CATALOG);
   }
+}
+
+interface ProgressRow extends Record<string, unknown> {
+  run_id: string;
+  provider: string;
+  stage: string;
+  current_step: string | null;
+  completed_units: number;
+  total_units: number | null;
+  percent: number;
+  elapsed_seconds: number;
+  estimated_remaining_seconds: number | null;
+  heartbeat_at: string;
+}
+
+function toSyncProgressState(row: ProgressRow): SyncProgressState {
+  return {
+    runId: row.run_id,
+    provider: row.provider,
+    stage: SYNC_STAGES.includes(row.stage as (typeof SYNC_STAGES)[number]) ? (row.stage as SyncProgressState['stage']) : 'starting',
+    currentStep: row.current_step,
+    completedUnits: Math.max(0, Number(row.completed_units) || 0),
+    totalUnits: row.total_units === null || row.total_units === undefined ? null : Math.max(0, Number(row.total_units) || 0),
+    percentComplete: Math.min(100, Math.max(0, Number(row.percent) || 0)),
+    elapsedSeconds: Math.max(0, Number(row.elapsed_seconds) || 0),
+    estimatedRemainingSeconds: row.estimated_remaining_seconds === null || row.estimated_remaining_seconds === undefined ? null : Math.max(0, Number(row.estimated_remaining_seconds) || 0),
+    heartbeatAt: row.heartbeat_at,
+  };
 }
 
 /** Converts DuckDB's Date/BigInt values into MCP-safe JSON values. */
