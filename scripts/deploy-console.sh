@@ -292,7 +292,7 @@ RUN test -n "$CATENCE_NPM_VERSION" \
     && test -n "$CATENCE_CONSOLE_VERSION" \
     && test -n "$CATENCE_MCP_BIND" \
     && apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && apt-get install -y --no-install-recommends curl ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
     && curl -LsSf https://astral.sh/uv/install.sh | sh \
     && install -m 755 /root/.local/bin/uv /usr/local/bin/uv
