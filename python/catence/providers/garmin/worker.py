@@ -9,7 +9,7 @@ from typing import Any, Callable, Mapping
 from .progress import ProgressReporter
 from .registry import GARMIN_READ_METHODS, assert_read_only_registry
 from .staging import StagingWriter
-from .streams import SAMPLE_COLUMNS, activity_details_to_samples, activity_power_bests, fit_archive_to_samples, write_parquet
+from .streams import SAMPLE_COLUMNS, activity_details_to_samples, activity_power_bests, fit_archive_to_samples, fit_archive_to_swim_lengths, write_parquet
 
 
 class WorkerInterrupted(Exception):
@@ -556,6 +556,20 @@ class GarminStagingWorker:
                     parent_remote_id=activity_id,
                     occurred_on=start_date[:10],
                 )
+        if original_path and original_path.exists():
+            sport = str(summary.get("sportType") or summary.get("sport") or "").lower()
+            if sport == "lap_swimming" or "swim" in sport:
+                lengths = fit_archive_to_swim_lengths(f"garmin:{activity_id}", original_path)
+                if lengths:
+                    start_date = str(summary.get("startTimeLocal") or summary.get("startTimeGMT") or date.today().isoformat())
+                    self.writer.source_entity(
+                        "activity_swim_lengths",
+                        f"{activity_id}:fit",
+                        {"lengths": lengths},
+                        original_hash,
+                        parent_remote_id=activity_id,
+                        occurred_on=start_date[:10],
+                    )
 
     def _collections(self) -> None:
         today = date.today()

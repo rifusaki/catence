@@ -35,7 +35,7 @@ export async function importRecord(database: CatenceDatabase, runId: string, rec
       const activity = await database.rows<{ activity_id: string }>('SELECT activity_id FROM activity_sources WHERE activity_source_id = $activitySourceId', { activitySourceId: record.provider + ':' + record.remoteId });
       if (activity[0]?.activity_id) await refreshActivityQuality(database, activity[0].activity_id);
     }
-    if (record.provider === 'garmin' && ['activity_detail', 'activity_interval', 'activity_exercise_set'].includes(record.entityType) && record.parentRemoteId) {
+    if (record.provider === 'garmin' && ['activity_detail', 'activity_interval', 'activity_exercise_set', 'activity_swim_lengths'].includes(record.entityType) && record.parentRemoteId) {
       const activity = await database.rows<{ activity_id: string }>('SELECT activity_id FROM activity_sources WHERE activity_source_id = $activitySourceId', { activitySourceId: `garmin:${record.parentRemoteId}` });
       if (activity[0]?.activity_id) await refreshActivityQuality(database, activity[0].activity_id);
     }

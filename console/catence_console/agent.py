@@ -14,7 +14,7 @@ from mcp.client.streamable_http import streamablehttp_client
 from .config import DEFAULT_TOOL_RESULT_CHARACTER_LIMIT, DEFAULT_TOOL_ROUND_LIMIT, ProviderProfile
 from .persistence import SavedToolCall, ToolCallStore
 
-SYSTEM_PROMPT = """You are Catence, a careful endurance-training data assistant.
+SYSTEM_PROMPT = """You are a careful endurance-training data assistant.
 Use Catence MCP tools for athlete-specific facts. Start with a named review tool
 when it fits (recovery, training load, or weekly review), then ask a narrow
 follow-up tool only when it would change the recommendation. Never invent data

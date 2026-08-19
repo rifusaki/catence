@@ -1,10 +1,10 @@
 [project]
 name = "catence-console"
-version = "0.2.0b12"
+version = "0.2.0b13"
 description = "Local Chainlit and LiteLLM console for Catence"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-  "catence-chainlit==0.2.0b12",
+  "catence-chainlit==0.2.0b13",
   "aiosqlite>=0.20.0,<1.0.0",
   "greenlet>=3.0.0,<4.0.0",
   "litellm>=1.80.0,<2.0.0",

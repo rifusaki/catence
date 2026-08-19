@@ -6,6 +6,7 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CatencePaths } from '../../contracts/runtime.js';
+import type { Provider } from '../../contracts/staging.js';
 import { normalizeProgress, STALE_RUN_TIMEOUT_MS, type SyncProgressSnapshot, type SyncProgressState, type SyncStage } from '../../contracts/progress.js';
 import { buildRetrievalIndex } from '../../core/retrieval/index.js';
 import { defaultFromDate, ensurePaths, requireIntervalsConfig } from '../../core/runtime/configuration.js';
@@ -15,6 +16,7 @@ import { importJsonl } from '../ingestion/importer.js';
 import { IntervalsExtractor } from '../ingestion/providers/intervals.js';
 import { completeStravaAuthorization, disconnectStrava, getStravaAuthorizationUrl, syncStravaGear } from '../ingestion/providers/strava/service.js';
 import { setManualActivityLink, unlinkActivitySource } from '../normalization/activities/linking.js';
+import { importSourceEntity } from '../normalization/normalizers.js';
 import { CatenceDatabase, openReadOnlyRepository, ReadOnlyDatabaseError } from '../storage/database.js';
 import { mergeProgress, ProgressPump, readRunningProgress, removeProgressSidecar } from '../storage/progress-sidecar.js';
 import { withDataWriteLock } from '../storage/write-lock.js';
@@ -298,6 +300,11 @@ export async function syncData(paths: CatencePaths, provider: ProviderChoice, ex
     const toDate = new Date().toISOString().slice(0, 10);
     const runs: SyncResult[] = [];
     for (const source of providers) runs.push(await syncProvider(database, paths, source, { explicitFrom, toDate, advanceCursor, refreshActivities, backfill }, log));
+    const executedRuns = runs.filter((run) => !run.skipped);
+    if (executedRuns.length > 0) {
+      const index = await buildRetrievalIndex(database);
+      log.info('Rebuilt retrieval index after sync', { documents: index.documents, mode: index.mode, watermark: index.watermark });
+    }
     return { runIds: runs.flatMap((run) => run.runId ? [run.runId] : []), runs, timedOutRuns: timedOutRuns.runIds };
   } finally {
     await database.close();
@@ -473,4 +480,78 @@ export async function rebuildRetrievalIndex(paths: CatencePaths): Promise<Record
   if (!existsSync(paths.database)) throw new Error('No Catence database exists yet. Complete a sync before building the retrieval index.');
   const database = await CatenceDatabase.open(paths);
   try { return await buildRetrievalIndex(database); } finally { await database.close(); }
+}
+
+export async function importStagedFile(paths: CatencePaths, provider: ProviderChoice, filePath: string): Promise<Record<string, unknown>> {
+  if (!existsSync(paths.database)) throw new Error('No Catence database exists yet. Complete a sync before importing staged records.');
+  if (!existsSync(filePath)) throw new Error(`Staging file not found: ${filePath}`);
+  const database = await CatenceDatabase.open(paths);
+  try {
+    const runId = randomUUID();
+    const importedRecords = await importJsonl(database, runId, filePath);
+    return { runId, provider, importedRecords };
+  } finally {
+    await database.close();
+  }
+}
+
+export async function resolveExtractionErrors(
+  paths: CatencePaths,
+  opts: { runIds?: string[]; provider?: string; before?: string; all?: boolean } = {},
+): Promise<Record<string, unknown>> {
+  if (!existsSync(paths.database)) throw new Error('No Catence database exists yet.');
+  const database = await CatenceDatabase.open(paths);
+  try {
+    const resolved = await database.resolveErrors({
+      runIds: opts.runIds,
+      provider: opts.provider as Provider | undefined,
+      before: opts.before,
+      all: opts.all,
+    });
+    return { resolvedErrors: resolved };
+  } finally {
+    await database.close();
+  }
+}
+
+type ReimportRow = {
+  provider: string; entity_type: string; remote_id: string; parent_remote_id: string | null;
+  occurred_on: string | null; source_updated_at: string | null; raw_object_hash: string | null;
+  payload_json: string; extension_json: string;
+};
+
+/**
+ * Re-run normalization over already-captured nutrition entities without
+ * contacting any provider. Idempotent upserts let a fixed normalizer backfill
+ * previously mis-parsed nutrition_days/nutrition_items from stored payloads.
+ */
+export async function reimportNutrition(paths: CatencePaths): Promise<Record<string, unknown>> {
+  if (!existsSync(paths.database)) throw new Error('No Catence database exists yet. Complete a sync before re-importing nutrition.');
+  const database = await CatenceDatabase.open(paths);
+  try {
+    const rows = await database.rows<ReimportRow>(
+      `SELECT provider, entity_type, remote_id, parent_remote_id, occurred_on, source_updated_at, raw_object_hash,
+              cast(payload_json AS VARCHAR) AS payload_json, cast(extension_json AS VARCHAR) AS extension_json
+       FROM source_entities
+       WHERE entity_type IN ('nutrition_log', 'nutrition_day')
+       ORDER BY provider, occurred_on, remote_id`,
+    );
+    for (const row of rows) {
+      await importSourceEntity(database, {
+        kind: 'source_entity', schemaVersion: 1, provider: row.provider as Provider, entityType: row.entity_type,
+        remoteId: row.remote_id, parentRemoteId: row.parent_remote_id, occurredOn: row.occurred_on, sourceUpdatedAt: row.source_updated_at,
+        rawObjectHash: row.raw_object_hash, payload: parseJsonObject(row.payload_json), extension: parseJsonObject(row.extension_json),
+      });
+    }
+    const days = (await database.rows<{ count: number | bigint }>('SELECT count(*) AS count FROM nutrition_days'))[0]?.count ?? 0;
+    const items = (await database.rows<{ count: number | bigint }>('SELECT count(*) AS count FROM nutrition_items'))[0]?.count ?? 0;
+    return { reimportedEntities: rows.length, nutritionDays: days, nutritionItems: items };
+  } finally {
+    await database.close();
+  }
+}
+
+function parseJsonObject(value: string | null): Record<string, unknown> {
+  if (!value) return {};
+  try { return JSON.parse(value) as Record<string, unknown>; } catch { return {}; }
 }

@@ -14,6 +14,7 @@ import {
   fetchNpmDistTags,
   fetchPypiReleases,
   hasCommand,
+  importStagedFile,
   initializeCatalog,
   isGlobalNpmInstall,
   linkActivity,
@@ -22,6 +23,8 @@ import {
   planSelfUpdate,
   readInstalledConsoleVersion,
   rebuildRetrievalIndex,
+  reimportNutrition,
+  resolveExtractionErrors,
   resolveAthlete,
   resolveCatalogPaths,
   retryDataSync,
@@ -279,5 +282,30 @@ program.command('build-retrieval-index').description('Build derived local retrie
   const { paths } = await currentAthlete();
   process.stdout.write(`${JSON.stringify(await rebuildRetrievalIndex(paths), null, 2)}\n`);
 });
+program.command('reimport-nutrition').description('Re-run normalization over captured nutrition entities without contacting providers.').action(async () => {
+  const { paths } = await currentAthlete();
+  process.stdout.write(`${JSON.stringify(await reimportNutrition(paths), null, 2)}\n`);
+});
+program
+  .command('import')
+  .description('Import a staged JSONL file (for example a swim-length backfill) into one athlete’s data store.')
+  .requiredOption('--provider <provider>', 'garmin, intervals, or strava')
+  .argument('<file>', 'path to the staged JSONL file')
+  .action(async (file: string, options: { provider: ProviderChoice }) => {
+    const { paths } = await currentAthlete();
+    process.stdout.write(`${JSON.stringify(await importStagedFile(paths, options.provider, file), null, 2)}\n`);
+  });
+program
+  .command('resolve-errors')
+  .description('Mark unresolved extraction errors as resolved (for example stale bootstrap failures from an environment that has since recovered).')
+  .option('--run <run-id>', 'resolve errors from a specific run only (repeatable)')
+  .option('--provider <provider>', 'resolve errors for garmin, intervals, or strava only')
+  .option('--before <timestamp>', 'resolve errors created before this ISO timestamp')
+  .option('--all', 'resolve every unresolved error')
+  .action(async (options: { run?: string | string[]; provider?: string; before?: string; all?: boolean }) => {
+    const { paths } = await currentAthlete();
+    const runIds = Array.isArray(options.run) ? options.run : options.run ? [options.run] : undefined;
+    process.stdout.write(`${JSON.stringify(await resolveExtractionErrors(paths, { runIds, provider: options.provider, before: options.before, all: options.all }), null, 2)}\n`);
+  });
 
 await program.parseAsync();

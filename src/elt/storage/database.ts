@@ -173,6 +173,32 @@ export class CatenceDatabase implements WriteDataStore {
     await this.run('UPDATE sync_runs SET error_count = error_count + 1 WHERE run_id = $runId', { runId });
   }
 
+  async resolveErrors(opts: { runIds?: string[]; provider?: Provider; before?: string; all?: boolean } = {}): Promise<number> {
+    const clauses: string[] = ['resolved_at IS NULL'];
+    const values: Record<string, string | number> = {};
+    if (opts.runIds && opts.runIds.length > 0) {
+      const placeholders = opts.runIds.map((_, index) => `$runId${index}`).join(', ');
+      clauses.push(`run_id IN (${placeholders})`);
+      opts.runIds.forEach((runId, index) => { values[`runId${index}`] = runId; });
+    }
+    if (opts.provider) {
+      clauses.push('provider = $provider');
+      values.provider = opts.provider;
+    }
+    if (opts.before) {
+      clauses.push('created_at < $before');
+      values.before = opts.before;
+    }
+    if (!opts.all && clauses.length === 1) {
+      throw new Error('Refusing to resolve all unresolved errors without an explicit --all flag.');
+    }
+    const resolved = await this.rows<{ error_id: string }>(
+      `UPDATE normalization_errors SET resolved_at = now() WHERE ${clauses.join(' AND ')} RETURNING error_id`,
+      values,
+    );
+    return resolved.length;
+  }
+
   async status(): Promise<Record<string, unknown>> {
     // @duckdb/node-api owns native statement state on the connection. Keep
     // status reads sequential instead of issuing several native calls at once.

@@ -183,6 +183,44 @@ def fit_archive_to_samples(activity_source_id: str, archive: Path) -> list[dict[
         return []
 
 
+def fit_archive_to_swim_lengths(activity_source_id: str, archive: Path) -> list[dict[str, Any]]:
+    """Best-effort per-length parsing from the FIT 'length' messages; malformed/unavailable archives yield no rows."""
+    try:
+        import fitdecode
+        with zipfile.ZipFile(archive) as zip_file:
+            fit_name = next((name for name in zip_file.namelist() if name.lower().endswith(".fit")), None)
+            if not fit_name:
+                return []
+            with zip_file.open(fit_name) as stream, fitdecode.FitReader(stream) as reader:
+                rows: list[dict[str, Any]] = []
+                for frame in reader:
+                    if not isinstance(frame, fitdecode.records.FitDataMessage) or frame.name != "length":
+                        continue
+                    fields = {field.name: field.value for field in frame.fields}
+                    length_type = str(fields.get("length_type") or "").lower()
+                    start_time = fields.get("start_time") or fields.get("timestamp")
+                    row = {
+                        "lengthIndex": _number(fields.get("message_index")),
+                        "lapIndex": None,
+                        "startTime": start_time.isoformat().replace("+00:00", "Z") if hasattr(start_time, "isoformat") else None,
+                        "durationS": _number(fields.get("total_elapsed_time") or fields.get("total_timer_time")),
+                        "activeDurationS": _number(fields.get("total_timer_time")),
+                        "distanceM": _number(fields.get("distance")),
+                        "strokeCount": _number(fields.get("total_strokes")),
+                        "strokeRate": _number(fields.get("avg_swimming_cadence") or fields.get("avg_cadence")),
+                        "swolf": _number(fields.get("avg_swolf")),
+                        "avgHr": _number(fields.get("avg_heart_rate") or fields.get("average_heart_rate")),
+                        "maxHr": _number(fields.get("max_heart_rate")),
+                        "isRest": length_type in {"rest", "idle", "pause"},
+                        "label": str(fields.get("swim_stroke") or "").lower() or None,
+                        "raw": {name: (value.isoformat().replace("+00:00", "Z") if hasattr(value, "isoformat") else value) for name, value in fields.items()},
+                    }
+                    rows.append(row)
+                return rows
+    except (ImportError, OSError, ValueError, zipfile.BadZipFile):
+        return []
+
+
 def write_parquet(data_dir: Path, activity_id: str, start_date: str, samples: Iterable[dict[str, Any]]) -> tuple[Path, str, int]:
     records = list(samples)
     year, month = (start_date[:4] or "unknown"), (start_date[5:7] or "unknown")

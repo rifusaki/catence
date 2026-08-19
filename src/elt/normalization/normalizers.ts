@@ -182,23 +182,60 @@ async function upsertDailyMetric(database: CatenceDatabase, provider: Provider, 
   );
 }
 
+/**
+ * Garmin's nutrition food log keeps its actuals under dailyNutritionContent
+ * (a per-day rolled-up object), while meal definitions and hydration endpoints
+ * share the same source entity type. Flat keys are kept for providers that
+ * return them directly.
+ */
 function nutritionFields(payload: JsonObject): Record<string, number | null> {
+  const content = object(payload.dailyNutritionContent);
   return {
-    energyKcal: firstNumber(payload, ['kcalConsumed', 'calories', 'totalCalories', 'energyKcal']),
-    carbohydratesG: firstNumber(payload, ['carbohydrates', 'carbs', 'totalCarbs', 'carbohydrateGrams']),
-    proteinG: firstNumber(payload, ['protein', 'totalProtein', 'proteinGrams']),
-    fatG: firstNumber(payload, ['fatTotal', 'fat', 'totalFat', 'fatGrams']),
-    hydrationMl: firstNumber(payload, ['hydrationVolume', 'hydration', 'waterMl', 'totalWater']),
+    energyKcal: firstNumber(payload, ['kcalConsumed', 'calories', 'totalCalories', 'energyKcal']) ?? firstNumber(content, ['calories', 'energyKcal', 'totalCalories']),
+    carbohydratesG: firstNumber(payload, ['carbohydrates', 'carbs', 'totalCarbs', 'carbohydrateGrams']) ?? firstNumber(content, ['carbohydrates', 'carbs']),
+    proteinG: firstNumber(payload, ['protein', 'totalProtein', 'proteinGrams']) ?? firstNumber(content, ['protein']),
+    fatG: firstNumber(payload, ['fatTotal', 'fat', 'totalFat', 'fatGrams']) ?? firstNumber(content, ['fat', 'fatTotal']),
+    hydrationMl: firstNumber(payload, ['hydrationVolume', 'hydration', 'waterMl', 'totalWater', 'valueInML', 'dailyAverageinML']),
   };
 }
 
+/**
+ * Garmin food-log items live under mealDetails[].foods[]. Each food carries the
+ * day's nutrition_date, so a meal label is folded onto the item to avoid losing
+ * it. Flat arrays are kept for providers that return items directly.
+ */
 function nutritionItems(payload: JsonObject): JsonObject[] {
-  const candidates = ['foodItems', 'items', 'entries', 'foodLogEntries', 'meals'];
-  for (const key of candidates) {
+  const items: JsonObject[] = [];
+  const mealDetails = payload.mealDetails;
+  if (Array.isArray(mealDetails)) {
+    for (const detail of mealDetails) {
+      const mealDetail = object(detail);
+      const mealName = firstString(object(mealDetail.meal), ['mealName']) ?? firstString(mealDetail, ['mealName']);
+      const foods = mealDetail.foods;
+      if (Array.isArray(foods)) {
+        for (const food of foods) {
+          const item = object(food);
+          if (Object.keys(item).length === 0) continue;
+          items.push(mealName ? { ...item, mealName } : item);
+        }
+      } else if (Object.keys(mealDetail).length > 0 && firstString(mealDetail, ['foodName', 'name', 'description']) !== null) {
+        items.push(mealName ? { ...mealDetail, mealName } : mealDetail);
+      }
+    }
+    if (items.length > 0) return items;
+  }
+  for (const key of ['foodItems', 'items', 'entries', 'foodLogEntries', 'meals']) {
     const value = payload[key];
     if (Array.isArray(value)) return value.map(object).filter((item) => Object.keys(item).length > 0);
   }
   return [];
+}
+
+/** True when a payload contributes real nutrition facts rather than meal definitions or hydration-only bookkeeping. */
+function hasNutritionContent(payload: JsonObject): boolean {
+  const fields = nutritionFields(payload);
+  return fields.energyKcal !== null || fields.carbohydratesG !== null || fields.proteinG !== null || fields.fatG !== null
+    || fields.hydrationMl !== null || nutritionItems(payload).length > 0;
 }
 
 export async function importSourceEntity(database: CatenceDatabase, entity: SourceEntity): Promise<void> {
@@ -247,6 +284,9 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
   if (entity.entityType === 'activity_interval') await importActivityIntervals(database, entity.provider, entity.parentRemoteId, payload, rawHash);
   if (entity.provider === 'garmin' && ['activity_detail', 'activity_interval', 'activity_exercise_set'].includes(entity.entityType)) {
     await importGarminExplicitSwimLengths(database, entity.parentRemoteId, entity.entityType, payload, rawHash);
+  }
+  if (entity.provider === 'garmin' && entity.entityType === 'activity_swim_lengths') {
+    await importGarminFitSwimLengths(database, entity.parentRemoteId, payload, rawHash);
   }
   if (entity.entityType === 'wellness' || entity.entityType === 'daily_health') await importDailyMetrics(database, entity.provider, entity.remoteId, entity.occurredOn, payload, rawHash);
   if (entity.entityType === 'nutrition_day' || entity.entityType === 'nutrition_log') await importNutrition(database, entity.provider, entity.occurredOn, entity.remoteId, payload, rawHash);
@@ -752,6 +792,47 @@ async function importGarminExplicitSwimLengths(database: CatenceDatabase, parent
   }
 }
 
+async function importGarminFitSwimLengths(database: CatenceDatabase, parentRemoteId: string | null, payload: JsonObject, rawHash: string | null): Promise<void> {
+  if (!parentRemoteId) return;
+  const activitySourceId = providerActivityId('garmin', parentRemoteId);
+  const lengths = objectArray(payload.lengths);
+  if (lengths.length === 0) return;
+  const source = 'garmin_fit_length';
+  await database.run('DELETE FROM swim_lengths WHERE activity_source_id = $activitySourceId AND source = $source', { activitySourceId, source });
+  const summaryPoolLengthM = await activityPoolLengthM(database, activitySourceId);
+  for (const [offset, length] of lengths.entries()) {
+    const durationS = firstNumber(length, ['durationS', 'duration', 'durationSeconds', 'elapsedDuration']);
+    if (durationS === null) continue;
+    const sourceLabel = swimSourceLabel(length);
+    const isRest = firstBoolean(length, ['isRest', 'rest']) ?? Boolean(sourceLabel && /rest|idle|pause/.test(sourceLabel));
+    const lengthIndex = Math.round(firstNumber(length, ['lengthIndex', 'messageIndex', 'lengthNumber', 'index']) ?? offset);
+    await database.run(
+      `INSERT INTO swim_lengths
+        (activity_source_id, source, length_index, lap_index, pool_length_m, start_time, duration_s, active_duration_s, distance_m, stroke_count, stroke_rate, swolf, avg_hr, max_hr, is_rest, confidence, metrics_json, raw_object_hash)
+       VALUES ($activitySourceId, $source, $lengthIndex, $lapIndex, $poolLengthM, $startTime, $durationS, $activeDurationS, $distanceM, $strokeCount, $strokeRate, $swolf, $avgHr, $maxHr, $isRest, 'provider_supplied', $metrics, $rawHash)
+       ON CONFLICT (activity_source_id, source, length_index) DO UPDATE SET
+         lap_index = excluded.lap_index, pool_length_m = excluded.pool_length_m, start_time = excluded.start_time,
+         duration_s = excluded.duration_s, active_duration_s = excluded.active_duration_s, distance_m = excluded.distance_m,
+         stroke_count = excluded.stroke_count, stroke_rate = excluded.stroke_rate, swolf = excluded.swolf,
+         avg_hr = excluded.avg_hr, max_hr = excluded.max_hr, is_rest = excluded.is_rest,
+         confidence = excluded.confidence, metrics_json = excluded.metrics_json, raw_object_hash = excluded.raw_object_hash`,
+      {
+        activitySourceId, source, lengthIndex,
+        lapIndex: firstNumber(length, ['lapIndex', 'lapNumber']), poolLengthM: garminPoolLengthM(length) ?? summaryPoolLengthM,
+        startTime: timestamp(length.startTime ?? length.startTimestamp ?? length.timestamp), durationS,
+        activeDurationS: firstNumber(length, ['activeDurationS', 'activeDuration', 'movingDuration']),
+        distanceM: firstNumber(length, ['distanceM', 'distance']),
+        strokeCount: firstNumber(length, ['strokeCount', 'strokes', 'total_strokes']),
+        strokeRate: firstNumber(length, ['strokeRate', 'averageStrokeRate', 'avg_swimming_cadence', 'avg_cadence', 'cadence']),
+        swolf: firstNumber(length, ['swolf', 'avg_swolf']),
+        avgHr: firstNumber(length, ['avgHr', 'averageHR', 'avg_heart_rate']),
+        maxHr: firstNumber(length, ['maxHr', 'maxHR', 'max_heart_rate']),
+        isRest, metrics: json(length), rawHash,
+      },
+    );
+  }
+}
+
 type ActivityQualityRow = {
   activity_source_id: string;
   provider: string;
@@ -884,13 +965,19 @@ async function importDailyMetrics(database: CatenceDatabase, provider: Provider,
 async function importNutrition(database: CatenceDatabase, provider: Provider, date: string | null, remoteId: string, payload: JsonObject, rawHash: string | null): Promise<void> {
   const nutritionDate = datePart(date) ?? datePart(firstString(payload, ['id', 'date', 'calendarDate'])) ?? null;
   if (!nutritionDate) return;
+  if (!hasNutritionContent(payload)) return;
   const fields = nutritionFields(payload);
   await database.run(
     `INSERT INTO nutrition_days
       (provider, nutrition_date, energy_kcal, carbohydrates_g, protein_g, fat_g, hydration_ml, metrics_json, raw_object_hash)
       VALUES ($provider, $nutritionDate, $energyKcal, $carbohydratesG, $proteinG, $fatG, $hydrationMl, $metrics, $rawHash)
-      ON CONFLICT (provider, nutrition_date) DO UPDATE SET energy_kcal = excluded.energy_kcal, carbohydrates_g = excluded.carbohydrates_g,
-       protein_g = excluded.protein_g, fat_g = excluded.fat_g, hydration_ml = excluded.hydration_ml, metrics_json = excluded.metrics_json, raw_object_hash = excluded.raw_object_hash`,
+      ON CONFLICT (provider, nutrition_date) DO UPDATE SET
+        energy_kcal = COALESCE(excluded.energy_kcal, nutrition_days.energy_kcal),
+        carbohydrates_g = COALESCE(excluded.carbohydrates_g, nutrition_days.carbohydrates_g),
+        protein_g = COALESCE(excluded.protein_g, nutrition_days.protein_g),
+        fat_g = COALESCE(excluded.fat_g, nutrition_days.fat_g),
+        hydration_ml = COALESCE(excluded.hydration_ml, nutrition_days.hydration_ml),
+        metrics_json = excluded.metrics_json, raw_object_hash = excluded.raw_object_hash`,
     { provider, nutritionDate, ...fields, metrics: json(payload), rawHash },
   );
   for (const [index, item] of nutritionItems(payload).entries()) {
