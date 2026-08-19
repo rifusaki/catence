@@ -240,6 +240,7 @@ describe('ProgressPump', () => {
       await database.beginRun('garmin', '2025-07-30');
       const pump = new ProgressPump(runId, 'garmin', { database, paths, log: noopLogger });
       pump.publish(sampleState(runId));
+      await vi.advanceTimersByTimeAsync(0);
 
       const state = await readSidecar(paths, runId);
       expect(state).toMatchObject({ runId, stage: 'daily', completedUnits: 1, totalUnits: 10 });
@@ -257,6 +258,7 @@ describe('ProgressPump', () => {
       const pump = new ProgressPump(runId, 'garmin', { database, paths, log: noopLogger });
       pump.start();
       pump.publish(sampleState(runId, { heartbeatAt: new Date(Date.now() - 60_000).toISOString() }));
+      await vi.advanceTimersByTimeAsync(0);
 
       const before = await readSidecar(paths, runId);
       await vi.advanceTimersByTimeAsync(30_000);
@@ -278,6 +280,7 @@ describe('ProgressPump', () => {
       const pump = new ProgressPump(runId, 'garmin', { database, paths, log: noopLogger });
       pump.start();
       pump.publish(sampleState(runId, { heartbeatAt: new Date(Date.now() - 60_000).toISOString() }));
+      await vi.advanceTimersByTimeAsync(0);
 
       const before = await readSidecar(paths, runId);
       pump.stop();
@@ -319,6 +322,7 @@ describe('ProgressPump', () => {
       const pump = new ProgressPump(runId, 'garmin', { database, paths, log: noopLogger });
       pump.publish(sampleState(runId));
       pump.publishFinal(sampleState(runId, { stage: 'completed' }));
+      await vi.advanceTimersByTimeAsync(0);
 
       const state = await readSidecar(paths, runId);
       expect(state).toMatchObject({ runId, stage: 'completed' });
