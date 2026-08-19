@@ -209,6 +209,10 @@ for live runs and only touch the `sync_run_progress` table for recent-run
 history once the lock is free — so they keep working while a backfill holds the
 lock, and never crash with a lock error.
 
+Progress also stays live through the entire run, not just worker extraction: a
+30-second keep-alive covers the JSONL import phase (which emits no worker
+output) and the `intervals` phase of a provider-all sync or backfill.
+
 Other read-only tools (`status`, `query_read_only_data`, and friends) still
 need the database and therefore return a clean `data_sync_in_progress` error
 while a sync run is active. That is expected behavior: the store is locked

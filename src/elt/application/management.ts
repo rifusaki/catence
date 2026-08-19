@@ -16,7 +16,7 @@ import { IntervalsExtractor } from '../ingestion/providers/intervals.js';
 import { completeStravaAuthorization, disconnectStrava, getStravaAuthorizationUrl, syncStravaGear } from '../ingestion/providers/strava/service.js';
 import { setManualActivityLink, unlinkActivitySource } from '../normalization/activities/linking.js';
 import { CatenceDatabase, openReadOnlyRepository, ReadOnlyDatabaseError } from '../storage/database.js';
-import { mergeProgress, readRunningProgress, removeProgressSidecar, writeProgressSidecar } from '../storage/progress-sidecar.js';
+import { mergeProgress, ProgressPump, readRunningProgress, removeProgressSidecar } from '../storage/progress-sidecar.js';
 import { withDataWriteLock } from '../storage/write-lock.js';
 
 type SyncProviderChoice = 'intervals' | 'garmin';
@@ -62,8 +62,7 @@ function runGarminWorker(
   runId: string,
   arguments_: string[],
   environment: { cwd: string; env: NodeJS.ProcessEnv },
-  database: CatenceDatabase,
-  paths: CatencePaths,
+  pump: ProgressPump,
   log: SyncLogger,
   onInterruptReady: (kill: () => void) => void,
 ): Promise<GarminWorkerOutcome> {
@@ -79,23 +78,6 @@ function runGarminWorker(
       }, 10_000);
       killTimer.unref();
     });
-    let lastProgress: SyncProgressState | null = null;
-    let lastHeartbeatAt = 0;
-    const heartbeat = (state: SyncProgressState): void => {
-      const now = Date.now();
-      if (now - lastHeartbeatAt < 2_000) return;
-      lastHeartbeatAt = now;
-      void database.heartbeatRun(runId, state).catch((error) => {
-        log.debug('Progress heartbeat failed', { runId, error: error instanceof Error ? error.message : String(error) });
-      });
-      void writeProgressSidecar(paths, runId, state).catch((error) => {
-        log.debug('Progress sidecar write failed', { runId, error: error instanceof Error ? error.message : String(error) });
-      });
-    };
-    const fallback = setInterval(() => {
-      heartbeat(lastProgress ?? baseProgress(runId, 'garmin', 'starting'));
-    }, 30_000);
-    fallback.unref();
     const buffer = (stream: NodeJS.ReadableStream, sink: (line: string) => void): void => {
       let pending = '';
       stream.on('data', (chunk: Buffer) => {
@@ -122,27 +104,20 @@ function runGarminWorker(
       }
       if (typeof parsed === 'object' && parsed !== null && (parsed as { kind?: unknown }).kind === 'progress') {
         const state = normalizeProgress(parsed);
-        if (state) {
-          lastProgress = state;
-          heartbeat(state);
-        }
+        if (state) pump.publish(state);
         return;
       }
       log.info(`[garmin] ${line}`);
     });
     buffer(child.stderr, (line) => log.error(`[garmin] ${line}`));
     child.on('error', (error) => {
-      clearInterval(fallback);
       if (killTimer) clearTimeout(killTimer);
       resolve({ code: 1, signal: null });
       log.error('Garmin staging worker could not be started', { runId, error: error.message });
     });
     child.on('close', (code, signal) => {
-      clearInterval(fallback);
       if (killTimer) clearTimeout(killTimer);
-      if (code === 0 && lastProgress) {
-        void writeProgressSidecar(paths, runId, { ...lastProgress, stage: 'importing' }).catch(() => undefined);
-      }
+      if (code === 0) pump.setStageImporting();
       resolve({ code, signal });
     });
   });
@@ -215,11 +190,14 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
   });
   let extractionStarted = false;
   const guard: { interrupted: boolean } = { interrupted: false };
+  const pump = new ProgressPump(runId, provider, { database, paths, log });
+  pump.start();
   try {
     if (provider === 'intervals') {
       const environment = await athleteProviderEnvironment(paths);
       const config = requireIntervalsConfig(environment);
       extractionStarted = true;
+      pump.setStage('intervals');
       await runWithInterruptGuard(runId, database, () => undefined, guard, async () => {
         await new IntervalsExtractor(database, paths, config.apiKey, config.athleteId, log).sync(runId, activityWindow, !options.backfill || options.refreshActivities);
       });
@@ -247,8 +225,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
             cwd: packageRoot(),
             env: { ...(await athleteProviderEnvironment(paths)), UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT ?? path.join(paths.root, 'python-venv') },
           },
-          database,
-          paths,
+          pump,
           log,
           (kill) => { interruptChild = kill; },
         );
@@ -269,11 +246,13 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       await database.heartbeatRun(runId, baseProgress(runId, provider, 'failed')).catch(() => undefined);
     }
   } finally {
+    pump.stop();
     if (guard.interrupted) {
       await database.markRunInterrupted(runId);
       log.warn('Sync run interrupted', { runId, provider });
     } else {
       await database.finishRun(runId);
+      pump.publishFinal(baseProgress(runId, provider, 'completed'));
     }
     await removeProgressSidecar(paths, runId).catch(() => undefined);
     const [run] = await database.rows<{ status: string; error_count: number }>(

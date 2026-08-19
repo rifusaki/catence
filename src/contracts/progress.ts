@@ -12,6 +12,7 @@ export const SYNC_STAGES = [
   'scores',
   'activities',
   'collections',
+  'intervals',
   'importing',
   'completed',
   'interrupted',

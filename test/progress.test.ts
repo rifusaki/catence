@@ -1,10 +1,13 @@
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SyncProgressState } from '../src/contracts/progress.js';
+import type { CatencePaths } from '../src/contracts/runtime.js';
+import type { SyncLogger } from '../src/core/logging.js';
 import { openReadOnlyRepository } from '../src/elt/storage/database.js';
 import {
   mergeProgress,
+  ProgressPump,
   progressSidecarPath,
   readProgressSidecars,
   readRunningProgress,
@@ -12,6 +15,23 @@ import {
   writeProgressSidecar,
 } from '../src/elt/storage/progress-sidecar.js';
 import { temporaryDatabase } from './helpers.js';
+
+const noopLogger: SyncLogger = {
+  info: () => undefined,
+  warn: () => undefined,
+  error: () => undefined,
+  debug: () => undefined,
+};
+
+async function readSidecar(paths: CatencePaths, runId: string, predicate?: (state: SyncProgressState) => boolean): Promise<SyncProgressState> {
+  const target = progressSidecarPath(paths, runId);
+  return await vi.waitFor(async () => {
+    if (!existsSync(target)) throw new Error(`sidecar ${runId} not written yet`);
+    const parsed = JSON.parse(await readFile(target, 'utf8')) as SyncProgressState;
+    if (predicate && !predicate(parsed)) throw new Error(`sidecar ${runId} content not ready`);
+    return parsed;
+  });
+}
 
 function sampleState(runId: string, overrides: Partial<SyncProgressState> = {}): SyncProgressState {
   return {
@@ -203,6 +223,107 @@ describe('sync run progress sidecars', () => {
       expect(snapshot.running[0]).toMatchObject({ runId: 'sidecar-only', stage: 'collections' });
     } finally {
       await repository.close();
+    }
+  });
+});
+
+describe('ProgressPump', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('publish persists a sidecar at progressSidecarPath', async () => {
+    vi.useFakeTimers();
+    const { paths, database } = await temporaryDatabase();
+    try {
+      const runId = 'pump-publish';
+      await database.beginRun('garmin', '2025-07-30');
+      const pump = new ProgressPump(runId, 'garmin', { database, paths, log: noopLogger });
+      pump.publish(sampleState(runId));
+
+      const state = await readSidecar(paths, runId);
+      expect(state).toMatchObject({ runId, stage: 'daily', completedUnits: 1, totalUnits: 10 });
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('keepAlive refreshes heartbeatAt after 30s with no new worker output', async () => {
+    vi.useFakeTimers({ now: 1_700_000_000_000 });
+    const { paths, database } = await temporaryDatabase();
+    try {
+      const runId = 'pump-keepalive';
+      await database.beginRun('garmin', '2025-07-30');
+      const pump = new ProgressPump(runId, 'garmin', { database, paths, log: noopLogger });
+      pump.start();
+      pump.publish(sampleState(runId, { heartbeatAt: new Date(Date.now() - 60_000).toISOString() }));
+
+      const before = await readSidecar(paths, runId);
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      const after = await readSidecar(paths, runId, (state) => Date.parse(state.heartbeatAt) > Date.parse(before.heartbeatAt));
+      expect(Date.parse(after.heartbeatAt)).toBeGreaterThan(Date.parse(before.heartbeatAt));
+      pump.stop();
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('stop() clears the keepAlive interval', async () => {
+    vi.useFakeTimers();
+    const { paths, database } = await temporaryDatabase();
+    try {
+      const runId = 'pump-stop';
+      await database.beginRun('garmin', '2025-07-30');
+      const pump = new ProgressPump(runId, 'garmin', { database, paths, log: noopLogger });
+      pump.start();
+      pump.publish(sampleState(runId, { heartbeatAt: new Date(Date.now() - 60_000).toISOString() }));
+
+      const before = await readSidecar(paths, runId);
+      pump.stop();
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      const after = await readSidecar(paths, runId);
+      expect(after.heartbeatAt).toBe(before.heartbeatAt);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('setStageImporting() persists an importing stage via keepAlive', async () => {
+    vi.useFakeTimers();
+    const { paths, database } = await temporaryDatabase();
+    try {
+      const runId = 'pump-importing';
+      await database.beginRun('garmin', '2025-07-30');
+      const pump = new ProgressPump(runId, 'garmin', { database, paths, log: noopLogger });
+      pump.start();
+      pump.publish(sampleState(runId));
+      pump.setStageImporting();
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      const state = await readSidecar(paths, runId);
+      expect(state.stage).toBe('importing');
+      pump.stop();
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('publishFinal forces a terminal write past the publish throttle', async () => {
+    vi.useFakeTimers();
+    const { paths, database } = await temporaryDatabase();
+    try {
+      const runId = 'pump-final';
+      await database.beginRun('garmin', '2025-07-30');
+      const pump = new ProgressPump(runId, 'garmin', { database, paths, log: noopLogger });
+      pump.publish(sampleState(runId));
+      pump.publishFinal(sampleState(runId, { stage: 'completed' }));
+
+      const state = await readSidecar(paths, runId);
+      expect(state).toMatchObject({ runId, stage: 'completed' });
+    } finally {
+      await database.close();
     }
   });
 });
