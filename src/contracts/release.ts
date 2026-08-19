@@ -3,7 +3,7 @@
  * Keep these values synchronized with release/manifest.json; release checks
  * deliberately reject drift before a package can be published.
  */
-export const CATENCE_RUNTIME_VERSION = '0.2.0-beta.11';
+export const CATENCE_RUNTIME_VERSION = '0.2.0-beta.12';
 export const CATENCE_PROTOCOL_VERSION = 1;
 
 export type CatenceRuntimeCapabilities = {
