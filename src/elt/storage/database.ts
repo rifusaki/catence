@@ -9,6 +9,26 @@ import { SYNC_STAGES, STALE_RUN_TIMEOUT_MS, type InterruptedRuns, type SyncProgr
 import { migrations } from './migrations.js';
 import { json } from './sql.js';
 
+/**
+ * DuckDB's node API throws "Cannot create values of type ANY" when a bound
+ * parameter resolves to an untyped value. JS `Date` objects surface as `ANY`
+ * (and are not auto-coerced the way strings are), so any date/timestamp
+ * parameter read back from the database and re-bound crashes the statement.
+ * Serializing dates to ISO strings keeps every parameter concretely typed.
+ */
+function serializeValue(value: unknown): unknown {
+  if (value instanceof Date) return value.toISOString();
+  return value;
+}
+
+function serializeBindings(bindings?: QueryBindings): QueryBindings | undefined {
+  if (!bindings) return bindings;
+  if (Array.isArray(bindings)) return bindings.map(serializeValue) as QueryBindings;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(bindings)) out[key] = serializeValue(value);
+  return out as QueryBindings;
+}
+
 export class CatenceDatabase implements WriteDataStore {
   private closed = false;
 
@@ -64,11 +84,11 @@ export class CatenceDatabase implements WriteDataStore {
   }
 
   async run(sql: string, values?: QueryBindings): Promise<void> {
-    await this.connection.run(sql, values as DuckDBValue[] | Record<string, DuckDBValue> | undefined);
+    await this.connection.run(sql, serializeBindings(values) as DuckDBValue[] | Record<string, DuckDBValue> | undefined);
   }
 
   async rows<T extends Record<string, unknown>>(sql: string, values?: QueryBindings): Promise<T[]> {
-    const result = await this.connection.runAndReadAll(sql, values as DuckDBValue[] | Record<string, DuckDBValue> | undefined);
+    const result = await this.connection.runAndReadAll(sql, serializeBindings(values) as DuckDBValue[] | Record<string, DuckDBValue> | undefined);
     return result.getRowObjectsJS() as T[];
   }
 
