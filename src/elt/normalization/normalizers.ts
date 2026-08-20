@@ -63,9 +63,10 @@ function swimSourceLabel(payload: JsonObject): string | null {
   return direct ? direct.toLowerCase() : null;
 }
 
-function datePart(value: string | null): string | null {
+function datePart(value: string | Date | null): string | null {
   if (!value) return null;
-  const match = value.match(/^\d{4}-\d{2}-\d{2}/);
+  const s = typeof value === 'string' ? value : value.toISOString();
+  const match = s.match(/^\d{4}-\d{2}-\d{2}/);
   return match?.[0] ?? null;
 }
 
@@ -159,6 +160,7 @@ function snake(value: string): string {
 }
 
 function timestamp(value: unknown): string | null {
+  if (value instanceof Date) return value.toISOString();
   if (typeof value === 'string' && value.length >= 10) return value;
   if (typeof value !== 'number' || !Number.isFinite(value)) return null;
   const milliseconds = value > 10_000_000_000 ? value : value * 1_000;
@@ -457,8 +459,8 @@ function nested(payload: JsonObject, key: string): JsonObject {
   return object(payload[key]);
 }
 
-function metricObservedAt(occurredOn: string | null, payload: JsonObject): string | null {
-  return firstTimestamp(payload, ['timestamp', 'timestampLocal', 'calendarDate', 'date']) ?? (occurredOn ? `${occurredOn}T00:00:00Z` : null);
+function metricObservedAt(occurredOn: string | Date | null, payload: JsonObject): string | null {
+  return firstTimestamp(payload, ['timestamp', 'timestampLocal', 'calendarDate', 'date']) ?? (occurredOn ? `${datePart(occurredOn)}T00:00:00Z` : null);
 }
 
 async function importGarminActivityPerformance(database: CatenceDatabase, remoteId: string, payload: JsonObject, rawHash: string | null): Promise<void> {

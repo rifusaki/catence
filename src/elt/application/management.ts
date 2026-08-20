@@ -545,7 +545,7 @@ export async function reimportNutrition(paths: CatencePaths): Promise<Record<str
     }
     const days = (await database.rows<{ count: number | bigint }>('SELECT count(*) AS count FROM nutrition_days'))[0]?.count ?? 0;
     const items = (await database.rows<{ count: number | bigint }>('SELECT count(*) AS count FROM nutrition_items'))[0]?.count ?? 0;
-    return { reimportedEntities: rows.length, nutritionDays: days, nutritionItems: items };
+    return { reimportedEntities: rows.length, nutritionDays: Number(days), nutritionItems: Number(items) };
   } finally {
     await database.close();
   }
