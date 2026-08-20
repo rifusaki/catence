@@ -244,7 +244,7 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
   await database.run(
     `INSERT INTO source_entities
       (provider, entity_type, remote_id, parent_remote_id, occurred_on, source_updated_at, raw_object_hash, payload_json, extension_json)
-      VALUES ($provider, $entityType, $remoteId, $parentRemoteId, $occurredOn, $sourceUpdatedAt, $rawHash, $payload, $extension)
+      VALUES ($provider::VARCHAR, $entityType::VARCHAR, $remoteId::VARCHAR, $parentRemoteId::VARCHAR, $occurredOn::TIMESTAMPTZ, $sourceUpdatedAt::TIMESTAMPTZ, $rawHash::VARCHAR, $payload::JSON, $extension::JSON)
       ON CONFLICT (provider, entity_type, remote_id) DO UPDATE SET
         parent_remote_id = excluded.parent_remote_id, occurred_on = excluded.occurred_on,
         source_updated_at = excluded.source_updated_at, raw_object_hash = excluded.raw_object_hash,
@@ -258,7 +258,7 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
   await database.run(
     `INSERT INTO domain_entities
       (provider, entity_type, remote_id, parent_remote_id, occurred_on, payload_json, extension_json, raw_object_hash)
-      VALUES ($provider, $entityType, $remoteId, $parentRemoteId, $occurredOn, $payload, $extension, $rawHash)
+      VALUES ($provider::VARCHAR, $entityType::VARCHAR, $remoteId::VARCHAR, $parentRemoteId::VARCHAR, $occurredOn::TIMESTAMPTZ, $payload::JSON, $extension::JSON, $rawHash::VARCHAR)
       ON CONFLICT (provider, entity_type, remote_id) DO UPDATE SET
         parent_remote_id = excluded.parent_remote_id, occurred_on = excluded.occurred_on,
         payload_json = excluded.payload_json, extension_json = excluded.extension_json, raw_object_hash = excluded.raw_object_hash`,
@@ -970,7 +970,7 @@ async function importNutrition(database: CatenceDatabase, provider: Provider, da
   await database.run(
     `INSERT INTO nutrition_days
       (provider, nutrition_date, energy_kcal, carbohydrates_g, protein_g, fat_g, hydration_ml, metrics_json, raw_object_hash)
-      VALUES ($provider, $nutritionDate, $energyKcal, $carbohydratesG, $proteinG, $fatG, $hydrationMl, $metrics, $rawHash)
+      VALUES ($provider::VARCHAR, $nutritionDate::DATE, $energyKcal::DOUBLE, $carbohydratesG::DOUBLE, $proteinG::DOUBLE, $fatG::DOUBLE, $hydrationMl::DOUBLE, $metrics::JSON, $rawHash::VARCHAR)
       ON CONFLICT (provider, nutrition_date) DO UPDATE SET
         energy_kcal = COALESCE(excluded.energy_kcal, nutrition_days.energy_kcal),
         carbohydrates_g = COALESCE(excluded.carbohydrates_g, nutrition_days.carbohydrates_g),
@@ -986,7 +986,11 @@ async function importNutrition(database: CatenceDatabase, provider: Provider, da
     await database.run(
       `INSERT INTO nutrition_items
        (provider, remote_item_id, nutrition_date, meal, consumed_at, food_name, quantity, energy_kcal, carbohydrates_g, protein_g, fat_g, payload_json, raw_object_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       VALUES (
+         CAST(? AS VARCHAR), CAST(? AS VARCHAR), CAST(? AS DATE), CAST(? AS VARCHAR),
+         CAST(? AS TIMESTAMP), CAST(? AS VARCHAR), CAST(? AS DOUBLE), CAST(? AS DOUBLE),
+         CAST(? AS DOUBLE), CAST(? AS DOUBLE), CAST(? AS DOUBLE), CAST(? AS JSON), CAST(? AS VARCHAR)
+       )
        ON CONFLICT (provider, remote_item_id) DO UPDATE SET nutrition_date = excluded.nutrition_date, meal = excluded.meal,
        consumed_at = excluded.consumed_at, food_name = excluded.food_name, quantity = excluded.quantity, energy_kcal = excluded.energy_kcal,
        carbohydrates_g = excluded.carbohydrates_g, protein_g = excluded.protein_g, fat_g = excluded.fat_g, payload_json = excluded.payload_json,

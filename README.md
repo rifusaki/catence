@@ -24,6 +24,8 @@ Catence helps explore recovery, training load, trends, activity detail, swimming
 
 Install Catence and create the first athlete. The default catalog home is `~/.catence`; set `CATENCE_HOME` or pass `--home` to use a different location.
 
+Every `catence-data` command requires `--athlete <id>`; there is no default athlete. Pair it with `--home <dir>` to select the catalog when not using the default home.
+
 ```sh
 npm install --global catence@beta          # or catence@latest for stable
 catence-data setup --athlete alex --label "Alex"
@@ -147,9 +149,7 @@ UV_CACHE_DIR=$PWD/.cache/uv uv run --project console --group dev python -m pytes
 
 ## Beta releases
 
-Registry betas use distinct npm and Python prerelease formats: for example,
-`catence@0.2.0-beta.1` pairs with `catence-console==0.2.0b1` and
-`catence-chainlit==0.2.0b1`. The protected `beta` branch verifies candidates;
+Registry betas use distinct npm, console, and UI-runtime prerelease formats. Each `catence@0.2.0-beta.N` npm release maps to a `catence-console==0.2.0bN` wheel, but the console depends on a range of `catence-chainlit` (the UI runtime), so the `catence-chainlit` version does not need to match the npm or console version. For example, `catence@0.2.0-beta.1` pairs with `catence-console==0.2.0b1` and can use any compatible `catence-chainlit` (such as `0.2.0b1`). The protected `beta` branch verifies candidates;
 a `v0.2.0-beta.1` tag publishes to npm's `beta` channel and creates a GitHub
 prerelease. Follow [the beta release checklist](release/beta-checklist.md) to
 publish the UI wheel first, deploy the registry artifacts with Compose, and
