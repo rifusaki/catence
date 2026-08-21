@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -52,6 +52,78 @@ function baseProgress(runId: string, provider: string, stage: SyncStage): SyncPr
     completedUnits: 0, totalUnits: null, percentComplete: 0, elapsedSeconds: 0,
     estimatedRemainingSeconds: null, heartbeatAt: new Date().toISOString(),
   };
+}
+
+/**
+ * Run the standalone swim-length backfill without progress streaming.
+ * The backfill reads every archived Garmin FIT (already on disk) and emits
+ * source_entity rows for any swim that actually contains length messages;
+ * importing them is idempotent, so re-parsing already-imported swims is
+ * harmless.
+ */
+function runSwimBackfillProcess(
+  arguments_: string[],
+  environment: { cwd: string; env: NodeJS.ProcessEnv },
+  log: SyncLogger,
+): Promise<GarminWorkerOutcome> {
+  return new Promise((resolve) => {
+    const child = spawn('uv', arguments_, { ...environment, stdio: ['ignore', 'pipe', 'pipe'] });
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk.toString('utf8')));
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk.toString('utf8')));
+    child.on('error', (error) => {
+      log.error('Garmin swim-backfill process could not be started', { error: error.message });
+      resolve({ code: 1, signal: null });
+    });
+    child.on('close', (code, signal) => {
+      const out = stdout.join('').trim();
+      const err = stderr.join('').trim();
+      if (out) log.info(`[garmin swim_backfill] ${out}`);
+      if (err) log.error(`[garmin swim_backfill] ${err}`);
+      resolve({ code, signal });
+    });
+  });
+}
+
+async function backfillGarminSwimLengths(
+  database: CatenceDatabase,
+  paths: CatencePaths,
+  parentRunId: string,
+  log: SyncLogger,
+): Promise<void> {
+  const output = path.join(paths.staging, 'garmin', `${parentRunId}.swim_lengths.jsonl`);
+  await mkdir(path.dirname(output), { recursive: true });
+  // Fresh file for deterministic counting; a stale file would make
+  // line counting ambiguous.
+  try {
+    const { rm } = await import('node:fs/promises');
+    await rm(output, { force: true });
+  } catch {
+    // Best-effort cleanup.
+  }
+  const arguments_ = ['run', 'python', '-m', 'python.catence.providers.garmin.swim_backfill', '--data-dir', paths.root, '--output', output];
+  const environment = {
+    cwd: packageRoot(),
+    env: { ...(await athleteProviderEnvironment(paths)), UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT ?? path.join(paths.root, 'python-venv') },
+  };
+  const outcome = await runSwimBackfillProcess(arguments_, environment, log);
+  if (outcome.code !== 0) {
+    throw new Error(`Garmin swim_backfill exited with code ${outcome.code}${outcome.signal ? ` (${outcome.signal})` : ''}.`);
+  }
+  if (!existsSync(output)) {
+    log.info('Garmin swim backfill produced no output file', { parentRunId });
+    return;
+  }
+  const content = await readFile(output, 'utf8');
+  const lines = content.split('\n').filter((line) => line.trim().length > 0);
+  if (lines.length === 0) {
+    log.info('Garmin swim backfill produced no staged lengths', { parentRunId });
+    return;
+  }
+  const backfillRunId = randomUUID();
+  const imported = await importJsonl(database, backfillRunId, output, log);
+  log.info('Imported swim lengths from automatic backfill', { parentRunId, backfillRunId, staged: lines.length, imported });
 }
 
 /**
@@ -238,6 +310,16 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       if (!guard.interrupted) {
         if (!existsSync(output)) throw new Error('Garmin staging worker completed without writing a JSONL manifest.');
         await importJsonl(database, runId, output, log);
+        if (provider === 'garmin') {
+          try {
+            await backfillGarminSwimLengths(database, paths, runId, log);
+          } catch (error) {
+            log.warn('Garmin swim-length backfill after sync failed', {
+              runId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
       }
     }
   } catch (error) {

@@ -492,6 +492,49 @@ class GarminStagingWorker:
             if isinstance(payload, dict):
                 self.writer.source_entity("activity", child_id, payload, raw_hash, parent_remote_id=parent_activity_id)
 
+    def _is_swim_activity(self, summary: dict[str, Any], activity: dict[str, Any] | None, details: dict[str, Any] | None) -> bool:
+        """Return True when any of the Garmin sport/type fields indicates a swim."""
+        candidates: list[str] = []
+        # Direct sport string fields on the list summary (including flat activityType string).
+        for key in ("sport", "sportType", "sport_type", "activityType", "activityTypeKey"):
+            value = summary.get(key)
+            if isinstance(value, str) and value:
+                candidates.append(value)
+        # Nested activityType shapes on the list summary.
+        for key in ("activityType", "activityTypeDTO"):
+            nested = summary.get(key)
+            if isinstance(nested, dict):
+                type_key = nested.get("typeKey") or nested.get("type_key") or nested.get("type") or nested.get("key")
+                if isinstance(type_key, str) and type_key:
+                    candidates.append(type_key)
+        # Detailed payloads provide the authoritative typeKey.
+        for payload in (activity, details):
+            if not isinstance(payload, dict):
+                continue
+            for key in ("activityType", "activityTypeDTO"):
+                nested = payload.get(key)
+                if isinstance(nested, dict):
+                    type_key = nested.get("typeKey")
+                    if isinstance(type_key, str) and type_key:
+                        candidates.append(type_key)
+            for key in ("sport", "sportType"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    candidates.append(value)
+            summary_dto = payload.get("summaryDTO")
+            if isinstance(summary_dto, dict):
+                for key in ("activityType", "activityTypeDTO"):
+                    nested = summary_dto.get(key)
+                    if isinstance(nested, dict):
+                        type_key = nested.get("typeKey")
+                        if isinstance(type_key, str) and type_key:
+                            candidates.append(type_key)
+        for candidate in candidates:
+            lowered = candidate.lower()
+            if lowered == "lap_swimming" or "swim" in lowered:
+                return True
+        return False
+
     def _activity_details(self, activity_id: str, summary: dict[str, Any]) -> None:
         calls = {
             "activity": ("get_activity", "activity_detail"), "activity_details": ("get_activity_details", "activity_detail"),
@@ -501,17 +544,19 @@ class GarminStagingWorker:
             "activity_exercise_sets": ("get_activity_exercise_sets", "activity_exercise_set"), "activity_gear": ("get_activity_gear", "activity_gear"),
         }
         details: dict[str, Any] | None = None
+        activity_payload: dict[str, Any] | None = None
         for endpoint, (method, entity_type) in calls.items():
             payload, raw_hash = self._capture(endpoint, lambda method=method: getattr(self.api, method)(activity_id), activity_id)
             if payload is not None:
                 self._entity(endpoint, entity_type, payload, raw_hash, parent_remote_id=activity_id)
                 if endpoint == "activity" and isinstance(payload, dict):
+                    activity_payload = payload
                     self._multisport_children(activity_id, payload)
                 if endpoint == "activity_details" and isinstance(payload, dict):
                     details = payload
-        self._activity_files(activity_id, summary, details)
+        self._activity_files(activity_id, summary, activity_payload, details)
 
-    def _activity_files(self, activity_id: str, summary: dict[str, Any], details: dict[str, Any] | None) -> None:
+    def _activity_files(self, activity_id: str, summary: dict[str, Any], activity: dict[str, Any] | None, details: dict[str, Any] | None) -> None:
         try:
             from garminconnect import Garmin
             formats = {
@@ -557,8 +602,7 @@ class GarminStagingWorker:
                     occurred_on=start_date[:10],
                 )
         if original_path and original_path.exists():
-            sport = str(summary.get("sportType") or summary.get("sport") or "").lower()
-            if sport == "lap_swimming" or "swim" in sport:
+            if self._is_swim_activity(summary, activity, details):
                 lengths = fit_archive_to_swim_lengths(f"garmin:{activity_id}", original_path)
                 if lengths:
                     start_date = str(summary.get("startTimeLocal") or summary.get("startTimeGMT") or date.today().isoformat())
