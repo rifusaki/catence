@@ -2,8 +2,10 @@ node_modules/
 dist/
 coverage/
 .env
-.env.beta
+.env.*
+!.env.example
 .catence/
+.catence-*
 .venv/
 console/.venv/
 console/.chainlit/
@@ -20,6 +22,7 @@ __pycache__/
 /.cocoindex_code/
 docs/*
 !docs/architecture.md
+!docs/development.md
 !docs/mcp-activity-retrieval.md
 !docs/llm-providers.md
 !docs/configuration.md

@@ -1,0 +1,67 @@
+# Development override for live Docker testing without publishing a beta.
+# See docs/development.md "Live loop — bind-mount the checkout into the container".
+#
+# Usage:
+#   cp .env.example .env.dev   # fill in CATENCE_CONSOLE_USERNAME, PASSWORD_HASH, CHAINLIT_AUTH_SECRET, model key
+#   docker compose -f docker-compose.dev.yml --env-file .env.dev up --build
+#
+# The data volume (catence-dev-data) is the authority for /data: config.json,
+# secrets/providers.json, and console/chat-history.sqlite3 are preserved across
+# rebuilds. Source is bind-mounted so edits on the host are visible inside.
+# For a host-side runtime instead, run `npx tsx watch src/interfaces/mcp/main.ts -- serve ...`
+# on the host and start the Console with --mcp-url host.docker.internal:8787.
+
+services:
+  console:
+    build:
+      context: .
+      dockerfile: console/Dockerfile
+    image: catence-console:dev
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8787:8787"
+    environment:
+      CATENCE_HOME: /data
+      CATENCE_CONSOLE_USERNAME: ${CATENCE_CONSOLE_USERNAME:-}
+      CATENCE_CONSOLE_PASSWORD_HASH: ${CATENCE_CONSOLE_PASSWORD_HASH:-}
+      CHAINLIT_AUTH_SECRET: ${CHAINLIT_AUTH_SECRET:-}
+      # Opt-in flag for generic provider env fallback (per-athlete CATENCE_ATHLETE_<ID>_* vars work without it).
+      CATENCE_ALLOW_ENV_SECRETS: ${CATENCE_ALLOW_ENV_SECRETS:-}
+      CATENCE_SECRETS_FROM_ENV: ${CATENCE_SECRETS_FROM_ENV:-}
+      # Generic fallback — only used when CATENCE_ALLOW_ENV_SECRETS=1 and providers.json field missing.
+      GARMIN_EMAIL: ${GARMIN_EMAIL:-}
+      GARMIN_PASSWORD: ${GARMIN_PASSWORD:-}
+      INTERVALS_API_KEY: ${INTERVALS_API_KEY:-}
+      INTERVALS_ATHLETE_ID: ${INTERVALS_ATHLETE_ID:-}
+      STRAVA_CLIENT_ID: ${STRAVA_CLIENT_ID:-}
+      STRAVA_CLIENT_SECRET: ${STRAVA_CLIENT_SECRET:-}
+      # Per-athlete scoped fallback (always, no flag) — add your athlete id upper-cased, '-' → '_':
+      # CATENCE_ATHLETE_ALEX_GARMIN_EMAIL: ${CATENCE_ATHLETE_ALEX_GARMIN_EMAIL:-}
+      # CATENCE_ATHLETE_ALEX_GARMIN_PASSWORD: ${CATENCE_ATHLETE_ALEX_GARMIN_PASSWORD:-}
+      # CATENCE_ATHLETE_ALEX_INTERVALS_API_KEY: ${CATENCE_ATHLETE_ALEX_INTERVALS_API_KEY:-}
+      # CATENCE_ATHLETE_ALEX_INTERVALS_ATHLETE_ID: ${CATENCE_ATHLETE_ALEX_INTERVALS_ATHLETE_ID:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}
+      OPENCODE_GO_API_KEY: ${OPENCODE_GO_API_KEY:-}
+      OPENCODE_GO_API_BASE: ${OPENCODE_GO_API_BASE:-}
+      OPENCODE_GO_MESSAGES_API_BASE: ${OPENCODE_GO_MESSAGES_API_BASE:-}
+      OPENCODE_ZEN_API_BASE: ${OPENCODE_ZEN_API_BASE:-}
+      OPENCODE_ZEN_RESPONSES_API_BASE: ${OPENCODE_ZEN_RESPONSES_API_BASE:-}
+    volumes:
+      - catence-dev-data:/data
+      - .:/app
+      - /app/node_modules
+      - /app/console/.venv
+      - /app/dist
+      - /app/.catence-dev
+      - /app/.catence
+    command: >
+      sh -c "npm run build &&
+             uv run --project /app/console catence-console serve
+               --home /data --ui-host 0.0.0.0 --ui-port 8000
+               --mcp-host 0.0.0.0 --mcp-port 8787"
+
+volumes:
+  catence-dev-data:
