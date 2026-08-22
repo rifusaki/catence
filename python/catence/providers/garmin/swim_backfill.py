@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from .staging import StagingWriter
@@ -13,14 +14,21 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backfill swim lengths from already-archived Garmin activity FIT files.")
     parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--activities",
+        type=Path,
+        help=(
+            "JSON list of {remote_activity_id, started_on} rows produced by the TypeScript side. "
+            "Preferred over reading DuckDB because the parent process may hold the write lock."
+        ),
+    )
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    database_path = args.data_dir / "catence.duckdb"
-    if not database_path.exists():
-        raise SystemExit(f"Catalog database not found: {database_path}")
+def load_swim_activities(activities_file: Path | None, database_path: Path) -> list[tuple[str, str | None]]:
+    if activities_file is not None:
+        payload = json.loads(activities_file.read_text())
+        return [(str(row["remote_activity_id"]), row.get("started_on")) for row in payload]
     import duckdb
 
     con = duckdb.connect(str(database_path), read_only=True)
@@ -35,6 +43,15 @@ def main() -> None:
         """.format(placeholders=", ".join(f"'{sport}'" for sport in SWIM_SPORTS)),
     ).fetchall()
     con.close()
+    return [(str(remote_id), started_at_utc) for remote_id, started_at_utc in rows]
+
+
+def main() -> None:
+    args = parse_args()
+    database_path = args.data_dir / "catence.duckdb"
+    if args.activities is None and not database_path.exists():
+        raise SystemExit(f"Catalog database not found: {database_path}")
+    rows = load_swim_activities(args.activities, database_path)
 
     writer = StagingWriter(args.data_dir, args.output)
     staged = 0

@@ -102,7 +102,23 @@ async function backfillGarminSwimLengths(
   } catch {
     // Best-effort cleanup.
   }
-  const arguments_ = ['run', 'python', '-m', 'python.catence.providers.garmin.swim_backfill', '--data-dir', paths.root, '--output', output];
+  // The swim list is queried here and handed to the Python worker as a file:
+  // the child must never open DuckDB itself because the parent holds the
+  // write lock for the whole run.
+  const activitiesFile = path.join(paths.staging, 'garmin', `${parentRunId}.swim_activities.json`);
+  await writeFile(activitiesFile, JSON.stringify(await database.garminSwimActivitySources()));
+  const arguments_ = [
+    'run',
+    'python',
+    '-m',
+    'python.catence.providers.garmin.swim_backfill',
+    '--data-dir',
+    paths.root,
+    '--output',
+    output,
+    '--activities',
+    activitiesFile,
+  ];
   const environment = {
     cwd: packageRoot(),
     env: { ...(await athleteProviderEnvironment(paths)), UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT ?? path.join(paths.root, 'python-venv') },

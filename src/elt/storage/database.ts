@@ -341,6 +341,18 @@ export class CatenceDatabase implements WriteDataStore {
     return toIsoDate(rows[0]?.earliest ?? null);
   }
 
+  async garminSwimActivitySources(): Promise<Array<{ remote_activity_id: string; started_on: string | null }>> {
+    const sports = ['lap_swimming', 'swimming', 'open_water_swimming', 'openwaterswimming'];
+    return this.rows(
+      `SELECT source.remote_activity_id, cast(activity.started_at_utc AS VARCHAR) AS started_on
+         FROM activity_sources AS source
+         JOIN activities AS activity USING (activity_id)
+        WHERE source.provider = 'garmin'
+          AND lower(coalesce(activity.sport, '')) IN (${sports.map((sport) => `'${sport}'`).join(', ')})
+        ORDER BY activity.started_at_utc`,
+    );
+  }
+
   private async latestSourceDate(provider: Provider, cursorName: 'daily' | 'activities'): Promise<string | null> {
     const observations = cursorName === 'daily'
       ? `SELECT max(metric_date) AS observed_date FROM daily_metrics WHERE provider = $provider
