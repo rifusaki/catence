@@ -29,8 +29,14 @@ async function checkVersions() {
   if (!['stable', 'beta'].includes(channel)) throw new Error('release/manifest.json channel must be stable or beta.');
   const beta = version.match(/^(\d+\.\d+\.\d+)-beta\.(\d+)$/);
   if (channel === 'stable' && (beta || pythonVersion !== version)) throw new Error('A stable release must use matching final npm and Python versions.');
-  if (channel === 'beta' && (!beta || pythonVersion !== `${beta[1]}b${beta[2]}`)) {
-    throw new Error('A beta release must map npm X.Y.Z-beta.N to Python X.Y.ZbN.');
+  if (channel === 'beta') {
+    if (!beta) throw new Error('A beta npm release must be semver X.Y.Z-beta.N.');
+    // catence-console may lag npm: it only re-releases when its own code
+    // changes. Its PEP 440 beta number must never run ahead of npm's.
+    const pythonPrefix = `${beta[1]}b`;
+    if (!pythonVersion.startsWith(pythonPrefix) || Number(pythonVersion.slice(pythonPrefix.length)) > Number(beta[2])) {
+      throw new Error(`Beta Python version ${pythonVersion} must stay on ${beta[1]} and not run ahead of npm beta.${beta[2]}.`);
+    }
   }
   if (!Number.isInteger(release.protocolVersion) || release.protocolVersion < 1) throw new Error('release/manifest.json protocolVersion must be a positive integer.');
   if (release.packages?.npm !== packageJson.name) throw new Error(`release/manifest.json npm package must equal ${packageJson.name}.`);

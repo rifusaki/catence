@@ -155,11 +155,31 @@ jobs:
     permissions:
       id-token: write
     steps:
+      - uses: actions/checkout@v4
+      - name: Resolve Python release version
+        id: pyver
+        run: echo "version=$(node -p "require('./release/manifest.json').pythonVersion")" >> "$GITHUB_OUTPUT"
+      # catence-console may lag npm on beta; skip the upload when this exact
+      # version already exists on PyPI because PyPI rejects duplicates.
+      - name: Check whether catence-console is already published
+        id: published
+        run: |
+          version='${{ steps.pyver.outputs.version }}'
+          if curl -fsSL "https://pypi.org/pypi/catence-console/json" | python3 -c '
+import json, sys
+version = sys.argv[1]
+sys.exit(0 if json.load(sys.stdin).get("releases", {}).get(version) else 1)
+' "$version"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "catence-console==$version is already on PyPI; skipping upload."
+          fi
       - uses: actions/download-artifact@v4
+        if: steps.published.outputs.skip != 'true'
         with:
           name: catence-console-wheel
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+        if: steps.published.outputs.skip != 'true'
 
   github-release:
     needs: [publish, publish-console]
