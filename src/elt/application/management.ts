@@ -290,6 +290,15 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       if (activityWindow) arguments_.push('--activity-from', activityWindow.fromDate, '--activity-to', activityWindow.toDate);
       else arguments_.push('--skip-activities');
       if (options.backfill && !options.refreshActivities) arguments_.push('--historical-only');
+      // Data-completeness catch-up: stores synced before lactate-threshold
+      // history capture only hold the latest singleton point. When no
+      // per-day LT observations exist yet, widen the worker's LT window to
+      // the athlete's first activity so the history backfills once; the
+      // condition self-clears after the first successful import.
+      if (!(await database.hasGarminLactateThresholdHistory())) {
+        const earliest = await database.earliestActivityStartDate('garmin');
+        if (earliest) arguments_.push('--lt-history-from', earliest);
+      }
       let interruptChild: (() => void) | null = null;
       await runWithInterruptGuard(runId, database, () => interruptChild?.(), guard, async () => {
         const outcome = await runGarminWorker(

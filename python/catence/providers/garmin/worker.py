@@ -44,6 +44,52 @@ def functional_threshold_power_items(value: Any) -> list[dict[str, Any]]:
     return []
 
 
+def threshold_range_items(value: Any) -> list[dict[str, Any]]:
+    """Extract dated points from a lactate-threshold range series response."""
+    items = functional_threshold_power_items(value)
+    return [item for item in items if isinstance(item.get("value"), (int, float)) and not isinstance(item.get("value"), bool)]
+
+
+def lactate_threshold_days(payload: Any) -> dict[str, dict[str, float]]:
+    """Combine speed/heart-rate and power range series into per-day thresholds.
+
+    The range responses carry no weight or power-to-weight fields; deriving
+    W/kg is left to downstream joins against daily weight history.
+    """
+    combined: dict[str, dict[str, float]] = {}
+    if not isinstance(payload, Mapping):
+        return combined
+    for block, key in (("speed", "speed"), ("heart_rate", "heartRate")):
+        for item in threshold_range_items(payload.get(block)):
+            day = ftp_history_date(item)
+            if day:
+                combined.setdefault(day, {})[key] = float(item["value"])
+    for item in threshold_range_items(payload.get("power")):
+        day = ftp_history_date(item)
+        if day:
+            combined.setdefault(day, {})["functionalThresholdPower"] = float(item["value"])
+    return combined
+
+
+def lactate_threshold_payload(day: str, threshold: Mapping[str, float]) -> dict[str, Any]:
+    """Compose a singleton-shaped payload the normalizer already understands."""
+    observed_at = f"{day}T12:00:00"
+    payload: dict[str, Any] = {"calendarDate": observed_at}
+    speed = threshold.get("speed")
+    heart_rate = threshold.get("heartRate")
+    power = threshold.get("functionalThresholdPower")
+    if speed is not None or heart_rate is not None:
+        speed_and_heart_rate: dict[str, Any] = {"calendarDate": observed_at}
+        if speed is not None:
+            speed_and_heart_rate["speed"] = speed
+        if heart_rate is not None:
+            speed_and_heart_rate["heartRate"] = heart_rate
+        payload["speed_and_heart_rate"] = speed_and_heart_rate
+    if power is not None:
+        payload["power"] = {"calendarDate": observed_at, "functionalThresholdPower": power, "origin": "RUNNING"}
+    return payload
+
+
 def ftp_history_date(payload: Mapping[str, Any]) -> str | None:
     for key in ("until", "calendarDate", "date", "updatedDate", "from"):
         value = payload.get(key)
@@ -111,6 +157,7 @@ class GarminStagingWorker:
         daily_to_date: date | None = None,
         activity_to_date: date | None = None,
         include_non_historical: bool = True,
+        lactate_threshold_history_from: date | None = None,
     ) -> None:
         assert_read_only_registry()
         end = to_date or date.today()
@@ -132,6 +179,14 @@ class GarminStagingWorker:
             self._hrv_history(daily_from_date, daily_end)
             self._check_interrupted()
             self._score_history(daily_from_date, daily_end)
+        # Lactate-threshold history uses the widest requested window so a
+        # single sync can catch stores up that were created before per-day
+        # LT capture existed; runs even when the daily window is skipped.
+        lt_windows = [window for window in (daily_from_date, lactate_threshold_history_from) if window is not None]
+        lt_start = min(lt_windows) if lt_windows else None
+        if lt_start is not None and lt_start <= daily_end:
+            self._check_interrupted()
+            self._lactate_threshold_history(lt_start, daily_end)
         if activity_from_date and activity_from_date <= activity_end:
             self._check_interrupted()
             self._activities(activity_from_date, activity_end)
@@ -313,6 +368,41 @@ class GarminStagingWorker:
                         normalized,
                         raw_hash,
                         occurred_on=occurred_on,
+                    )
+            completed_windows += 1
+            if self.progress is not None:
+                self.progress.advance(completed=completed_windows)
+            window_start = window_end + timedelta(days=1)
+
+    def _lactate_threshold_history(self, from_date: date, to_date: date) -> None:
+        """Stage daily running lactate-threshold history from Garmin's range endpoints."""
+        window_start = from_date
+        total_windows = (to_date - from_date).days // 365 + 1
+        if self.progress is not None:
+            self.progress.set_stage("lt_history")
+            self.progress.advance(total=total_windows)
+        completed_windows = 0
+        while window_start <= to_date:
+            self._check_interrupted()
+            # Garmin rejects range windows longer than 366 days.
+            window_end = min(to_date, window_start + timedelta(days=365))
+            start, end = window_start.isoformat(), window_end.isoformat()
+            if self.progress is not None:
+                self.progress.advance(step=start)
+            payload, raw_hash = self._capture(
+                "lactate_threshold_range",
+                lambda start=start, end=end: self.api.get_lactate_threshold(latest=False, start_date=start, end_date=end, aggregation="daily"),
+                None,
+                {"from": start, "to": end, "aggregation": "daily"},
+            )
+            if payload is not None and raw_hash is not None:
+                for item_day, threshold in lactate_threshold_days(payload).items():
+                    self.writer.source_entity(
+                        "lactate_threshold",
+                        f"daily:{item_day}",
+                        lactate_threshold_payload(item_day, threshold),
+                        raw_hash,
+                        occurred_on=item_day,
                     )
             completed_windows += 1
             if self.progress is not None:

@@ -325,6 +325,22 @@ export class CatenceDatabase implements WriteDataStore {
     return Object.fromEntries(rows.map((row) => [row.remote_activity_id, row.summary_hash]));
   }
 
+  async hasGarminLactateThresholdHistory(): Promise<boolean> {
+    const rows = await this.rows<{ n: number }>(
+      "SELECT count(*) AS n FROM training_metric_observations WHERE observation_id LIKE 'garmin:lactate_threshold:daily:%'",
+    );
+    return (rows[0]?.n ?? 0) > 0;
+  }
+
+  async earliestActivityStartDate(provider: Provider): Promise<string | null> {
+    const rows = await this.rows<{ earliest: string | Date | null }>(
+      `SELECT min(cast(started_at_utc AS DATE)) AS earliest FROM activities activity
+         JOIN activity_sources source USING (activity_id) WHERE source.provider = $provider`,
+      { provider },
+    );
+    return toIsoDate(rows[0]?.earliest ?? null);
+  }
+
   private async latestSourceDate(provider: Provider, cursorName: 'daily' | 'activities'): Promise<string | null> {
     const observations = cursorName === 'daily'
       ? `SELECT max(metric_date) AS observed_date FROM daily_metrics WHERE provider = $provider

@@ -29,6 +29,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--historical-only", action="store_true", help="Skip current account and collection endpoints.")
     parser.add_argument("--skip-daily", action="store_true", help="Do not fetch date-scoped daily data.")
     parser.add_argument("--skip-activities", action="store_true", help="Do not fetch date-scoped activities.")
+    parser.add_argument(
+        "--lt-history-from",
+        dest="lt_history_from",
+        type=date.fromisoformat,
+        help="Backfill lactate-threshold history from this date instead of the daily window.",
+    )
     return parser.parse_args()
 
 
@@ -72,6 +78,7 @@ def main() -> None:
             daily_to_date=args.daily_to_date,
             activity_to_date=args.activity_to_date,
             include_non_historical=not args.historical_only,
+            lactate_threshold_history_from=args.lt_history_from,
         )
     except WorkerInterrupted:
         reporter.finish("interrupted")
