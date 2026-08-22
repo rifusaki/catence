@@ -214,7 +214,16 @@ pypi_has_version() { # package version -> 1 | 0
 resolve_console_fallback() { # pep440 target -> version | empty
   local target="$1"
   registry_json "https://pypi.org/pypi/catence-console/json" \
-    "import sys,json,re;v='$target';m=re.match(r'^(\d+)\.(\d+)\.(\d+)b(\d+)$',v);print('');sys.exit(0) if not m else None;maj,mino,pat,tb=map(int,m.groups());c=[(int(re.match(r'^(\d+)\.(\d+)\.(\d+)b(\d+)$',x).group(4)),x) for x in json.load(sys.stdin).get('releases',{}).keys() if re.match(r'^(\d+)\.(\d+)\.(\d+)b(\d+)$',x) and tuple(map(int,re.match(r'^(\d+)\.(\d+)\.(\d+)b(\d+)$',x).groups()[:3]))==(maj,mino,pat) and int(re.match(r'^(\d+)\.(\d+)\.(\d+)b(\d+)$',x).groups()[3])<=tb];c.sort();print(c[-1][1] if c else '')" \
+    "import sys,json,re
+v='$target'
+m=re.match(r'^(\d+)\.(\d+)\.(\d+)b(\d+)$',v)
+if not m:
+    print('')
+    sys.exit(0)
+maj,mino,pat,tb=map(int,m.groups())
+c=[(int(re.match(r'^(\d+)\.(\d+)\.(\d+)b(\d+)$',x).group(4)),x) for x in json.load(sys.stdin).get('releases',{}).keys() if re.match(r'^(\d+)\.(\d+)\.(\d+)b(\d+)$',x) and tuple(map(int,re.match(r'^(\d+)\.(\d+)\.(\d+)b(\d+)$',x).groups()[:3]))==(maj,mino,pat) and int(re.match(r'^(\d+)\.(\d+)\.(\d+)b(\d+)$',x).groups()[3])<=tb]
+c.sort()
+print(c[-1][1] if c else '')" \
     "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const v='$target';const m=v.match(/^(\d+)\.(\d+)\.(\d+)b(\d+)$/);if(!m){console.log('');return;}const maj=Number(m[1]),mino=Number(m[2]),pat=Number(m[3]),tb=Number(m[4]);const c=Object.keys(JSON.parse(s).releases||{}).filter(x=>{const mm=x.match(/^(\d+)\.(\d+)\.(\d+)b(\d+)$/);return mm&&(Number(mm[1])+'.'+Number(mm[2])+'.'+Number(mm[3]))===(maj+'.'+mino+'.'+pat)&&Number(mm[4])<=tb;}).sort((a,b)=>Number(b.match(/b(\d+)$/)[1])-Number(a.match(/b(\d+)$/)[1]));console.log(c[0]||'');})"
 }
 
@@ -250,7 +259,7 @@ if [ -z "$CONSOLE_VERSION" ]; then
   # that is still compatible (same X.Y.Z base, beta number <= the runtime's).
   if [ "$(pypi_has_version catence-console "$CONSOLE_VERSION")" != "1" ]; then
     info "catence-console==$CONSOLE_VERSION not published; resolving newest compatible published release"
-    fallback="$(resolve_console_fallback "$CONSOLE_VERSION")"
+    fallback="$(resolve_console_fallback "$CONSOLE_VERSION" | tr -d '[:space:]')"
     [ -n "$fallback" ] || die "no published catence-console <= $CONSOLE_VERSION on PyPI"
     CONSOLE_VERSION="$fallback"
   fi
