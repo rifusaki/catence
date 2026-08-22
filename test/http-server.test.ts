@@ -1,12 +1,18 @@
 import type { AddressInfo } from 'node:net';
+import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CATENCE_PROTOCOL_VERSION, CATENCE_RUNTIME_VERSION } from '../src/contracts/release.js';
 import { createCatenceHttpServer } from '../src/interfaces/http/server.js';
+import { startDetachedSync, type DetachedSyncHandle, type DetachedSyncRequest } from '../src/runtime/index.js';
 import { temporaryDatabase } from './helpers.js';
 
 const servers: Array<ReturnType<typeof createCatenceHttpServer>> = [];
+
+function fakeStartSync(log = 'log.txt'): (request: DetachedSyncRequest) => Promise<DetachedSyncHandle> {
+  return async (request) => ({ started: true, athleteId: request.athleteId, provider: request.provider ?? 'all', logFile: log });
+}
 
 async function listen(server: ReturnType<typeof createCatenceHttpServer>): Promise<string> {
   await new Promise<void>((resolve, reject) => {
@@ -73,5 +79,122 @@ describe('Catence Streamable HTTP server', () => {
 
     const invalidDashboard = await fetch(`${origin}/api/v1/dashboard?days=0`);
     expect(invalidDashboard.status).toBe(400);
+  });
+
+  it('starts detached syncs and reports progress plus last-completion timestamps', async () => {
+    const { paths, database } = await temporaryDatabase();
+    await database.close();
+    let requested: DetachedSyncRequest | null = null;
+    const server = createCatenceHttpServer({
+      paths,
+      startSync: async (request) => {
+        requested = request;
+        return { started: true, athleteId: request.athleteId, provider: request.provider ?? 'all', logFile: 'sync.log' };
+      },
+      mergeModels: async ({ configPath }) => ({
+        configPath,
+        mergedProfileIds: ['opencode-go'],
+        defaultProfile: 'opencode-go',
+        counts: { chat: 3, responses: 1, messages: 2 },
+        guessedRoutes: [],
+      }),
+    });
+    servers.push(server);
+    const origin = await listen(server);
+
+    const invalid = await fetch(`${origin}/api/v1/sync`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'bogus' }),
+    });
+    expect(invalid.status).toBe(400);
+
+    const started = await fetch(`${origin}/api/v1/sync`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'garmin', refresh: true, refreshModels: true }),
+    });
+    expect(started.status).toBe(202);
+    expect(await started.json()).toMatchObject({
+      started: true,
+      athleteId: 'local',
+      provider: 'garmin',
+      progressEndpoint: '/api/v1/sync/status',
+    });
+    // The discovery merge receives the store's config path.
+    expect((requested as unknown as DetachedSyncRequest | null)).toMatchObject({ athleteId: 'local', provider: 'garmin', refresh: true });
+
+    const status = await fetch(`${origin}/api/v1/sync/status`);
+    expect(status.status).toBe(200);
+    // An empty readable store reports a null last-completion timestamp; while
+    // a sync holds the write lock, lastSync is null entirely.
+    expect(await status.json()).toMatchObject({
+      athleteId: 'local',
+      progress: { running: [], recent: [] },
+      lastSync: { lastCompletedAt: null, providers: {} },
+    });
+  });
+
+  it('reports 409 with a stable error code when a sync run is already active', async () => {
+    const { paths, database } = await temporaryDatabase();
+    await database.close();
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    await mkdir(path.join(paths.staging, 'garmin'), { recursive: true });
+    await writeFile(
+      path.join(paths.staging, 'garmin', 'run-1.progress.json'),
+      JSON.stringify({ runId: 'run-1', provider: 'garmin', stage: 'daily', completedUnits: 0, totalUnits: null, percentComplete: 0, elapsedSeconds: 0, estimatedRemainingSeconds: null, heartbeatAt: new Date().toISOString() }),
+      'utf8',
+    );
+
+    // The default startDetachedSync performs the busy check itself, so the
+    // server must refuse before any spawn dependency runs.
+    let spawned = false;
+    const server = createCatenceHttpServer({
+      paths,
+      syncSpawnProcess: () => {
+        spawned = true;
+        return { unref() {} };
+      },
+    });    servers.push(server);
+    const origin = await listen(server);
+
+    const response = await fetch(`${origin}/api/v1/sync`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: { code: 'sync_in_progress', message: expect.stringContaining('run-1') } });
+    expect(spawned).toBe(false);
+
+    const status = await fetch(`${origin}/api/v1/sync/status`);
+    // The store itself stays readable here: the sidecar simulates live
+    // progress without holding the real single-writer lock.
+    expect(await status.json()).toMatchObject({ progress: { running: [{ runId: 'run-1' }] }, lastSync: { lastCompletedAt: null } });
+  });
+
+  it('keeps model-discovery failures non-fatal for the data sync', async () => {
+    const { paths, database } = await temporaryDatabase();
+    await database.close();
+    const server = createCatenceHttpServer({
+      paths,
+      startSync: fakeStartSync(),
+      mergeModels: async () => {
+        throw new Error('catalog unreachable');
+      },
+    });
+    servers.push(server);
+    const origin = await listen(server);
+
+    const started = await fetch(`${origin}/api/v1/sync`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ refreshModels: true }),
+    });
+    expect(started.status).toBe(202);
+    expect(await started.json()).toMatchObject({
+      started: true,
+      warning: expect.stringContaining('OpenCode Go model discovery failed'),
+    });
   });
 });

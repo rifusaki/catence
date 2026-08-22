@@ -10,6 +10,7 @@ import {
   DataWriteBusyError,
   DATASET_CATALOG,
   demoStoreMetadata,
+  DetachedSyncBusyError,
   FitnessService,
   getDataset,
   hydrateStravaActivity,
@@ -25,6 +26,7 @@ import {
   resolveCatalogPaths,
   searchContext,
   SlidingWindowLimiter,
+  startDetachedSync,
   StravaEnrichmentError,
   StravaRateLimitError,
   SwimmingService,
@@ -57,6 +59,7 @@ type StravaActivityHydrator = typeof hydrateStravaActivity;
 
 type McpDependencies = {
   hydrateStravaActivity?: StravaActivityHydrator;
+  startDetachedSync?: typeof startDetachedSync;
 };
 
 type AthleteResolution = { athlete: { id: string; label: string }; paths: CatencePaths };
@@ -77,9 +80,11 @@ function textResult(value: unknown): ToolResult {
 }
 
 function errorResult(error: unknown): ToolResult {
-  const classified = error instanceof DataWriteBusyError
-    ? { code: 'data_sync_in_progress', message: error.message, retryable: true }
-    : error instanceof StravaRateLimitError
+  const classified = error instanceof DetachedSyncBusyError
+    ? { code: 'sync_in_progress', message: error.message, retryable: true, runId: error.runId }
+    : error instanceof DataWriteBusyError
+      ? { code: 'data_sync_in_progress', message: error.message, retryable: true }
+      : error instanceof StravaRateLimitError
       ? { code: 'rate_limited', message: error.message, retryable: true, retryAfterSeconds: error.retryAfterSeconds ?? null }
       : error instanceof StravaEnrichmentError
         ? { code: 'strava_connection_error', message: error.message }
@@ -168,6 +173,7 @@ async function activitySegments(repository: ReadOnlyRepository, activityId: stri
 export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = resolveCatalogPaths(), dependencies: McpDependencies = {}): McpServer {
   const server = new McpServer({ name: 'catence', version: '0.1.0' }, { instructions: MCP_INSTRUCTIONS });
   const hydrateActivity = dependencies.hydrateStravaActivity ?? hydrateStravaActivity;
+  const startSync = dependencies.startDetachedSync ?? startDetachedSync;
   const catalogPaths = isCatalogPaths(paths) ? paths : null;
   const staticPaths: CatencePaths | null = isCatalogPaths(paths) ? null : paths;
   const scope = new AsyncLocalStorage<AthleteResolution>();
@@ -219,7 +225,11 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
           ...(demoStore ? { demoStore: { generated: true, seed: demoStore.seed, days: demoStore.days, startDate: demoStore.startDate, endDate: demoStore.endDate }, caveats: [...caveats, 'This response uses Catence generated demo data, not personal measurements.'] } : {}),
         });
       };
-      return selected ? scope.run(selected, run) : run();
+      // `return await` matters here: a bare `return run()` would let a
+      // rejected promise escape the try block, bypassing the classified
+      // errorResult payload entirely.
+      if (selected) return await scope.run(selected, run);
+      return await run();
     } catch (error) { return errorResult(error); }
   };
   const resourceLimit = async (name: string, uri: URL) => {
@@ -279,6 +289,30 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     data: await repository.progress(),
     provenance: { database: 'read-only DuckDB snapshot' }, query: {}, caveats: [],
   }))));
+
+  server.registerTool('start_detached_sync', {
+    title: 'Start a detached data sync',
+    description:
+      'Write-only sync trigger, named like the other explicit lock-guarded write tools. Spawns one detached catence-data sync process for this athlete and returns immediately with the run handle and log file; it refuses while another sync run is active. Track the run with catence_sync_progress; this tool never waits for completion.',
+    inputSchema: {
+      provider: z.enum(['intervals', 'garmin', 'strava', 'all']).optional(),
+      from: z.string().date().optional(),
+      refresh: z.boolean().optional(),
+    },
+  }, tool('start_detached_sync', async (input) => {
+    const paths = activePaths();
+    const athleteId = activeAthlete()?.id ?? 'local';
+    const handle = await startSync({ paths, athleteId, provider: input.provider, from: input.from, refresh: input.refresh });
+    return {
+      data: { ...handle, progressTool: 'catence_sync_progress' },
+      provenance: { operation: 'detached_sync_spawn' },
+      query: { ...input },
+      caveats: [
+        'The sync runs in its own process and keeps running if this session ends; its log file records the full worker output.',
+        'Only one sync run may be active per athlete store.',
+      ],
+    };
+  }));
 
   server.registerTool('review_daily_recovery_load', {
     title: 'Review daily recovery and training load',

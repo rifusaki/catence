@@ -186,11 +186,15 @@ async def _invoke_tool(
     tool_call_store: ToolCallStore | None = None,
     thread_id: str | None = None,
     athlete_id: str | None = None,
+    parent_id: str | None = None,
 ) -> dict[str, Any]:
     # A shared Console process may see several athlete stores. The selected
     # athlete is server-owned session state, never model-controlled input.
     arguments = _scoped_tool_arguments(name, arguments, athlete_id)
-    step = cl.Step(name=f"Catence · {name}", type="tool", default_open=False)
+    # Nesting the step under its triggering user message keeps every artifact
+    # of one turn attached to it, so editing that message can clean up the
+    # whole subtree instead of leaving orphaned tool steps behind.
+    step = cl.Step(name=f"Catence · {name}", type="tool", default_open=False, parent_id=parent_id)
     step.input = arguments
     await step.send()
     try:
@@ -223,6 +227,7 @@ async def respond(
     tool_call_store: ToolCallStore | None = None,
     thread_id: str | None = None,
     athlete_id: str | None = None,
+    step_parent_id: str | None = None,
     complete: Callable[..., Awaitable[Any]] = acompletion,
 ) -> str:
     """Run one bounded Chat turn, displaying each evidence-producing MCP call."""
@@ -298,6 +303,7 @@ async def respond(
                             tool_call_store=tool_call_store,
                             thread_id=thread_id,
                             athlete_id=None,
+                            parent_id=step_parent_id,
                         )
                         if tool_call_store is not None and thread_id and name != _RECALL_SAVED_TOOL_RESULT:
                             tool_call_store.record(

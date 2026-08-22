@@ -1,6 +1,25 @@
+import { spawn } from 'node:child_process';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { catenceRuntimeHealth, DashboardSnapshotService, jsonSafe, loadCatalog, openReadOnlyRepository, resolveAthlete, resolveCatalogPaths, type CatalogPaths, type CatencePaths } from '../../runtime/index.js';
+import {
+  catenceRuntimeHealth,
+  DashboardSnapshotService,
+  dataStatus,
+  DetachedSyncBusyError,
+  type DetachedSyncSpawner,
+  DETACHED_SYNC_PROVIDERS,
+  jsonSafe,
+  loadCatalog,
+  mergeOpenCodeGoConsoleProfiles,
+  openReadOnlyRepository,
+  ReadOnlyDatabaseError,
+  resolveAthlete,
+  resolveCatalogPaths,
+  startDetachedSync,
+  syncProgress,
+  type CatalogPaths,
+  type CatencePaths,
+} from '../../runtime/index.js';
 import { createCatenceMcpServer } from '../mcp/server.js';
 
 const MAX_REQUEST_BYTES = 1_000_000;
@@ -11,6 +30,12 @@ export type CatenceHttpServerOptions = {
   /** Internal compatibility hook for tests and embedded single-store callers. */
   paths?: CatencePaths;
   allowedOrigins?: readonly string[];
+  /** Internal compatibility hook for tests: override the detached sync spawner. */
+  startSync?: typeof startDetachedSync;
+  /** Internal compatibility hook for tests: passed into the default startDetachedSync. */
+  syncSpawnProcess?: DetachedSyncSpawner;
+  /** Internal compatibility hook for tests: override OpenCode Go model discovery. */
+  mergeModels?: typeof mergeOpenCodeGoConsoleProfiles;
 };
 
 function json(response: ServerResponse, statusCode: number, value: unknown): void {
@@ -92,6 +117,72 @@ async function dashboardPaths(catalogPaths: CatalogPaths | null, staticPaths: Ca
   throw new Error('No Catence data store is configured.');
 }
 
+type SyncRequestBody = {
+  athleteId?: string;
+  provider?: string;
+  from?: string;
+  refresh?: boolean;
+  refreshModels?: boolean;
+};
+
+function parseSyncBody(body: unknown): SyncRequestBody {
+  if (body === undefined) return {};
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new Error('Request body must be a JSON object.');
+  const raw = body as Record<string, unknown>;
+  for (const key of Object.keys(raw)) {
+    if (!['athleteId', 'provider', 'from', 'refresh', 'refreshModels'].includes(key)) {
+      throw new Error(`Unknown sync field: ${key}.`);
+    }
+  }
+  if (raw.athleteId !== undefined && typeof raw.athleteId !== 'string') throw new Error('athleteId must be a string.');
+  if (raw.provider !== undefined && (typeof raw.provider !== 'string' || !DETACHED_SYNC_PROVIDERS.includes(raw.provider as never))) {
+    throw new Error('provider must be intervals, garmin, strava, or all.');
+  }
+  if (raw.from !== undefined && (typeof raw.from !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(raw.from))) {
+    throw new Error('from must use YYYY-MM-DD.');
+  }
+  for (const flag of ['refresh', 'refreshModels'] as const) {
+    if (raw[flag] !== undefined && typeof raw[flag] !== 'boolean') throw new Error(`${flag} must be a boolean.`);
+  }
+  return raw as SyncRequestBody;
+}
+
+async function resolveSyncPaths(catalogPaths: CatalogPaths | null, staticPaths: CatencePaths | null, body: SyncRequestBody): Promise<CatencePaths> {
+  if (catalogPaths) {
+    if (!body.athleteId) throw new Error('athleteId is required. Call /api/v1/athletes to inspect the configured catalog.');
+    return (await resolveAthlete(catalogPaths, body.athleteId)).paths;
+  }
+  if (staticPaths) return staticPaths;
+  throw new Error('No Catence data store is configured.');
+}
+
+type LastSyncSummary = {
+  lastCompletedAt: string | null;
+  providers: Record<string, string>;
+  recentRuns: Array<Record<string, unknown>>;
+};
+
+/** Best-effort last-success timestamps; null while a run holds the write lock. */
+async function lastSyncSummary(paths: CatencePaths): Promise<LastSyncSummary | null> {
+  try {
+    const status = await dataStatus(paths);
+    const runs = Array.isArray(status.syncRuns) ? (status.syncRuns as Array<Record<string, unknown>>) : [];
+    const completed = runs.filter((run) => typeof run.completed_at === 'string' && String(run.status).startsWith('completed'));
+    const providers: Record<string, string> = {};
+    let lastCompletedAt: string | null = null;
+    for (const run of completed) {
+      const completedAt = String(run.completed_at);
+      const provider = String(run.provider ?? 'unknown');
+      if (!providers[provider] || providers[provider] < completedAt) providers[provider] = completedAt;
+      if (!lastCompletedAt || lastCompletedAt < completedAt) lastCompletedAt = completedAt;
+    }
+    return { lastCompletedAt, providers, recentRuns: runs.slice(0, 5) };
+  } catch (error) {
+    if (error instanceof ReadOnlyDatabaseError) return null;
+    throw error;
+  }
+}
+
 async function handleMcpRequest(request: IncomingMessage, response: ServerResponse, paths: CatencePaths | CatalogPaths): Promise<void> {
   if (request.method !== 'POST') {
     methodNotAllowed(response);
@@ -148,6 +239,8 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
   const catalogPaths = options.catalogPaths ?? (options.paths ? null : resolveCatalogPaths());
   const staticPaths = options.paths ?? null;
   const allowedOrigins = options.allowedOrigins ?? [];
+  const startSync = options.startSync ?? startDetachedSync;
+  const mergeModels = options.mergeModels ?? mergeOpenCodeGoConsoleProfiles;
 
   return createServer((request, response) => {
     void (async () => {
@@ -187,6 +280,50 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           json(response, 200, await dashboardSnapshot(await dashboardPaths(catalogPaths, staticPaths, url), url));
         } catch (error) {
           json(response, 400, { error: { code: 'dashboard_unavailable', message: error instanceof Error ? error.message : String(error) } });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/sync' && request.method === 'POST') {
+        let body: SyncRequestBody;
+        try {
+          body = parseSyncBody(await readJsonBody(request));
+          const paths = await resolveSyncPaths(catalogPaths, staticPaths, body);
+          // Optional model self-discovery runs before the data sync so new
+          // OpenCode Go models appear without a manual script run. Failure is
+          // non-fatal: it must never block or fail a data sync.
+          let discoveryWarning: string | null = null;
+          if (body.refreshModels) {
+            try {
+              await mergeModels({ configPath: paths.config, setDefault: false });
+            } catch (error) {
+              discoveryWarning = `OpenCode Go model discovery failed; profiles were left unchanged (${error instanceof Error ? error.message : String(error)}).`;
+            }
+          }
+          const handle = await startSync(
+            { paths, athleteId: body.athleteId ?? 'local', provider: body.provider as never, from: body.from, refresh: body.refresh },
+            { spawnProcess: options.syncSpawnProcess },
+          );
+          json(response, 202, { ...handle, ...(discoveryWarning ? { warning: discoveryWarning } : {}), progressEndpoint: '/api/v1/sync/status' });
+        } catch (error) {
+          json(response, error instanceof DetachedSyncBusyError ? 409 : 400, {
+            error: {
+              code: error instanceof DetachedSyncBusyError ? 'sync_in_progress' : 'sync_start_failed',
+              message: error instanceof Error ? error.message : String(error),
+            },
+          });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/sync/status' && request.method === 'GET') {
+        try {
+          const url = new URL(request.url ?? '/', 'http://localhost');
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          const athleteId = catalogPaths ? (await resolveAthlete(catalogPaths, url.searchParams.get('athleteId') ?? '')).athlete.id : 'local';
+          json(response, 200, { athleteId, progress: await syncProgress(paths), lastSync: await lastSyncSummary(paths) });
+        } catch (error) {
+          json(response, 400, { error: { code: 'sync_status_unavailable', message: error instanceof Error ? error.message : String(error) } });
         }
         return;
       }

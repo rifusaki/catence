@@ -69,6 +69,23 @@ export {
   unlinkActivity,
 } from '../elt/application/management.js';
 export type { ProviderChoice } from '../elt/application/management.js';
+export {
+  DETACHED_SYNC_PROVIDERS,
+  DetachedSyncBusyError,
+  startDetachedSync,
+} from '../elt/application/detached-sync.js';
+export type { DetachedSyncHandle, DetachedSyncProvider, DetachedSyncRequest, DetachedSyncSpawner } from '../elt/application/detached-sync.js';
+export {
+  buildOpenCodeGoConsoleProfiles,
+  classifyOpenCodeGoModel,
+  fetchOpenCodeGoModelIds,
+  mergeOpenCodeGoConsoleProfiles,
+  OPENCODE_GO_API_BASE_ENV,
+  OPENCODE_GO_API_KEY_ENV,
+  OPENCODE_GO_DEFAULT_BASE_URL,
+  OPENCODE_GO_MESSAGES_API_BASE_ENV,
+} from '../core/runtime/opencode-go.js';
+export type { OpenCodeGoConsoleProfiles, OpenCodeGoMergeResult, OpenCodeGoRoute } from '../core/runtime/opencode-go.js';
 export type { InterruptedRuns, SyncProgressSnapshot, SyncProgressState } from '../contracts/progress.js';
 export { openReadOnlyRepository, ReadOnlyDatabaseError } from '../elt/storage/database.js';
 export { DataWriteBusyError } from '../elt/storage/write-lock.js';

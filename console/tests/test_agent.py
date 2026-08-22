@@ -282,3 +282,76 @@ def test_respond_keeps_multi_error_groups_grouped(monkeypatch):
         )
 
     assert {type(exception) for exception in captured.value.exceptions} == {RuntimeError, ValueError}
+
+
+class _RecordingStep:
+    """Minimal cl.Step double that records constructor arguments."""
+
+    instances: list["_RecordingStep"] = []
+
+    def __init__(self, *, name, type, default_open, parent_id=None):
+        self.name = name
+        self.type = type
+        self.default_open = default_open
+        self.parent_id = parent_id
+        self.input = None
+        self.output = None
+        self.is_error = False
+        _RecordingStep.instances.append(self)
+
+    async def send(self):
+        return self
+
+    async def update(self):
+        return self
+
+
+def test_tool_steps_nest_under_the_triggering_user_message(monkeypatch):
+    """Tool steps must carry the edited/regenerated message as their parent."""
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", FakeSession)
+    monkeypatch.setattr(agent.cl, "Step", _RecordingStep)
+    _RecordingStep.instances.clear()
+
+    async def call_tool(name, arguments):
+        return {"content": [{"type": "text", "text": "evidence"}]}
+
+    FakeSession.call_tool = call_tool
+    completions = iter(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=None,
+                            tool_calls=[
+                                {
+                                    "id": "call-1",
+                                    "function": {"name": "daily_recovery_review", "arguments": "{}"},
+                                }
+                            ],
+                        )
+                    )
+                ]
+            ),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Done.", tool_calls=[]))]),
+        ]
+    )
+
+    async def complete(**_kwargs):
+        return next(completions)
+
+    answer = asyncio.run(
+        agent.respond(
+            profile=ProviderProfile(id="local", label="Local", model="openai/example"),
+            model_id="default",
+            reasoning_effort=None,
+            history=[{"role": "user", "content": "Review today."}],
+            mcp_url="http://example.test/mcp",
+            step_parent_id="user-message-1",
+            complete=complete,
+        )
+    )
+
+    assert answer == "Done."
+    assert [step.parent_id for step in _RecordingStep.instances] == ["user-message-1"]

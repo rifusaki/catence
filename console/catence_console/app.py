@@ -50,6 +50,36 @@ def _mcp_http_url(path: str) -> str:
     return f"{MCP_URL.rsplit('/mcp', 1)[0].rstrip('/')}{path}"
 
 
+NOTICE_METADATA = {"catenceNotice": True}
+
+
+def _notice(content: str) -> cl.Message:
+    """A Console-generated message that must never enter the model prompt."""
+    return cl.Message(content=content, metadata=dict(NOTICE_METADATA))
+
+
+def _model_history() -> list[dict[str, Any]]:
+    """chat_context as provider messages, excluding Console notices.
+
+    Readiness and setup-wizard messages describe the Console itself; keeping
+    them out of ``to_openai``-shaped history stops them from polluting every
+    later model turn.
+    """
+
+    messages: list[dict[str, Any]] = []
+    for message in cl.chat_context.get():
+        if isinstance(message.metadata, dict) and message.metadata.get("catenceNotice"):
+            continue
+        if message.type == "assistant_message":
+            role = "assistant"
+        elif message.type == "user_message":
+            role = "user"
+        else:
+            role = "system"
+        messages.append({"role": role, "content": message.content})
+    return messages
+
+
 def _authenticated(request: Request) -> bool:
     token = get_token_from_cookies(request.cookies)
     if not token:
@@ -349,7 +379,7 @@ async def _ask_setup_question(content: str) -> str | None:
 
 
 async def _setup_wizard() -> ConsoleConfiguration | None:
-    await cl.Message(
+    await _notice(
         content=(
             "Welcome to Catence Console. Let’s set up your first model. "
             "This wizard writes only provider and model names; API keys stay in your terminal environment."
@@ -368,7 +398,7 @@ async def _setup_wizard() -> ConsoleConfiguration | None:
         "anthropic": "Anthropic model name, for example `claude-sonnet-4-5`",
     }
     if provider not in examples:
-        await cl.Message(content="Setup paused: choose `openai-compatible`, `openai`, or `anthropic` and start a new chat to try again.").send()
+        await _notice(content="Setup paused: choose `openai-compatible`, `openai`, or `anthropic` and start a new chat to try again.").send()
         return None
     model = await _ask_setup_question(f"Enter the {examples[provider]}.")
     if model is None:
@@ -376,7 +406,7 @@ async def _setup_wizard() -> ConsoleConfiguration | None:
     try:
         configuration = write_provider_setup(DATA_DIRECTORY, provider, model)
     except ConsoleConfigurationError as error:
-        await cl.Message(content=f"Setup could not save the model: {error}").send()
+        await _notice(content=f"Setup could not save the model: {error}").send()
         return None
 
     environment = {
@@ -384,7 +414,7 @@ async def _setup_wizard() -> ConsoleConfiguration | None:
         "openai": "Set `OPENAI_API_KEY`, then restart the Console.",
         "anthropic": "Set `ANTHROPIC_API_KEY`, then restart the Console.",
     }
-    await cl.Message(content=f"Setup saved. {environment[provider]}").send()
+    await _notice(content=f"Setup saved. {environment[provider]}").send()
     return configuration
 
 
@@ -409,7 +439,7 @@ async def _initialize_chat(configuration: ConsoleConfiguration) -> None:
     readiness = "ready" if not missing else f"missing environment variables: {', '.join(missing)}"
     selected_model = profile.model_option(model_id)
     selected_effort = None if preferences.reasoning_effort == "default" else preferences.reasoning_effort
-    await cl.Message(
+    await _notice(
         content=(
             f"Catence Console is {readiness}. Using **{selected_model.label}** with **{selected_effort or 'provider default'}** thinking, "
             f"up to **{preferences.tool_rounds}** tool rounds and **{preferences.tool_result_characters:,}** evidence characters per result. "
@@ -526,12 +556,12 @@ async def on_message(message: cl.Message) -> None:
         profile_id, model_id, reasoning_effort, tool_round_limit, tool_result_character_limit, athlete_id = _selected_settings()
         profile = configuration.profile(profile_id)
     except ConsoleConfigurationError as error:
-        await cl.Message(content=f"Console configuration error: {error}").send()
+        await _notice(content=f"Console configuration error: {error}").send()
         return
 
     missing = missing_environment(profile)
     if missing:
-        await cl.Message(
+        await _notice(
             content=f"Profile **{profile.label}** is not ready. Set {', '.join(missing)} in the Console process environment, then restart it."
         ).send()
         return
@@ -541,17 +571,18 @@ async def on_message(message: cl.Message) -> None:
             profile=profile,
             model_id=model_id,
             reasoning_effort=reasoning_effort,
-            history=cl.chat_context.to_openai(),
+            history=_model_history(),
             mcp_url=MCP_URL,
             tool_round_limit=tool_round_limit,
             tool_result_character_limit=tool_result_character_limit,
             tool_call_store=tool_call_store(DATA_DIRECTORY),
             thread_id=cl.context.session.thread_id,
             athlete_id=athlete_id,
+            step_parent_id=message.id,
         )
     except Exception as error:
         logger.exception("Catence model request failed for profile %s and model %s", profile.id, model_id)
-        await cl.Message(
+        await _notice(
             content=(
                 f"I could not complete that Catence review: {error}\n\n"
                 "Run `catence-console doctor` to verify the profile and local Catence server."

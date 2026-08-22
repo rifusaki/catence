@@ -40,9 +40,13 @@ export function requireIntervalsConfig(environment: NodeJS.ProcessEnv = process.
 const rateLimitSchema = z.object({ requests: z.number().int().positive(), windowSeconds: z.number().int().positive() }).strict();
 const nullableRateLimitSchema = rateLimitSchema.nullable();
 const environmentVariableSchema = z.string().regex(/^[A-Z][A-Z0-9_]*$/, 'must be an uppercase environment-variable name');
+// Keep this aligned with the Console's Python validator, which accepts a
+// per-model reasoningEffort and free-form reasoning-effort variants.
 const consoleModelSchema = z.object({
   label: z.string().min(1).optional(),
   model: z.string().min(1),
+  reasoningEffort: z.string().min(1).optional(),
+  variants: z.record(z.string(), z.string()).optional(),
 }).strict();
 const consoleProfileSchema = z.object({
   label: z.string().min(1).optional(),
@@ -68,7 +72,7 @@ const consoleLimitsSchema = z.object({
   toolRounds: z.number().int().min(1).max(32).optional(),
   toolResultCharacters: z.number().int().min(1_000).max(250_000).optional(),
 }).strict();
-const catenceConfigSchema = z.object({
+export const catenceConfigSchema = z.object({
   mcp: z.object({
     rateLimits: z.object({
       server: nullableRateLimitSchema.optional(),
