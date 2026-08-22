@@ -233,6 +233,56 @@ class ConsolePreferencesStore:
             logger.exception("Could not reset Console preferences for %s", user_identifier)
 
 
+class DisabledModelsStore:
+    """Store which configured profile models the local user disabled.
+
+    Disabled models live here instead of ``config.json`` because both the
+    runtime and Console validate that file strictly; per-user UI state belongs
+    in this database, not in shared configuration.
+    """
+
+    def __init__(self, data_directory: Path):
+        self.database_path = _database_path(data_directory)
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=5)
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+
+    def list(self) -> set[tuple[str, str]]:
+        try:
+            with self._connect() as connection:
+                rows = connection.execute("SELECT profile_id, model_id FROM disabled_models").fetchall()
+        except sqlite3.Error:
+            logger.exception("Could not load disabled Console models")
+            return set()
+        return {(row[0], row[1]) for row in rows}
+
+    def add(self, profile_id: str, model_id: str) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO disabled_models (profile_id, model_id, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(profile_id, model_id) DO NOTHING
+                    """,
+                    (profile_id, model_id, datetime.now(UTC).isoformat()),
+                )
+        except sqlite3.Error:
+            logger.exception("Could not disable Console model %s:%s", profile_id, model_id)
+
+    def remove(self, profile_id: str, model_id: str) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "DELETE FROM disabled_models WHERE profile_id = ? AND model_id = ?",
+                    (profile_id, model_id),
+                )
+        except sqlite3.Error:
+            logger.exception("Could not enable Console model %s:%s", profile_id, model_id)
+
+
 def _json_object(value: str | None) -> dict[str, Any]:
     parsed = _json_object_or_none(value)
     return parsed if parsed is not None else {}
@@ -341,6 +391,12 @@ def _initialize_schema(database_path: Path) -> None:
                 "athlete_id" TEXT,
                 "updated_at" TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS disabled_models (
+                "profile_id" TEXT NOT NULL,
+                "model_id" TEXT NOT NULL,
+                "updated_at" TEXT NOT NULL,
+                PRIMARY KEY ("profile_id", "model_id")
+            );
             """
         )
 
@@ -393,3 +449,10 @@ def console_preferences_store(data_directory: Path) -> ConsolePreferencesStore:
 
     _initialize_schema(_database_path(data_directory))
     return ConsolePreferencesStore(data_directory)
+
+
+def disabled_models_store(data_directory: Path) -> DisabledModelsStore:
+    """Return the disabled-models store used by in-app model management."""
+
+    _initialize_schema(_database_path(data_directory))
+    return DisabledModelsStore(data_directory)

@@ -119,6 +119,30 @@ Preflight with:
 catence-console doctor
 ```
 
+### Manage models in the Console
+
+The **Models** page (header button) manages the model list without editing
+`config.json` by hand:
+
+- Enable/disable toggles hide models from the chat's Model dropdown. Disabled
+  choices are stored per machine in the Console database
+  (`console/chat-history.sqlite3`), never in `config.json`, and the Console
+  refuses to disable the only enabled model.
+- **Add a custom model** appends one deployment to an existing profile — id,
+  display label, LiteLLM reference (`openai/…`, `anthropic/…`,
+  `openai/responses/…`), and optional fixed reasoning effort or a custom
+  variants map.
+- **Remove / Make default** edit `config.json`'s console section directly;
+  every other section is preserved, the result is re-validated with the same
+  strict parser used at startup before it replaces the file, and secrets stay
+  forbidden (only environment-variable names are ever stored).
+
+The dashboard header has a **Sync data** button that starts the same detached
+sync as `catence-data sync --provider all` through the authenticated Console
+origin, shows live progress while the run is active, and displays the last
+completed sync afterwards. Each manual sync also refreshes OpenCode Go model
+profiles first; a discovery failure never blocks the data sync.
+
 ## Console serve options
 
 `catence-console serve` accepts:

@@ -160,6 +160,12 @@ Precedence for reasoning effort: per-chat dropdown selection > model
 `reasoningEffort` > profile `defaultReasoningEffort` > provider default. See
 [`llm-providers.md`](llm-providers.md#reasoning-effort) for the full behavior.
 
+The Console's **Models** page edits this section in place (enable/disable,
+add custom variants, remove, set defaults). Disabled choices are stored in the
+Console database rather than here; every write preserves all non-console
+sections and is re-validated with the same strict parser before the file is
+replaced.
+
 ### The Console wizard
 
 On the first authenticated chat, the Console wizard (`write_provider_setup`)

@@ -198,6 +198,12 @@ The script warns on stderr and skips any model that does not fit one of these
 families. Rerun it to refresh the model lists; existing profiles, limits, and
 `defaultProfile` are preserved unless `--set-default` is passed.
 
+You do not have to run the script manually: the Console dashboard's **Sync
+data** button (and `POST /api/v1/sync` with `"refreshModels": true`) refreshes
+these profiles from the live catalog before starting a data sync. Discovery
+failures — offline machine, catalog unreachable — are reported as a warning and
+never block or fail the sync itself.
+
 ```sh
 export OPENCODE_GO_API_KEY='…'                      # any non-empty value satisfies the key check
 export OPENCODE_GO_API_BASE='https://opencode.ai/zen/go/v1'

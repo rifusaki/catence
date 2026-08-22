@@ -100,6 +100,11 @@ athletes never leak into each other.
 - Rate limits are tracked **per athlete**: each athlete has its own sliding
   window for server, tool, and resource limits.
 - MCP responses carry an `athlete` field identifying which store served them.
+- `start_detached_sync` is the one explicitly named write tool besides the
+  Strava hydration tools: it spawns a detached `catence-data sync` child for
+  the selected athlete and returns immediately with the run handle and log
+  file. It refuses to start while another sync run is active (`sync_in_progress`);
+  follow the run with `catence_sync_progress`.
 
 ### Adding another athlete
 
@@ -298,6 +303,17 @@ override the host and port when the flags are omitted.
 - `GET /api/v1/dashboard` requires `athleteId`, for example
   `http://127.0.0.1:8787/api/v1/dashboard?athleteId=alex&days=28` (`endDate`
   is an optional `YYYY-MM-DD`; `days` ranges 1-90 and defaults to 28).
+- `POST /api/v1/sync` starts a detached data sync for one athlete:
+  `{"athleteId": "alex", "provider": "all", "from": "2026-01-01", "refresh": false}`.
+  The spawned child outlives the request, logs to `<home>/logs/`, and the call
+  returns `202` with the run handle immediately; an already-active run is
+  refused with `409 sync_in_progress`. Pass `"refreshModels": true` to also
+  refresh OpenCode Go model profiles first (failure is a non-fatal warning in
+  the response).
+- `GET /api/v1/sync/status?athleteId=alex` reports live progress heartbeats,
+  recent runs, and best-effort last-completion timestamps per provider. It
+  keeps working while a sync holds the write lock (`lastSync` becomes `null`
+  then).
 - Browser origins must be listed with `--allow-origin` (repeatable). The
   packaged Console instead proxies the dashboard through its authenticated
   same-origin route.

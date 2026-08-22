@@ -7,9 +7,9 @@ Catence is a local-first fitness MCP server for Garmin, Intervals.icu, and targe
 ## What is included
 
 - Garmin, Intervals.icu, and Strava ingestion with source-aware normalization.
-- Read-only MCP tools, plus explicitly named, lock-guarded Strava hydration tools.
+- Read-only MCP tools, plus explicitly named, lock-guarded write tools for Strava hydration and detached syncs.
 - One shared Catence agent can serve several isolated athlete stores. Every personal-data MCP call names an `athleteId`; Catence never silently combines athletes.
-- A password-protected Chainlit Console with an authenticated dashboard.
+- A password-protected Chainlit Console with an authenticated dashboard, a data-sync button with live progress, and in-app model management.
 - A generated demo catalog for safe evaluation in Glama, desktop MCP clients, or local development.
 
 Catence helps explore recovery, training load, trends, activity detail, swimming/cycling/running progress, segments, gear, and data quality. It reports the evidence and coverage it can see; it does not diagnose or prescribe training.

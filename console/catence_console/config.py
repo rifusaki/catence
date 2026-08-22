@@ -288,6 +288,11 @@ def load_console_configuration(data_directory: Path) -> ConsoleConfiguration:
         ) from error
     except json.JSONDecodeError as error:
         raise ConsoleConfigurationError(f"Invalid JSON in {path}: {error.msg}") from error
+    return parse_console_configuration(root)
+
+
+def parse_console_configuration(root: Any) -> ConsoleConfiguration:
+    """Validate an already-decoded ``config.json`` root object."""
 
     console = _object(root.get("console"), "console")
     unknown_console_fields = set(console) - {"defaultProfile", "profiles", "limits"}

@@ -34,9 +34,11 @@ from catence_console.config import (
     missing_environment,
     write_provider_setup,
 )
+from catence_console.config_io import read_config_root, write_console_section
 from catence_console.persistence import (
     SavedConsolePreferences,
     console_preferences_store,
+    disabled_models_store,
     local_data_layer,
     tool_call_store,
 )
@@ -128,7 +130,225 @@ async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Res
         return await dashboard_proxy(request)
     if request.method == "GET" and request.url.path == "/api/v1/athletes":
         return await athletes_proxy(request)
+    if request.url.path == "/api/v1/models":
+        if request.method == "GET":
+            return await models_overview(request)
+        return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use GET for /api/v1/models."}}, status_code=405)
+    if request.method == "POST" and request.url.path.startswith("/api/v1/models/"):
+        action = request.url.path.rsplit("/", 1)[-1]
+        if action in {"toggle", "add", "remove", "default"}:
+            return await mutate_models(request, action)
+    if request.method == "POST" and request.url.path == "/api/v1/sync":
+        return await sync_trigger_proxy(request)
+    if request.method == "GET" and request.url.path == "/api/v1/sync/status":
+        return await sync_status_proxy(request)
     return await call_next(request)
+
+
+def _unauthorized() -> JSONResponse:
+    return JSONResponse({"error": {"code": "unauthorized", "message": "Console login is required."}}, status_code=401)
+
+
+def _models_error(error: Exception, code: str) -> JSONResponse:
+    return JSONResponse({"error": {"code": code, "message": str(error)}}, status_code=400)
+
+
+def _configured_models(configuration: ConsoleConfiguration, profile_id: str) -> dict[str, Any]:
+    """The usable model map of one profile, tolerating legacy single-model profiles."""
+
+    profile = configuration.profile(profile_id)
+    return profile.models or {"default": profile.model_option()}
+
+
+def _models_payload(configuration: ConsoleConfiguration) -> dict[str, Any]:
+    """The authenticated model-management view: config plus disabled flags."""
+
+    disabled = disabled_models_store(DATA_DIRECTORY).list()
+    profiles: list[dict[str, Any]] = []
+    for profile in configuration.profiles.values():
+        models = [
+            {
+                "id": model_id,
+                "label": option.label,
+                "model": option.model,
+                "reasoningEffort": option.reasoning_effort,
+                "variants": option.variants,
+                "disabled": (profile.id, model_id) in disabled,
+            }
+            for model_id, option in _configured_models(configuration, profile.id).items()
+        ]
+        profiles.append(
+            {
+                "id": profile.id,
+                "label": profile.label,
+                "defaultModel": profile.default_model or "default",
+                "requiredEnvironment": list(profile.required_environment),
+                "missingEnvironment": list(missing_environment(profile)),
+                "models": models,
+            }
+        )
+    return {"defaultProfile": configuration.default_profile, "profiles": profiles}
+
+
+async def models_overview(request: Request) -> Response:
+    if not _authenticated(request):
+        return _unauthorized()
+    try:
+        return JSONResponse(_models_payload(_configuration()))
+    except ConsoleConfigurationError as error:
+        return _models_error(error, "configuration_invalid")
+
+
+async def _json_body(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception as error:
+        raise ConsoleConfigurationError("Request body must be valid JSON.") from error
+    if not isinstance(body, dict):
+        raise ConsoleConfigurationError("Request body must be a JSON object.")
+    return body
+
+
+def _require_model_fields(body: dict[str, Any], fields: tuple[str, ...]) -> None:
+    for field in fields:
+        value = body.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ConsoleConfigurationError(f"{field} is required.")
+
+
+def _enabled_pairs(configuration: ConsoleConfiguration, disabled: set[tuple[str, str]]) -> set[tuple[str, str]]:
+    pairs: set[tuple[str, str]] = set()
+    for profile in configuration.profiles.values():
+        for model_id in _configured_models(configuration, profile.id):
+            if (profile.id, model_id) not in disabled:
+                pairs.add((profile.id, model_id))
+    return pairs
+
+
+async def _toggle_model(body: dict[str, Any]) -> None:
+    """Enable or disable one configured model in the local sqlite store."""
+
+    _require_model_fields(body, ("profileId", "modelId"))
+    disabled_flag = body.get("disabled")
+    if not isinstance(disabled_flag, bool):
+        raise ConsoleConfigurationError("disabled must be a boolean.")
+    profile_id, model_id = body["profileId"], body["modelId"]
+    configuration = _configuration()
+    if model_id not in _configured_models(configuration, profile_id):
+        raise ConsoleConfigurationError(f"Unknown model {model_id!r} for Console profile {profile_id!r}.")
+    store = disabled_models_store(DATA_DIRECTORY)
+    if not disabled_flag:
+        store.remove(profile_id, model_id)
+        return
+    remaining = _enabled_pairs(configuration, store.list() | {(profile_id, model_id)})
+    if not remaining:
+        raise ConsoleConfigurationError("Cannot disable the only enabled model. Enable another model first.")
+    store.add(profile_id, model_id)
+
+
+def _add_model(console: dict[str, Any], body: dict[str, Any]) -> None:
+    _require_model_fields(body, ("profileId", "modelId", "label", "model"))
+    profiles = console.setdefault("profiles", {})
+    raw_profile = profiles.get(body["profileId"])
+    if not isinstance(raw_profile, dict):
+        raise ConsoleConfigurationError(f"Unknown Console profile: {body['profileId']}")
+    models = raw_profile.get("models")
+    if not isinstance(models, dict):
+        raise ConsoleConfigurationError(
+            f"Console profile {body['profileId']} does not use a models map; custom variants require one."
+        )
+    if body["modelId"] in models:
+        raise ConsoleConfigurationError(f"Model {body['modelId']!r} already exists in profile {body['profileId']!r}.")
+    entry: dict[str, Any] = {"label": body["label"], "model": body["model"]}
+    if body.get("reasoningEffort") is not None:
+        if not isinstance(body["reasoningEffort"], str):
+            raise ConsoleConfigurationError("reasoningEffort must be a string.")
+        entry["reasoningEffort"] = body["reasoningEffort"]
+    if body.get("variants") is not None:
+        variants = body["variants"]
+        if not isinstance(variants, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in variants.items()):
+            raise ConsoleConfigurationError("variants must map labels to reasoning-effort values.")
+        entry["variants"] = variants
+    models[body["modelId"]] = entry
+
+
+def _remove_model(console: dict[str, Any], body: dict[str, Any]) -> None:
+    _require_model_fields(body, ("profileId", "modelId"))
+    profile_id, model_id = body["profileId"], body["modelId"]
+    profiles = console.setdefault("profiles", {})
+    raw_profile = profiles.get(profile_id)
+    if not isinstance(raw_profile, dict) or not isinstance(raw_profile.get("models"), dict):
+        raise ConsoleConfigurationError(f"Unknown Console profile or unsupported layout: {profile_id}")
+    models = raw_profile["models"]
+    if model_id not in models:
+        raise ConsoleConfigurationError(f"Unknown model {model_id!r} for Console profile {profile_id!r}.")
+    if len(models) <= 1:
+        raise ConsoleConfigurationError("Cannot remove the last model of a profile.")
+    del models[model_id]
+    if raw_profile.get("defaultModel") == model_id:
+        raw_profile["defaultModel"] = next(iter(models))
+
+
+async def mutate_models(request: Request, action: str) -> Response:
+    if not _authenticated(request):
+        return _unauthorized()
+    try:
+        body = await _json_body(request)
+        if action == "toggle":
+            await _toggle_model(body)
+            return JSONResponse(_models_payload(_configuration()))
+        if action == "add":
+            configuration = write_console_section(DATA_DIRECTORY, lambda console: _add_model(console, body))
+            return JSONResponse(_models_payload(configuration))
+        if action == "remove":
+            write_console_section(DATA_DIRECTORY, lambda console: _remove_model(console, body))
+            # Only after the config write succeeded: a stale disable flag must
+            # not survive so a later re-add starts enabled.
+            disabled_models_store(DATA_DIRECTORY).remove(body["profileId"], body["modelId"])
+            return JSONResponse(_models_payload(_configuration()))
+        if action == "default":
+            _require_model_fields(body, ("profileId", "modelId"))
+
+            def set_default(console: dict[str, Any]) -> None:
+                profiles = console.setdefault("profiles", {})
+                raw_profile = profiles.get(body["profileId"])
+                if not isinstance(raw_profile, dict):
+                    raise ConsoleConfigurationError(f"Unknown Console profile: {body['profileId']}")
+                raw_profile["defaultModel"] = body["modelId"]
+
+            configuration = write_console_section(DATA_DIRECTORY, set_default)
+            return JSONResponse(_models_payload(configuration))
+        raise ConsoleConfigurationError(f"Unknown model management action: {action}")
+    except ConsoleConfigurationError as error:
+        return _models_error(error, "invalid_request")
+
+
+async def sync_trigger_proxy(request: Request) -> Response:
+    """Start a detached data sync through the runtime's /api/v1/sync route."""
+
+    if not _authenticated(request):
+        return _unauthorized()
+    target = _mcp_http_url("/api/v1/sync")
+    payload = await request.body()
+
+    def fetch() -> tuple[int, bytes, str]:
+        request_ = urllib.request.Request(target, data=payload, method="POST", headers={"content-type": "application/json"})
+        try:
+            with urllib.request.urlopen(request_, timeout=15) as upstream:
+                return upstream.status, upstream.read(), upstream.headers.get_content_type()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), error.headers.get_content_type()
+        except urllib.error.URLError as error:
+            return 502, json.dumps({"error": {"code": "mcp_unavailable", "message": str(error)}}).encode("utf-8"), "application/json"
+
+    status, response_body, content_type = await asyncio.to_thread(fetch)
+    return Response(content=response_body, status_code=status, media_type=content_type)
+
+
+async def sync_status_proxy(request: Request) -> Response:
+    """Proxy live sync progress and last-completion timestamps from the runtime."""
+
+    return await _proxy_mcp_get(request, "/api/v1/sync/status")
 
 
 def _athlete_roster() -> tuple[str, dict[str, str]]:
@@ -175,6 +395,31 @@ def _limit_setting(value: Any, minimum: int, maximum: int) -> int | None:
     return max(minimum, min(int(value), maximum))
 
 
+def _disabled_choices(configuration: ConsoleConfiguration) -> set[tuple[str, str]]:
+    return disabled_models_store(DATA_DIRECTORY).list()
+
+
+def _available_model_choices(configuration: ConsoleConfiguration) -> dict[str, str]:
+    """Model dropdown choices minus the models the local user disabled."""
+
+    disabled = _disabled_choices(configuration)
+    return {
+        label: value
+        for label, value in configuration.model_choices().items()
+        if (value.partition(":")[0], value.partition(":")[2]) not in disabled
+    }
+
+
+def _choice_available(configuration: ConsoleConfiguration, value: str) -> bool:
+    profile_id, _, model_id = value.partition(":")
+    try:
+        configuration.profile(profile_id)
+        _configured_models(configuration, profile_id)
+    except ConsoleConfigurationError:
+        return False
+    return (profile_id, model_id) not in _disabled_choices(configuration)
+
+
 def _session_settings(
     configuration: ConsoleConfiguration,
     default_athlete_id: str,
@@ -188,15 +433,23 @@ def _session_settings(
     """
 
     model_choice = cl.user_session.get("catence_model")
-    if isinstance(model_choice, str):
+    if isinstance(model_choice, str) and _choice_available(configuration, model_choice):
         try:
             profile, model_id = configuration.selected_model(model_choice)
         except ConsoleConfigurationError:
             model_choice = configuration.default_model_choice()
             profile, model_id = configuration.selected_model(model_choice)
     else:
-        model_choice = configuration.default_model_choice()
-        profile, model_id = configuration.selected_model(model_choice)
+        # Fall back to the configured default, then to any enabled model, so a
+        # chat stays usable after its saved model was disabled or removed.
+        fallback = configuration.default_model_choice()
+        if not _choice_available(configuration, fallback):
+            available = _available_model_choices(configuration)
+            if not available:
+                raise ConsoleConfigurationError("Every Console model is disabled. Enable one in the models page.")
+            fallback = next(iter(available.values()))
+        model_choice = fallback
+        profile, model_id = configuration.selected_model(fallback)
     reasoning_effort = cl.user_session.get("catence_reasoning_effort")
     valid = profile.valid_reasoning_effort(model_id)
     if reasoning_effort not in valid:
@@ -249,6 +502,8 @@ def _normalized_preferences(
 ) -> SavedConsolePreferences:
     default = _configured_preferences(configuration, default_athlete_id)
     try:
+        if not _choice_available(configuration, preferences.model_choice):
+            raise ConsoleConfigurationError("The saved model is disabled.")
         profile, model_id = configuration.selected_model(preferences.model_choice)
         model_choice = preferences.model_choice
     except ConsoleConfigurationError:
@@ -331,10 +586,10 @@ def _chat_settings(
             Select(
                 id="model",
                 label="Model",
-                items=configuration.model_choices(),
+                items=_available_model_choices(configuration),
                 initial_value=model_choice,
                 reset_value=defaults.model_choice,
-                description="Choose a deployment. Credentials stay in the Console process environment.",
+                description="Choose a deployment. Credentials stay in the Console process environment. Manage the list on the models page.",
             ),
             Select(
                 id="reasoningEffort",
@@ -500,7 +755,7 @@ async def update_settings(settings: dict[str, Any]) -> None:
     current = _restore_preferences(configuration)
     default_athlete_id, athletes = _athlete_roster()
     model_choice = settings.get("model", current.model_choice)
-    if not isinstance(model_choice, str):
+    if not isinstance(model_choice, str) or not _choice_available(configuration, model_choice):
         model_choice = current.model_choice
     try:
         profile, model_id = configuration.selected_model(model_choice)
