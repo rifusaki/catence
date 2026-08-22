@@ -185,6 +185,22 @@ into the provider worker environment, and inherited `GARMIN_*`/`INTERVALS_*`/
 `STRAVA_*` variables are stripped first so an athlete without a provider cannot
 inherit its credentials.
 
+For local and Docker development you can also keep credentials in env without
+`secret set` — see the two fallback modes below. File values always win over
+env, so a `providers.json` entry overrides any env fallback for that field.
+
+### Provider credentials via env (dev fallback)
+
+Two opt-in env fallbacks are checked **only when a `providers.json` field is
+missing** — file values always win. See `src/core/runtime/secrets.ts:51`.
+
+| Mode | Variables | When allowed | Example for athlete `alex` |
+|------|-----------|--------------|----------------------------|
+| **Per-athlete scoped** (recommended, multi-athlete safe) | `CATENCE_ATHLETE_<ID>_<PROVIDER_VAR>` — prefix is `CATENCE_ATHLETE_` + upper-cased athlete id with `-` → `_` + `_` | **Always** — checked even when the generic flag is off. Only maps to that one athlete. | `CATENCE_ATHLETE_ALEX_GARMIN_EMAIL=alex@example.com` `CATENCE_ATHLETE_ALEX_INTERVALS_API_KEY=…` |
+| **Generic** (single-athlete dev, opt-in) | `GARMIN_EMAIL`, `GARMIN_PASSWORD`, `INTERVALS_API_KEY`, `INTERVALS_ATHLETE_ID`, `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET` | Only when `CATENCE_ALLOW_ENV_SECRETS` (or alias `CATENCE_SECRETS_FROM_ENV`) is `1`/`true`/`yes`/`on` in the worker's env. Without the flag, bare provider env vars are stripped. | `CATENCE_ALLOW_ENV_SECRETS=1` + `GARMIN_EMAIL=…` |
+
+Resolution order per field: `providers.json` → `CATENCE_ATHLETE_<ID>_<VAR>` → (if flag set) `VAR`. Set `CATENCE_ALLOW_ENV_SECRETS=1` in `.env.dev` / `docker-compose.dev.yml` for single-athlete Docker dev, or prefer per-athlete vars for a shared catalog.
+
 ### Console auth and serving
 
 | Variable | Purpose |
