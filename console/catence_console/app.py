@@ -410,6 +410,30 @@ def _available_model_choices(configuration: ConsoleConfiguration) -> dict[str, s
     }
 
 
+def _effort_dynamic_options(configuration: ConsoleConfiguration) -> dict[str, Any] | None:
+    """Per-model thinking-effort options for the settings panel.
+
+    Sent as Select.dynamic_options so the frontend swaps the effort dropdown
+    the moment the model dropdown changes, without saving and reopening.
+    """
+
+    cases: dict[str, Any] = {}
+    for choice in _available_model_choices(configuration).values():
+        profile_id, _, model_id = choice.partition(":")
+        try:
+            profile = configuration.profile(profile_id)
+        except ConsoleConfigurationError:
+            continue
+        cases[choice] = {
+            "items": {"Provider default": "default", **profile.reasoning_effort_choices(model_id)},
+            "initialValue": profile.default_reasoning_effort or "default",
+            "disabled": profile.reasoning_effort_disabled(model_id),
+        }
+    if not cases:
+        return None
+    return {"watchId": "model", "cases": cases}
+
+
 def _choice_available(configuration: ConsoleConfiguration, value: str) -> bool:
     profile_id, _, model_id = value.partition(":")
     try:
@@ -598,10 +622,11 @@ def _chat_settings(
                 initial_value=reasoning_effort or "default",
                 reset_value=defaults.reasoning_effort,
                 disabled=effort_disabled,
+                dynamic_options=_effort_dynamic_options(configuration),
                 description=(
                     "This model does not expose reasoning-effort levels; the provider default is always used."
                     if effort_disabled
-                    else "Reasoning-effort level for this model. Variants come from the model's config, falling back to the OpenAI-standard set."
+                    else "Reasoning-effort level for this model. The dropdown follows the selected model; variants come from the model's config, falling back to the OpenAI-standard set."
                 ),
             ),
             NumberInput(
