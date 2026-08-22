@@ -165,13 +165,12 @@ jobs:
         id: published
         run: |
           version='${{ steps.pyver.outputs.version }}'
-          if curl -fsSL "https://pypi.org/pypi/catence-console/json" | python3 -c '
-import json, sys
-version = sys.argv[1]
-sys.exit(0 if json.load(sys.stdin).get("releases", {}).get(version) else 1)
-' "$version"; then
+          if curl -fsSL "https://pypi.org/pypi/catence-console/json" | python3 -c 'import json, sys; version = sys.argv[1]; sys.exit(0 if json.load(sys.stdin).get("releases", {}).get(version) else 1)' "$version"; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "catence-console==$version is already on PyPI; skipping upload."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "catence-console==$version is not on PyPI yet; uploading."
           fi
       - uses: actions/download-artifact@v4
         if: steps.published.outputs.skip != 'true'
