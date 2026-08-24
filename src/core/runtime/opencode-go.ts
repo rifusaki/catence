@@ -161,12 +161,26 @@ export type OpenCodeGoMergeResult = {
   guessedRoutes: string[];
 };
 
+/** Per-model fields a human may have customized after the initial discovery. */
+function preservedModelFields(previous: unknown): Record<string, unknown> {
+  if (typeof previous !== 'object' || previous === null || Array.isArray(previous)) return {};
+  const raw = previous as Record<string, unknown>;
+  const preserved: Record<string, unknown> = {};
+  if (typeof raw.label === 'string' && raw.label.trim()) preserved.label = raw.label;
+  if (typeof raw.reasoningEffort === 'string') preserved.reasoningEffort = raw.reasoningEffort;
+  if (raw.variants !== undefined) preserved.variants = raw.variants;
+  return preserved;
+}
+
 /**
  * Fetch the live OpenCode Go catalog and merge the two Console profiles into
  * `configPath`, preserving every other section plus existing console fields
  * (`limits`, other profiles) and the existing `defaultProfile` unless
- * `setDefault` is passed. The written file is re-validated with the same
- * strict schema the runtime applies on load, then replaced atomically.
+ * `setDefault` is passed. Model routing (`model`) is refreshed from the live
+ * catalog, while per-model customizations (custom label, `reasoningEffort`,
+ * `variants`) and models that disappeared upstream are kept. The written file
+ * is re-validated with the same strict schema the runtime applies on load,
+ * then replaced atomically.
  */
 export async function mergeOpenCodeGoConsoleProfiles(
   options: {
@@ -190,10 +204,43 @@ export async function mergeOpenCodeGoConsoleProfiles(
     typeof existingConsole.defaultProfile === 'string' && existingConsole.defaultProfile && !options.setDefault
       ? existingConsole.defaultProfile
       : built.defaultProfile;
+
+  // Merge per model, not per profile: discovery owns routing and the id list,
+  // but a human's label, reasoningEffort, and variants must survive every
+  // re-discovery. Models that vanished upstream stay configured.
+  const mergedProfiles: Record<string, Record<string, unknown>> = {};
+  for (const [profileId, builtProfile] of Object.entries(built.profiles)) {
+    const previousProfile = existingProfiles[profileId];
+    const rawModels = typeof previousProfile === 'object' && previousProfile !== null
+      ? (previousProfile as Record<string, unknown>).models
+      : undefined;
+    const previousModels = typeof rawModels === 'object' && rawModels !== null && !Array.isArray(rawModels)
+      ? (rawModels as Record<string, unknown>)
+      : {};
+    const models: Record<string, unknown> = { ...previousModels };
+    for (const [modelId, entry] of Object.entries(builtProfile.models as Record<string, { label: string; model: string }>)) {
+      models[modelId] = {
+        ...preservedModelFields(previousModels[modelId]),
+        label: entry.label,
+        model: entry.model,
+      };
+    }
+    const previousDefaultModel = typeof previousProfile === 'object' && previousProfile !== null
+      ? (previousProfile as Record<string, unknown>).defaultModel
+      : undefined;
+    mergedProfiles[profileId] = {
+      ...builtProfile,
+      ...(typeof previousDefaultModel === 'string' && previousDefaultModel in models
+        ? { defaultModel: previousDefaultModel }
+        : {}),
+      models,
+    };
+  }
+
   const updatedConsole: Record<string, unknown> = {
     ...existingConsole,
     defaultProfile,
-    profiles: { ...existingProfiles, ...built.profiles },
+    profiles: { ...existingProfiles, ...mergedProfiles },
   };
 
   // Validate before writing anything: the runtime rejects invalid configs at

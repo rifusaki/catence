@@ -297,11 +297,14 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           const paths = await resolveSyncPaths(catalogPaths, staticPaths, body);
           // Optional model self-discovery runs before the data sync so new
           // OpenCode Go models appear without a manual script run. Failure is
-          // non-fatal: it must never block or fail a data sync.
+          // non-fatal: it must never block or fail a data sync. The Console
+          // reads <CATENCE_HOME>/config.json, so catalog deployments merge
+          // into the catalog root's config instead of the athlete store.
+          const discoveryConfigPath = catalogPaths ? path.join(catalogPaths.root, 'config.json') : paths.config;
           let discoveryWarning: string | null = null;
           if (body.refreshModels) {
             try {
-              await mergeModels({ configPath: paths.config, setDefault: false });
+              await mergeModels({ configPath: discoveryConfigPath, setDefault: false });
             } catch (error) {
               discoveryWarning = `OpenCode Go model discovery failed; profiles were left unchanged (${error instanceof Error ? error.message : String(error)}).`;
             }
@@ -318,6 +321,22 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
               message: error instanceof Error ? error.message : String(error),
             },
           });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/models/discover' && request.method === 'POST') {
+        // Refresh the OpenCode Go profiles without starting a data sync. The
+        // Console's Models page calls this behind its authenticated proxy.
+        try {
+          const body = await readJsonBody(request).catch(() => ({}) as Record<string, unknown>);
+          const raw = (body ?? {}) as Record<string, unknown>;
+          if (raw.setDefault !== undefined && typeof raw.setDefault !== 'boolean') throw new Error('setDefault must be a boolean.');
+          const configPath = catalogPaths ? path.join(catalogPaths.root, 'config.json') : staticPaths?.config;
+          if (!configPath) throw new Error('No Catence data store is configured.');
+          json(response, 200, jsonSafe(await mergeModels({ configPath, setDefault: raw.setDefault === true })));
+        } catch (error) {
+          json(response, 400, { error: { code: 'model_discovery_failed', message: error instanceof Error ? error.message : String(error) } });
         }
         return;
       }

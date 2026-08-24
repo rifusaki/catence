@@ -81,4 +81,41 @@ describe('mergeOpenCodeGoConsoleProfiles', () => {
     const root = JSON.parse(await readFile(configPath, 'utf8'));
     expect(root.console.profiles['opencode-go']).toBeTruthy();
   });
+
+  it('preserves per-model customizations across re-discovery', async () => {
+    const initial = {
+      console: {
+        defaultProfile: 'opencode-go',
+        profiles: {
+          'opencode-go': {
+            label: 'OpenCode Go',
+            defaultModel: 'ox-alpha-free',
+            apiKeyEnv: 'OPENCODE_GO_API_KEY',
+            apiBaseEnv: 'OPENCODE_GO_API_BASE',
+            models: {
+              'ox-alpha-free': {
+                label: 'Ox Alpha Free',
+                model: 'openai/ox-alpha-free',
+                variants: { Default: 'default', Thinking: 'high' },
+              },
+              'custom-local': { label: 'Custom Local', model: 'openai/custom-local', reasoningEffort: 'low' },
+            },
+          },
+        },
+      },
+    };
+    const { configPath } = await temporaryConfig(JSON.stringify(initial));
+    await mergeOpenCodeGoConsoleProfiles({ configPath });
+    const root = JSON.parse(await readFile(configPath, 'utf8'));
+    const profile = root.console.profiles['opencode-go'];
+    // Human-added thinking-effort variants and labels survive the refresh.
+    expect(profile.models['ox-alpha-free'].variants).toEqual({ Default: 'default', Thinking: 'high' });
+    expect(profile.models['ox-alpha-free'].label).toBe('Ox Alpha Free');
+    expect(profile.models['ox-alpha-free'].model).toBe('openai/ox-alpha-free');
+    // Models absent from the live catalog stay configured.
+    expect(profile.models['custom-local']).toMatchObject({ label: 'Custom Local', reasoningEffort: 'low' });
+    // A previously customized default model is not reset by discovery.
+    expect(profile.defaultModel).toBe('ox-alpha-free');
+    await expect(loadCatenceConfig(resolvePaths(path.dirname(configPath)))).resolves.toBeTruthy();
+  });
 });

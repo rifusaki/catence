@@ -242,4 +242,43 @@ describe('Catence Streamable HTTP server', () => {
     expect(leftovers).toEqual([]);
   });
 
+  it('discovers OpenCode Go models without starting a data sync', async () => {
+    const { paths, database } = await temporaryDatabase();
+    await database.close();
+    let discoveryCalls = 0;
+    const requestedConfigPaths: string[] = [];
+    const server = createCatenceHttpServer({
+      paths,
+      mergeModels: async (options) => {
+        discoveryCalls += 1;
+        requestedConfigPaths.push(options.configPath);
+        return {
+          configPath: options.configPath,
+          mergedProfileIds: ['opencode-go'],
+          defaultProfile: 'opencode-go',
+          counts: { chat: 2, responses: 0, messages: 0 },
+          guessedRoutes: [],
+        };
+      },
+      syncSpawnProcess: () => {
+        throw new Error('a model refresh must never spawn a sync child');
+      },
+    });
+    servers.push(server);
+    const origin = await listen(server);
+
+    const response = await fetch(`${origin}/api/v1/models/discover`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      mergedProfileIds: ['opencode-go'],
+      counts: { chat: 2, responses: 0, messages: 0 },
+    });
+    expect(discoveryCalls).toBe(1);
+    // Single-store deployments merge into the store's own config.
+    expect(requestedConfigPaths[0]).toBe(paths.config);
+  });
 });
