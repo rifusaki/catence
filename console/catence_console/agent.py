@@ -62,6 +62,29 @@ def _unwrap_exception_group(exc: BaseException) -> BaseException:
     return ExceptionGroup("Catence agent failed with multiple errors", leaves)
 
 
+def _provider_safe_schema(node: Any) -> Any:
+    """Rewrite JSON Schema keywords some upstream providers reject.
+
+    Tuple-form ``items`` (an array of per-index schemas) is valid draft-07 but
+    several OpenAI-compatible gateways answer tool definitions containing it
+    with a 400 "Invalid API parameter" error. Expressing the same shape as an
+    ``anyOf`` of the index schemas is universally accepted and keeps guiding
+    the model toward the intended tuple. Everything else passes through.
+    """
+
+    if isinstance(node, list):
+        return [_provider_safe_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    rewritten: dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "items" and isinstance(value, list):
+            rewritten[key] = {"anyOf": [_provider_safe_schema(item) for item in value]} if value else {}
+        else:
+            rewritten[key] = _provider_safe_schema(value)
+    return rewritten
+
+
 def _tool_definitions(tools: list[Any]) -> list[dict[str, Any]]:
     definitions: list[dict[str, Any]] = []
     for tool in tools:
@@ -72,7 +95,7 @@ def _tool_definitions(tools: list[Any]) -> list[dict[str, Any]]:
                 "function": {
                     "name": raw["name"],
                     "description": raw.get("description", ""),
-                    "parameters": raw.get("inputSchema", raw.get("input_schema", {"type": "object", "properties": {}})),
+                    "parameters": _provider_safe_schema(raw.get("inputSchema", raw.get("input_schema", {"type": "object", "properties": {}}))),
                 },
             }
         )

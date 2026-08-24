@@ -48,6 +48,31 @@ class WrappingSession(FakeSession):
         return False
 
 
+def test_provider_safe_schema_rewrites_tuple_items_for_upstream_gateways():
+    schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "distanceKm": {
+                "type": "array",
+                "items": [{"type": "number", "minimum": 0}, {"type": "number", "minimum": 0}],
+            },
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "nested": {"anyOf": [{"type": "array", "items": []}, {"type": "null"}]},
+        },
+    }
+
+    rewritten = agent._provider_safe_schema(schema)
+
+    assert rewritten["properties"]["distanceKm"]["items"] == {
+        "anyOf": [{"type": "number", "minimum": 0}, {"type": "number", "minimum": 0}]
+    }
+    # Object-form items and untouched branches pass through unchanged.
+    assert rewritten["properties"]["tags"]["items"] == {"type": "string"}
+    assert rewritten["properties"]["nested"]["anyOf"][0] == {"type": "array", "items": {}}
+    assert rewritten["$schema"] == schema["$schema"]
+
+
 def test_respond_normalizes_mcp_tools_for_litellm(monkeypatch):
     monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
