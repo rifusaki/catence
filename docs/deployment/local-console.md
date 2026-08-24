@@ -196,11 +196,20 @@ script fetches it and merges two ready-made profiles into `config.json`:
 `opencode-go` (chat + responses models, base `…/zen/go/v1`) and
 `opencode-go-messages` (messages models, base `…/zen/go`). Existing profiles,
 limits, and `defaultProfile` are preserved unless `--set-default` is passed.
+Re-discovery refreshes each known model's routing reference but keeps your
+custom label, `reasoningEffort`, and `variants`, and keeps models that have
+disappeared from the live catalog.
 
 ```sh
 # Local (from a checkout)
 npm run discover:opencode-go -- --write ~/.catence/config.json
 ```
+
+Inside the Console's Models page, **Discover OpenCode Go models** runs the
+same merge for the current home without touching athlete data (runtime route
+`POST /api/v1/models/discover`, proxied behind the Console login). Models can
+also be edited in place there — the update action rewrites the `console`
+section atomically and never stores secret values.
 
 Then set the credentials and verify:
 

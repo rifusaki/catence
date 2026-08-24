@@ -313,7 +313,12 @@ override the host and port when the flags are omitted.
 - `GET /api/v1/sync/status?athleteId=alex` reports live progress heartbeats,
   recent runs, and best-effort last-completion timestamps per provider. It
   keeps working while a sync holds the write lock (`lastSync` becomes `null`
-  then).
+  then). Finished runs are never reported as active, so a completed or
+  crashed run can never wedge the busy guard.
+- `POST /api/v1/models/discover` refreshes the OpenCode Go profiles in
+  `<home>/config.json` without starting a data sync:
+  `{"setDefault": false}` (both fields optional). Returns the merged profile
+  ids, per-route counts, and any prefix-guessed routes.
 - Browser origins must be listed with `--allow-origin` (repeatable). The
   packaged Console instead proxies the dashboard through its authenticated
   same-origin route.
