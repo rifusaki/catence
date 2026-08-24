@@ -134,9 +134,11 @@ async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Res
         if request.method == "GET":
             return await models_overview(request)
         return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use GET for /api/v1/models."}}, status_code=405)
+    if request.method == "POST" and request.url.path == "/api/v1/models/discover":
+        return await discover_models_proxy(request)
     if request.method == "POST" and request.url.path.startswith("/api/v1/models/"):
         action = request.url.path.rsplit("/", 1)[-1]
-        if action in {"toggle", "add", "remove", "default"}:
+        if action in {"toggle", "add", "update", "remove", "default"}:
             return await mutate_models(request, action)
     if request.method == "POST" and request.url.path == "/api/v1/sync":
         return await sync_trigger_proxy(request)
@@ -272,6 +274,60 @@ def _add_model(console: dict[str, Any], body: dict[str, Any]) -> None:
     models[body["modelId"]] = entry
 
 
+def _update_model(console: dict[str, Any], body: dict[str, Any]) -> None:
+    """Edit one existing model entry: label, routing, reasoningEffort, variants.
+
+    Only fields present in the request body change; a field set to null is
+    cleared (except ``model``, which must always stay configured). This is how
+    custom thinking-effort variants are attached to an already-discovered
+    model without removing and re-adding it.
+    """
+
+    _require_model_fields(body, ("profileId", "modelId"))
+    profile_id, model_id = body["profileId"], body["modelId"]
+    profiles = console.setdefault("profiles", {})
+    raw_profile = profiles.get(profile_id)
+    if not isinstance(raw_profile, dict) or not isinstance(raw_profile.get("models"), dict):
+        raise ConsoleConfigurationError(f"Unknown Console profile or unsupported layout: {profile_id}")
+    models = raw_profile["models"]
+    if model_id not in models:
+        raise ConsoleConfigurationError(f"Unknown model {model_id!r} for Console profile {profile_id!r}.")
+    entry = models[model_id]
+    for field in ("label", "model"):
+        if field not in body:
+            continue
+        value = body[field]
+        if field == "model" and (value is None or not isinstance(value, str) or not value.strip()):
+            raise ConsoleConfigurationError("model must be a non-empty string; it cannot be cleared.")
+        if value is None:
+            entry.pop(field, None)
+        elif isinstance(value, str) and value.strip():
+            entry[field] = value
+        else:
+            raise ConsoleConfigurationError(f"{field} must be a non-empty string when provided.")
+    for field in ("reasoningEffort", "variants"):
+        if field not in body:
+            continue
+        value = body[field]
+        if value is None:
+            entry.pop(field, None)
+        elif field == "reasoningEffort" and isinstance(value, str) and value.strip():
+            entry["reasoningEffort"] = value
+        elif field == "reasoningEffort":
+            raise ConsoleConfigurationError("reasoningEffort must be a string.")
+        elif isinstance(value, dict) and all(isinstance(key, str) and isinstance(item, str) for key, item in value.items()):
+            entry["variants"] = value
+        else:
+            raise ConsoleConfigurationError("variants must map labels to reasoning-effort values.")
+    # Mirror the strict startup loader's cross-field rule before writing.
+    if isinstance(entry.get("reasoningEffort"), str) and entry.get("variants") == {}:
+        raise ConsoleConfigurationError(
+            f"{profile_id}.models.{model_id} cannot combine a fixed reasoningEffort with empty variants."
+        )
+    if not isinstance(entry.get("label"), str) or not entry.get("label", "").strip():
+        entry["label"] = model_id
+
+
 def _remove_model(console: dict[str, Any], body: dict[str, Any]) -> None:
     _require_model_fields(body, ("profileId", "modelId"))
     profile_id, model_id = body["profileId"], body["modelId"]
@@ -300,6 +356,9 @@ async def mutate_models(request: Request, action: str) -> Response:
         if action == "add":
             configuration = write_console_section(DATA_DIRECTORY, lambda console: _add_model(console, body))
             return JSONResponse(_models_payload(configuration))
+        if action == "update":
+            configuration = write_console_section(DATA_DIRECTORY, lambda console: _update_model(console, body))
+            return JSONResponse(_models_payload(configuration))
         if action == "remove":
             write_console_section(DATA_DIRECTORY, lambda console: _remove_model(console, body))
             # Only after the config write succeeded: a stale disable flag must
@@ -323,12 +382,10 @@ async def mutate_models(request: Request, action: str) -> Response:
         return _models_error(error, "invalid_request")
 
 
-async def sync_trigger_proxy(request: Request) -> Response:
-    """Start a detached data sync through the runtime's /api/v1/sync route."""
+async def _proxy_mcp_post(request: Request, path: str) -> Response:
+    """Forward an authenticated POST body to the runtime's JSON API."""
 
-    if not _authenticated(request):
-        return _unauthorized()
-    target = _mcp_http_url("/api/v1/sync")
+    target = _mcp_http_url(path)
     payload = await request.body()
 
     def fetch() -> tuple[int, bytes, str]:
@@ -343,6 +400,22 @@ async def sync_trigger_proxy(request: Request) -> Response:
 
     status, response_body, content_type = await asyncio.to_thread(fetch)
     return Response(content=response_body, status_code=status, media_type=content_type)
+
+
+async def sync_trigger_proxy(request: Request) -> Response:
+    """Start a detached data sync through the runtime's /api/v1/sync route."""
+
+    if not _authenticated(request):
+        return _unauthorized()
+    return await _proxy_mcp_post(request, "/api/v1/sync")
+
+
+async def discover_models_proxy(request: Request) -> Response:
+    """Refresh the OpenCode Go model profiles through the runtime route."""
+
+    if not _authenticated(request):
+        return _unauthorized()
+    return await _proxy_mcp_post(request, "/api/v1/models/discover")
 
 
 async def sync_status_proxy(request: Request) -> Response:

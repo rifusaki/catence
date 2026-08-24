@@ -170,3 +170,68 @@ def test_default_endpoint_updates_profile_default(client: TestClient):
 
     unknown = client.post("/api/v1/models/default", json={"profileId": "openai", "modelId": "does-not-exist"})
     assert unknown.status_code == 400
+
+
+def test_update_attaches_variants_to_an_existing_model(client: TestClient, data_directory: Path):
+    response = client.post(
+        "/api/v1/models/update",
+        json={
+            "profileId": "openai",
+            "modelId": "gpt-5-mini",
+            "variants": {"Default": "default", "Thinking": "high"},
+        },
+    )
+    assert response.status_code == 200
+    model = next(model for model in response.json()["profiles"][0]["models"] if model["id"] == "gpt-5-mini")
+    assert model["variants"] == {"Default": "default", "Thinking": "high"}
+    # The written config keeps unrelated sections intact.
+    assert "mcp" in read_config_root(data_directory)
+
+    persisted = parse_console_configuration(read_config_root(data_directory))
+    assert persisted.profile("openai").model_option("gpt-5-mini").variants == {"Default": "default", "Thinking": "high"}
+
+
+def test_update_clears_fields_with_null_and_relabels(client: TestClient):
+    added = client.post(
+        "/api/v1/models/add",
+        json={
+            "profileId": "openai",
+            "modelId": "temp-model",
+            "label": "Temp",
+            "model": "openai/temp",
+            "reasoningEffort": "low",
+        },
+    )
+    assert added.status_code == 200
+    cleared = client.post(
+        "/api/v1/models/update",
+        json={"profileId": "openai", "modelId": "temp-model", "reasoningEffort": None, "label": "Renamed"},
+    )
+    assert cleared.status_code == 200
+    model = next(model for model in cleared.json()["profiles"][0]["models"] if model["id"] == "temp-model")
+    assert model["reasoningEffort"] is None
+    assert model["label"] == "Renamed"
+
+
+def test_update_rejects_invalid_edits(client: TestClient, data_directory: Path):
+    conflicting = client.post(
+        "/api/v1/models/update",
+        json={"profileId": "openai", "modelId": "o4-mini", "reasoningEffort": "high"},
+    )
+    # o4-mini declares empty variants (effort disabled); a fixed effort cannot combine.
+    assert conflicting.status_code == 400
+
+    unknown = client.post("/api/v1/models/update", json={"profileId": "openai", "modelId": "ghost", "label": "X"})
+    assert unknown.status_code == 400
+
+    cleared_routing = client.post(
+        "/api/v1/models/update", json={"profileId": "openai", "modelId": "gpt-5-mini", "model": None}
+    )
+    assert cleared_routing.status_code == 400
+    # Nothing above may have touched the file.
+    assert parse_console_configuration(read_config_root(data_directory)).profile("openai").default_model == "gpt-5-mini"
+
+
+def test_discover_endpoint_requires_login():
+    response = TestClient(app.chainlit_server).post("/api/v1/models/discover", json={})
+    assert response.status_code == 401
