@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import path from 'node:path';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   catenceRuntimeHealth,
@@ -164,14 +165,19 @@ type LastSyncSummary = {
 
 /** Best-effort last-success timestamps; null while a run holds the write lock. */
 async function lastSyncSummary(paths: CatencePaths): Promise<LastSyncSummary | null> {
+  const completedAtIso = (value: unknown): string | null => {
+    if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString();
+    if (typeof value === 'string' && value.trim()) return value;
+    return null;
+  };
   try {
     const status = await dataStatus(paths);
     const runs = Array.isArray(status.syncRuns) ? (status.syncRuns as Array<Record<string, unknown>>) : [];
-    const completed = runs.filter((run) => typeof run.completed_at === 'string' && String(run.status).startsWith('completed'));
+    const completed = runs.filter((run) => String(run.status ?? '').startsWith('completed') && completedAtIso(run.completed_at));
     const providers: Record<string, string> = {};
     let lastCompletedAt: string | null = null;
     for (const run of completed) {
-      const completedAt = String(run.completed_at);
+      const completedAt = completedAtIso(run.completed_at) as string;
       const provider = String(run.provider ?? 'unknown');
       if (!providers[provider] || providers[provider] < completedAt) providers[provider] = completedAt;
       if (!lastCompletedAt || lastCompletedAt < completedAt) lastCompletedAt = completedAt;

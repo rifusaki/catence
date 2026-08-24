@@ -361,7 +361,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       log.warn('Sync run interrupted', { runId, provider });
     } else {
       await database.finishRun(runId);
-      pump.publishFinal(baseProgress(runId, provider, 'completed'));
+      await pump.publishFinal(baseProgress(runId, provider, 'completed'));
     }
     await removeProgressSidecar(paths, runId).catch(() => undefined);
     const [run] = await database.rows<{ status: string; error_count: number }>(

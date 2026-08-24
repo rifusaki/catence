@@ -62,13 +62,30 @@ export async function readProgressSidecars(paths: CatencePaths): Promise<SyncPro
 /** Active runs from sidecars: non-terminal stage and a fresh heartbeat. */
 export async function readRunningProgress(paths: CatencePaths, staleAfterMs = PROGRESS_SIDECAR_STALE_MS): Promise<SyncProgressState[]> {
   const now = Date.now();
+  const directory = path.join(paths.staging, 'garmin');
+  if (!existsSync(directory)) return [];
+  const files = (await readdir(directory)).filter((file) => file.endsWith(PROGRESS_SIDECAR_SUFFIX));
   const running: SyncProgressState[] = [];
-  for (const state of await readProgressSidecars(paths)) {
-    if (TERMINAL_STAGES.has(state.stage)) continue;
+  const prunable: string[] = [];
+  for (const file of files) {
+    let state: SyncProgressState | null = null;
+    try {
+      state = normalizeProgress(JSON.parse(await readFile(path.join(directory, file), 'utf8')));
+    } catch {
+      // Torn or partial sidecar write; it is not authoritative.
+    }
+    if (!state) continue;
     const ageMs = now - Date.parse(state.heartbeatAt);
-    if (!Number.isFinite(ageMs) || ageMs > staleAfterMs) continue;
+    if (TERMINAL_STAGES.has(state.stage) || !Number.isFinite(ageMs) || ageMs > staleAfterMs) {
+      // A terminal heartbeat that survived its own cleanup (a crash between
+      // the final publish and the sidecar removal) must never read as an
+      // active run again, so sweep it instead of leaving it behind forever.
+      prunable.push(file);
+      continue;
+    }
     running.push(state);
   }
+  await Promise.all(prunable.map((file) => rm(path.join(directory, file), { force: true }).catch(() => undefined)));
   return running;
 }
 
@@ -177,14 +194,16 @@ export class ProgressPump {
   }
 
   /** Write a terminal heartbeat immediately, bypassing the publish throttle. */
-  publishFinal(state: SyncProgressState): void {
+  async publishFinal(state: SyncProgressState): Promise<void> {
     this.lastHeartbeatAt = Date.now();
     this.lastProgress = state;
     const { database, paths, log } = this.options;
-    void database.heartbeatRun(this.runId, state).catch((error: unknown) => {
+    // Both terminal writes complete before the caller removes the sidecar, so
+    // a finished run can never resurrect its own progress file after cleanup.
+    await database.heartbeatRun(this.runId, state).catch((error: unknown) => {
       log.debug('Progress heartbeat failed', { runId: this.runId, error: error instanceof Error ? error.message : String(error) });
     });
-    void writeProgressSidecar(paths, this.runId, state).catch((error: unknown) => {
+    await writeProgressSidecar(paths, this.runId, state).catch((error: unknown) => {
       log.debug('Progress sidecar write failed', { runId: this.runId, error: error instanceof Error ? error.message : String(error) });
     });
   }

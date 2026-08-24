@@ -192,8 +192,11 @@ describe('sync run progress sidecars', () => {
     const running = await readRunningProgress(paths);
     expect(running.map((state) => state.runId)).toEqual([liveRunId]);
 
-    const all = await readProgressSidecars(paths);
-    expect(all).toHaveLength(3);
+    // Terminal and stale sidecars are swept during the read, so a finished
+    // run whose cleanup raced its final publish can never resurface as an
+    // active sync on any later read.
+    const survivors = await readProgressSidecars(paths);
+    expect(survivors.map((state) => state.runId)).toEqual([liveRunId]);
   });
 
   it('mergeProgress lets sidecar state win for running runs and sorts recent by heartbeat', async () => {

@@ -197,4 +197,49 @@ describe('Catence Streamable HTTP server', () => {
       warning: expect.stringContaining('OpenCode Go model discovery failed'),
     });
   });
+
+  it('never reports a finished run as active, even when its sidecar survived', async () => {
+    const { paths, database } = await temporaryDatabase();
+    await database.close();
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    await mkdir(path.join(paths.staging, 'garmin'), { recursive: true });
+    // A terminal heartbeat that outlived its own cleanup (the historic
+    // publish/remove race) must not read as a running sync.
+    await writeFile(
+      path.join(paths.staging, 'garmin', 'done-1.progress.json'),
+      JSON.stringify({ runId: 'done-1', provider: 'intervals', stage: 'completed', completedUnits: 0, totalUnits: null, percentComplete: 0, elapsedSeconds: 0, estimatedRemainingSeconds: null, heartbeatAt: new Date().toISOString() }),
+      'utf8',
+    );
+
+    let spawned = 0;
+    const server = createCatenceHttpServer({
+      paths,
+      syncSpawnProcess: () => {
+        spawned += 1;
+        return { unref() {} };
+      },
+    });
+    servers.push(server);
+    const origin = await listen(server);
+
+    const status = await fetch(`${origin}/api/v1/sync/status`);
+    const payload = await status.json();
+    expect(payload.progress.running).toEqual([]);
+    expect(payload.progress.recent.map((run: { runId: string }) => run.runId)).not.toContain('done-1');
+
+    // The busy guard passes, so a new sync starts instead of returning 409.
+    const started = await fetch(`${origin}/api/v1/sync`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'all' }),
+    });
+    expect(started.status).toBe(202);
+    expect(spawned).toBe(1);
+
+    // Reading the status again swept the orphaned terminal sidecar.
+    const { readdir } = await import('node:fs/promises');
+    const leftovers = (await readdir(path.join(paths.staging, 'garmin'))).filter((file) => file.endsWith('.progress.json'));
+    expect(leftovers).toEqual([]);
+  });
+
 });
