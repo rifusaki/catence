@@ -159,6 +159,8 @@ export type OpenCodeGoMergeResult = {
   defaultProfile: string;
   counts: { chat: number; responses: number; messages: number };
   guessedRoutes: string[];
+  /** Model ids removed from the managed profiles because they left the live catalog. */
+  prunedModelIds?: string[];
 };
 
 /** Per-model fields a human may have customized after the initial discovery. */
@@ -177,10 +179,11 @@ function preservedModelFields(previous: unknown): Record<string, unknown> {
  * `configPath`, preserving every other section plus existing console fields
  * (`limits`, other profiles) and the existing `defaultProfile` unless
  * `setDefault` is passed. Model routing (`model`) is refreshed from the live
- * catalog, while per-model customizations (custom label, `reasoningEffort`,
- * `variants`) and models that disappeared upstream are kept. The written file
- * is re-validated with the same strict schema the runtime applies on load,
- * then replaced atomically.
+ * catalog, per-model customizations (custom label, `reasoningEffort`,
+ * `variants`) survive for models still in the catalog, and models that
+ * disappeared upstream are pruned so the Console never offers stale routes.
+ * The written file is re-validated with the same strict schema the runtime
+ * applies on load, then replaced atomically.
  */
 export async function mergeOpenCodeGoConsoleProfiles(
   options: {
@@ -207,8 +210,11 @@ export async function mergeOpenCodeGoConsoleProfiles(
 
   // Merge per model, not per profile: discovery owns routing and the id list,
   // but a human's label, reasoningEffort, and variants must survive every
-  // re-discovery. Models that vanished upstream stay configured.
+  // re-discovery. Models that vanished upstream are pruned so the managed
+  // profiles mirror the live catalog instead of going stale; a failed or
+  // empty catalog fetch never reaches this loop (fetch throws first).
   const mergedProfiles: Record<string, Record<string, unknown>> = {};
+  const prunedModelIds: string[] = [];
   for (const [profileId, builtProfile] of Object.entries(built.profiles)) {
     const previousProfile = existingProfiles[profileId];
     const rawModels = typeof previousProfile === 'object' && previousProfile !== null
@@ -217,13 +223,16 @@ export async function mergeOpenCodeGoConsoleProfiles(
     const previousModels = typeof rawModels === 'object' && rawModels !== null && !Array.isArray(rawModels)
       ? (rawModels as Record<string, unknown>)
       : {};
-    const models: Record<string, unknown> = { ...previousModels };
+    const models: Record<string, unknown> = {};
     for (const [modelId, entry] of Object.entries(builtProfile.models as Record<string, { label: string; model: string }>)) {
       models[modelId] = {
         ...preservedModelFields(previousModels[modelId]),
         label: entry.label,
         model: entry.model,
       };
+    }
+    for (const modelId of Object.keys(previousModels)) {
+      if (!(modelId in models)) prunedModelIds.push(`${profileId}:${modelId}`);
     }
     const previousDefaultModel = typeof previousProfile === 'object' && previousProfile !== null
       ? (previousProfile as Record<string, unknown>).defaultModel
@@ -259,5 +268,6 @@ export async function mergeOpenCodeGoConsoleProfiles(
     defaultProfile,
     counts: built.counts,
     guessedRoutes: built.guessedRoutes,
+    prunedModelIds,
   };
 }

@@ -198,8 +198,10 @@ The script warns on stderr and skips any model that does not fit one of these
 families. Rerun it to refresh the model lists; existing profiles, limits, and
 `defaultProfile` are preserved unless `--set-default` is passed. Re-running
 never discards your own tweaks: per-model custom labels, `reasoningEffort`
-pins, and `variants` maps survive every refresh, and models that have dropped
-out of the live catalog stay configured.
+pins, and `variants` maps survive every refresh. Models that have dropped out
+of the live catalog are pruned from the managed profiles, so the Console never
+offers a route the gateway no longer serves; if a pruned model was the
+profile's default, discovery selects a current one instead.
 
 You do not have to run the script manually: the Console dashboard's **Sync
 data** button (and `POST /api/v1/sync` with `"refreshModels": true`) refreshes

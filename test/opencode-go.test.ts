@@ -1,9 +1,24 @@
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadCatenceConfig, resolvePaths } from '../src/core/runtime/configuration.js';
 import { buildOpenCodeGoConsoleProfiles, classifyOpenCodeGoModel, mergeOpenCodeGoConsoleProfiles } from '../src/core/runtime/opencode-go.js';
+
+const LIVE_CATALOG = {
+  data: [{ id: 'deepseek-v4' }, { id: 'grok-4.5' }, { id: 'minimax-m3' }, { id: 'ox-alpha-free' }],
+};
+
+function stubLiveCatalog(payload: unknown = LIVE_CATALOG): void {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => new Response(JSON.stringify(payload), { status: 200, headers: { 'content-type': 'application/json' } })),
+  );
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('OpenCode Go model routing', () => {
   it('routes trusted models exactly and unknown prefixes heuristically', () => {
@@ -82,7 +97,8 @@ describe('mergeOpenCodeGoConsoleProfiles', () => {
     expect(root.console.profiles['opencode-go']).toBeTruthy();
   });
 
-  it('preserves per-model customizations across re-discovery', async () => {
+  it('preserves per-model customizations and prunes models that left the live catalog', async () => {
+    stubLiveCatalog();
     const initial = {
       console: {
         defaultProfile: 'opencode-go',
@@ -98,6 +114,7 @@ describe('mergeOpenCodeGoConsoleProfiles', () => {
                 model: 'openai/ox-alpha-free',
                 variants: { Default: 'default', Thinking: 'high' },
               },
+              'retired-model': { label: 'Retired', model: 'openai/retired-model', reasoningEffort: 'low' },
               'custom-local': { label: 'Custom Local', model: 'openai/custom-local', reasoningEffort: 'low' },
             },
           },
@@ -105,17 +122,47 @@ describe('mergeOpenCodeGoConsoleProfiles', () => {
       },
     };
     const { configPath } = await temporaryConfig(JSON.stringify(initial));
-    await mergeOpenCodeGoConsoleProfiles({ configPath });
+    const result = await mergeOpenCodeGoConsoleProfiles({ configPath });
     const root = JSON.parse(await readFile(configPath, 'utf8'));
     const profile = root.console.profiles['opencode-go'];
     // Human-added thinking-effort variants and labels survive the refresh.
     expect(profile.models['ox-alpha-free'].variants).toEqual({ Default: 'default', Thinking: 'high' });
     expect(profile.models['ox-alpha-free'].label).toBe('Ox Alpha Free');
     expect(profile.models['ox-alpha-free'].model).toBe('openai/ox-alpha-free');
-    // Models absent from the live catalog stay configured.
-    expect(profile.models['custom-local']).toMatchObject({ label: 'Custom Local', reasoningEffort: 'low' });
+    // Models absent from the live catalog are pruned so the list cannot go stale.
+    expect(profile.models['retired-model']).toBeUndefined();
+    expect(profile.models['custom-local']).toBeUndefined();
+    expect(result.prunedModelIds).toEqual(['opencode-go:retired-model', 'opencode-go:custom-local']);
     // A previously customized default model is not reset by discovery.
     expect(profile.defaultModel).toBe('ox-alpha-free');
+    await expect(loadCatenceConfig(resolvePaths(path.dirname(configPath)))).resolves.toBeTruthy();
+  });
+
+  it('reassigns the profile default when the previous default is pruned', async () => {
+    stubLiveCatalog({
+      data: [{ id: 'kimi-k3' }],
+    });
+    const initial = {
+      console: {
+        defaultProfile: 'opencode-go',
+        profiles: {
+          'opencode-go': {
+            label: 'OpenCode Go',
+            defaultModel: 'ox-alpha-free',
+            apiKeyEnv: 'OPENCODE_GO_API_KEY',
+            apiBaseEnv: 'OPENCODE_GO_API_BASE',
+            models: { 'ox-alpha-free': { label: 'Ox Alpha Free', model: 'openai/ox-alpha-free' } },
+          },
+        },
+      },
+    };
+    const { configPath } = await temporaryConfig(JSON.stringify(initial));
+    const result = await mergeOpenCodeGoConsoleProfiles({ configPath });
+    const root = JSON.parse(await readFile(configPath, 'utf8'));
+    const profile = root.console.profiles['opencode-go'];
+    expect(profile.defaultModel).toBe('kimi-k3');
+    expect(Object.keys(profile.models)).toEqual(['kimi-k3']);
+    expect(result.prunedModelIds).toEqual(['opencode-go:ox-alpha-free']);
     await expect(loadCatenceConfig(resolvePaths(path.dirname(configPath)))).resolves.toBeTruthy();
   });
 });

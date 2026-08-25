@@ -17,6 +17,38 @@ from typing import Any, Callable
 from .config import ConsoleConfiguration, ConsoleConfigurationError, parse_console_configuration
 
 
+def _normalize_legacy_profiles(console: dict[str, Any]) -> None:
+    """Rewrite scalar-``model`` profiles into the ``models`` map in place.
+
+    Early config.example.json seeds (and hand-written configs) express a profile
+    as ``{"model": "openai/gpt-5-mini"}``. Every UI mutation (add, update,
+    remove) requires the ``models`` layout, so without this rewrite the Models
+    page rejects those profiles with "Unknown Console profile or unsupported
+    layout". Normalizing here keeps one choke point: the first successful write
+    migrates the profile on disk while preserving every other field verbatim.
+    Invalid shapes are left alone so the strict parser still reports them.
+    """
+
+    profiles = console.get("profiles")
+    if not isinstance(profiles, dict):
+        return
+    for profile_id, raw_profile in profiles.items():
+        if not isinstance(raw_profile, dict) or "models" in raw_profile:
+            continue
+        model = raw_profile.get("model")
+        if not isinstance(model, str) or not model.strip():
+            continue
+        label = raw_profile.get("label")
+        # The tolerant readers presented a legacy profile's single model under
+        # the profile label (falling back to the profile id); keep that so the
+        # UI text does not change after migration.
+        inner_label = label if isinstance(label, str) and label.strip() else profile_id
+        entry: dict[str, Any] = {"label": inner_label, "model": model}
+        raw_profile["models"] = {"default": entry}
+        raw_profile["defaultModel"] = "default"
+        del raw_profile["model"]
+
+
 def read_config_root(data_directory: Path) -> dict[str, Any]:
     """Return the decoded config.json root; an absent file reads as empty."""
 
@@ -49,6 +81,7 @@ def write_console_section(
     console = root.get("console")
     console = console if isinstance(console, dict) else {}
     candidate_console = json.loads(json.dumps(console))
+    _normalize_legacy_profiles(candidate_console)
     mutate(candidate_console)
     candidate_root = {**root, "console": candidate_console}
     configuration = parse_console_configuration(candidate_root)
