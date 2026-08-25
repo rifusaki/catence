@@ -47,7 +47,7 @@ dev = [
 requires-dist = [
     { name = "duckdb", specifier = ">=1.4.0" },
     { name = "fitdecode", specifier = ">=0.10.0" },
-    { name = "garminconnect", git = "https://github.com/rifusaki/python-garminconnect.git?rev=732bf14602bce2ca22cb569ba6583c3229bf904d" },
+    { name = "garminconnect", git = "https://github.com/rifusaki/python-garminconnect.git?rev=cd4e3d9ef81a93681950138e08f57af226fd5735" },
     { name = "polars", specifier = ">=1.0.0" },
     { name = "pyarrow", specifier = ">=18.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
@@ -318,8 +318,8 @@ wheels = [
 
 [[package]]
 name = "garminconnect"
-version = "0.3.8"
-source = { git = "https://github.com/rifusaki/python-garminconnect.git?rev=732bf14602bce2ca22cb569ba6583c3229bf904d#732bf14602bce2ca22cb569ba6583c3229bf904d" }
+version = "0.3.12"
+source = { git = "https://github.com/rifusaki/python-garminconnect.git?rev=cd4e3d9ef81a93681950138e08f57af226fd5735#cd4e3d9ef81a93681950138e08f57af226fd5735" }
 dependencies = [
     { name = "curl-cffi" },
     { name = "requests" },
