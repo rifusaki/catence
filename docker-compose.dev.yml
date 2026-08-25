@@ -49,6 +49,9 @@ services:
       OPENCODE_GO_MESSAGES_API_BASE: ${OPENCODE_GO_MESSAGES_API_BASE:-}
       OPENCODE_ZEN_API_BASE: ${OPENCODE_ZEN_API_BASE:-}
       OPENCODE_ZEN_RESPONSES_API_BASE: ${OPENCODE_ZEN_RESPONSES_API_BASE:-}
+      # Opt-in verbose LLM wire logging (LiteLLM + OpenAI SDK). Leave unset for quiet logs.
+      LITELLM_LOG: ${LITELLM_LOG:-}
+      OPENAI_LOG: ${OPENAI_LOG:-}
     volumes:
       - catence-dev-data:/data
       - .:/app

@@ -20,6 +20,9 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_API_BASE: ${OPENAI_API_BASE:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Opt-in verbose LLM wire logging (LiteLLM + OpenAI SDK), e.g. LITELLM_LOG=DEBUG.
+      LITELLM_LOG: ${LITELLM_LOG:-}
+      OPENAI_LOG: ${OPENAI_LOG:-}
     volumes:
       - catence-beta-data:/data
 
