@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from litellm.exceptions import AuthenticationError, InternalServerError, ServiceUnavailableError
 
 from catence_console import agent
 from catence_console.config import ModelOption, ProviderProfile
@@ -380,3 +381,62 @@ def test_tool_steps_nest_under_the_triggering_user_message(monkeypatch):
 
     assert answer == "Done."
     assert [step.parent_id for step in _RecordingStep.instances] == ["user-message-1"]
+
+
+def _profile(**overrides):
+    fields = {
+        "id": "opencode-go",
+        "label": "Console Go",
+        "model": "openai/ox-alpha-free",
+        "api_key_env": "OPENCODE_GO_API_KEY",
+        "api_base_env": None,
+    }
+    fields.update(overrides)
+    return ProviderProfile(**fields)
+
+
+def test_describe_failure_points_upstream_errors_at_the_provider(monkeypatch):
+    monkeypatch.setenv("OPENCODE_GO_API_BASE", "https://opencode.ai/zen/go/v1")
+    error = ServiceUnavailableError(
+        "OpenAIException - Error from provider (Console Go): Upstream request failed: Endpoint is unavailable.",
+        llm_provider="openai",
+        model="ox-alpha-free",
+    )
+
+    message = agent.describe_model_failure(_profile(api_base_env="OPENCODE_GO_API_BASE"), "ox-alpha-free", error)
+
+    assert "**Console Go** (https://opencode.ai/zen/go/v1)" in message
+    assert "not a Catence configuration problem" in message
+    assert "Endpoint is unavailable." in message
+    assert "doctor" not in message
+
+
+def test_describe_failure_internal_server_error_names_the_provider():
+    error = InternalServerError("Internal server error", llm_provider="openai", model="muse-spark-1.2")
+
+    message = agent.describe_model_failure(_profile(), "muse-spark-1.2", error)
+
+    assert "failed upstream" in message
+    assert "Internal server error" in message
+    # No api_base configured: no misleading target suffix, still no doctor hint.
+    assert "(https" not in message
+    assert "doctor" not in message
+
+
+def test_describe_failure_authentication_error_suggests_the_env_var(monkeypatch):
+    monkeypatch.delenv("OPENCODE_GO_API_BASE", raising=False)
+    error = AuthenticationError("bad key", llm_provider="openai", model="ox-alpha-free")
+
+    message = agent.describe_model_failure(_profile(), "ox-alpha-free", error)
+
+    assert "rejected the credentials" in message
+    assert "OPENCODE_GO_API_KEY" in message
+    # The targeted env-var guidance replaces the generic doctor hint.
+    assert "doctor" not in message
+
+
+def test_describe_failure_unknown_error_keeps_the_doctor_hint():
+    message = agent.describe_model_failure(_profile(), "ox-alpha-free", RuntimeError("boom"))
+
+    assert "boom" in message
+    assert "doctor" in message

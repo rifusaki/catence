@@ -20,7 +20,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
 from catence_console import auth as _auth  # Registers Chainlit's password callback.
-from catence_console.agent import respond
+from catence_console.agent import describe_model_failure, respond
 from catence_console.config import (
     DEFAULT_TOOL_RESULT_CHARACTER_LIMIT,
     DEFAULT_TOOL_ROUND_LIMIT,
@@ -39,6 +39,7 @@ from catence_console.persistence import (
     SavedConsolePreferences,
     console_preferences_store,
     disabled_models_store,
+    hidden_profiles_store,
     local_data_layer,
     tool_call_store,
 )
@@ -138,7 +139,7 @@ async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Res
         return await discover_models_proxy(request)
     if request.method == "POST" and request.url.path.startswith("/api/v1/models/"):
         action = request.url.path.rsplit("/", 1)[-1]
-        if action in {"toggle", "add", "update", "remove", "default"}:
+        if action in {"toggle", "add", "update", "remove", "default", "hide"}:
             return await mutate_models(request, action)
     if request.method == "POST" and request.url.path == "/api/v1/sync":
         return await sync_trigger_proxy(request)
@@ -163,9 +164,10 @@ def _configured_models(configuration: ConsoleConfiguration, profile_id: str) -> 
 
 
 def _models_payload(configuration: ConsoleConfiguration) -> dict[str, Any]:
-    """The authenticated model-management view: config plus disabled flags."""
+    """The authenticated model-management view: config plus per-user flags."""
 
     disabled = disabled_models_store(DATA_DIRECTORY).list()
+    hidden_profiles = hidden_profiles_store(DATA_DIRECTORY).list()
     profiles: list[dict[str, Any]] = []
     for profile in configuration.profiles.values():
         models = [
@@ -186,6 +188,7 @@ def _models_payload(configuration: ConsoleConfiguration) -> dict[str, Any]:
                 "defaultModel": profile.default_model or "default",
                 "requiredEnvironment": list(profile.required_environment),
                 "missingEnvironment": list(missing_environment(profile)),
+                "hidden": profile.id in hidden_profiles,
                 "models": models,
             }
         )
@@ -345,6 +348,22 @@ def _remove_model(console: dict[str, Any], body: dict[str, Any]) -> None:
         raw_profile["defaultModel"] = next(iter(models))
 
 
+async def _hide_profile(body: dict[str, Any]) -> None:
+    """Hide or unhide one provider profile for this local user (UI state only)."""
+
+    _require_model_fields(body, ("profileId",))
+    hidden_flag = body.get("hidden")
+    if not isinstance(hidden_flag, bool):
+        raise ConsoleConfigurationError("hidden must be a boolean.")
+    profile_id = body["profileId"]
+    _configuration().profile(profile_id)  # Unknown ids are rejected, not stored.
+    store = hidden_profiles_store(DATA_DIRECTORY)
+    if hidden_flag:
+        store.add(profile_id)
+    else:
+        store.remove(profile_id)
+
+
 async def mutate_models(request: Request, action: str) -> Response:
     if not _authenticated(request):
         return _unauthorized()
@@ -377,6 +396,9 @@ async def mutate_models(request: Request, action: str) -> Response:
 
             configuration = write_console_section(DATA_DIRECTORY, set_default)
             return JSONResponse(_models_payload(configuration))
+        if action == "hide":
+            await _hide_profile(body)
+            return JSONResponse(_models_payload(_configuration()))
         raise ConsoleConfigurationError(f"Unknown model management action: {action}")
     except ConsoleConfigurationError as error:
         return _models_error(error, "invalid_request")
@@ -472,15 +494,28 @@ def _disabled_choices(configuration: ConsoleConfiguration) -> set[tuple[str, str
     return disabled_models_store(DATA_DIRECTORY).list()
 
 
+def _hidden_profile_ids() -> set[str]:
+    return hidden_profiles_store(DATA_DIRECTORY).list()
+
+
 def _available_model_choices(configuration: ConsoleConfiguration) -> dict[str, str]:
-    """Model dropdown choices minus the models the local user disabled."""
+    """Model dropdown choices minus disabled models and hidden profiles.
+
+    Hiding every profile must never empty the dropdown: when the filtered map
+    would be empty, the unfiltered choices come back so the chat stays usable
+    (and the athlete can unhide a profile on the Models page).
+    """
 
     disabled = _disabled_choices(configuration)
-    return {
+    hidden = _hidden_profile_ids()
+    choices = configuration.model_choices()
+    visible = {
         label: value
-        for label, value in configuration.model_choices().items()
-        if (value.partition(":")[0], value.partition(":")[2]) not in disabled
+        for label, value in choices.items()
+        if value.partition(":")[0] not in hidden
+        and (value.partition(":")[0], value.partition(":")[2]) not in disabled
     }
+    return visible or choices
 
 
 def _effort_dynamic_options(configuration: ConsoleConfiguration) -> dict[str, Any] | None:
@@ -514,7 +549,10 @@ def _choice_available(configuration: ConsoleConfiguration, value: str) -> bool:
         _configured_models(configuration, profile_id)
     except ConsoleConfigurationError:
         return False
-    return (profile_id, model_id) not in _disabled_choices(configuration)
+    return (
+        profile_id not in _hidden_profile_ids()
+        and (profile_id, model_id) not in _disabled_choices(configuration)
+    )
 
 
 def _session_settings(
@@ -935,11 +973,6 @@ async def on_message(message: cl.Message) -> None:
         )
     except Exception as error:
         logger.exception("Catence model request failed for profile %s and model %s", profile.id, model_id)
-        await _notice(
-            content=(
-                f"I could not complete that Catence review: {error}\n\n"
-                "Run `catence-console doctor` to verify the profile and local Catence server."
-            )
-        ).send()
+        await _notice(content=describe_model_failure(profile, model_id, error)).send()
         return
     await cl.Message(content=answer).send()

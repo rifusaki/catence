@@ -8,6 +8,17 @@ from typing import Any
 
 import chainlit as cl
 from litellm import acompletion
+from litellm.exceptions import (
+    APIConnectionError,
+    AuthenticationError,
+    BadGatewayError,
+    BadRequestError,
+    InternalServerError,
+    NotFoundError,
+    RateLimitError,
+    ServiceUnavailableError,
+    Timeout,
+)
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
@@ -60,6 +71,56 @@ def _unwrap_exception_group(exc: BaseException) -> BaseException:
     if len(leaves) == 1:
         return leaves[0]
     return ExceptionGroup("Catence agent failed with multiple errors", leaves)
+
+
+def describe_model_failure(profile: ProviderProfile, model_id: str, error: BaseException) -> str:
+    """Attribute a failed model call so the athlete knows where to look.
+
+    The Console sits between the athlete and an upstream provider; most chat
+    failures are the provider's, not Catence configuration. Each message names
+    the responsible side, keeps the provider's own error text for traceability,
+    and only suggests ``catence-console doctor`` when the cause could actually
+    be local (credentials, unknown failure shapes, MCP reachability).
+    """
+
+    options = profile.litellm_options(model_id)
+    target = f" ({options['api_base']})" if options.get("api_base") else ""
+    detail = str(error) or type(error).__name__
+    if isinstance(error, AuthenticationError):
+        env_name = profile.api_key_env or "the profile's API key variable"
+        return (
+            f"The model provider rejected the credentials for **{profile.label}**{target}. "
+            f"Check that {env_name} is set correctly in the Console process environment.\n\n"
+            f"Provider said: {detail}"
+        )
+    if isinstance(error, RateLimitError):
+        return (
+            f"The model provider rate-limited or quota-blocked **{profile.label}**{target}. "
+            "This is on the provider's side — retry later, switch models, or check your quota there.\n\n"
+            f"Provider said: {detail}"
+        )
+    if isinstance(error, (Timeout, APIConnectionError)):
+        return (
+            f"Could not reach the model provider behind **{profile.label}**{target}. "
+            "This is between this machine and the provider — check connectivity, then retry.\n\n"
+            f"Provider said: {detail}"
+        )
+    if isinstance(error, (ServiceUnavailableError, BadGatewayError, InternalServerError)):
+        return (
+            f"The provider behind **{profile.label}**{target} failed upstream. "
+            "This is not a Catence configuration problem — retry, or pick another model in settings.\n\n"
+            f"Provider said: {detail}"
+        )
+    if isinstance(error, (BadRequestError, NotFoundError)):
+        return (
+            f"The provider rejected the request for **{profile.label}**{target}. "
+            "The selected model id or parameters may no longer be supported; re-discover or edit the profile in Models.\n\n"
+            f"Provider said: {detail}"
+        )
+    return (
+        f"I could not complete that Catence review: {detail}\n\n"
+        "Run `catence-console doctor` to verify the profile and local Catence server."
+    )
 
 
 def _provider_safe_schema(node: Any) -> Any:

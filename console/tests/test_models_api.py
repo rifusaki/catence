@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from catence_console import app
@@ -235,3 +236,165 @@ def test_update_rejects_invalid_edits(client: TestClient, data_directory: Path):
 def test_discover_endpoint_requires_login():
     response = TestClient(app.chainlit_server).post("/api/v1/models/discover", json={})
     assert response.status_code == 401
+
+
+def test_discover_endpoint_still_reaches_the_runtime_proxy(client, monkeypatch):
+    captured = {}
+
+    async def fake_proxy(request):
+        captured["called"] = True
+        return JSONResponse({"counts": {"chat": 0, "responses": 0, "messages": 0}})
+
+    monkeypatch.setattr(app, "discover_models_proxy", fake_proxy)
+    response = client.post("/api/v1/models/discover", json={})
+    assert response.status_code == 200
+    assert captured.get("called") is True
+
+
+def test_hide_and_unhide_a_profile_without_touching_config(client: TestClient, data_directory: Path):
+    before = (data_directory / "config.json").read_text(encoding="utf-8")
+
+    hidden = client.post("/api/v1/models/hide", json={"profileId": "openai", "hidden": True})
+    assert hidden.status_code == 200
+    assert hidden.json()["profiles"][0]["hidden"] is True
+
+    # Hiding is per-user UI state in sqlite; shared config stays byte-identical.
+    assert (data_directory / "config.json").read_text(encoding="utf-8") == before
+
+    unhidden = client.post("/api/v1/models/hide", json={"profileId": "openai", "hidden": False})
+    assert unhidden.status_code == 200
+    assert unhidden.json()["profiles"][0]["hidden"] is False
+
+
+def test_hide_rejects_unknown_profiles_and_non_boolean_flags(client: TestClient):
+    unknown = client.post("/api/v1/models/hide", json={"profileId": "ghost", "hidden": True})
+    assert unknown.status_code == 400
+    assert "Unknown Console profile" in unknown.json()["error"]["message"]
+
+    malformed = client.post("/api/v1/models/hide", json={"profileId": "openai", "hidden": "yes"})
+    assert malformed.status_code == 400
+    assert "hidden must be a boolean" in malformed.json()["error"]["message"]
+
+
+def test_hidden_profile_leaves_the_chat_dropdown_but_never_empties_it(client: TestClient):
+    configuration = app._configuration()
+
+    available = app._available_model_choices(configuration)
+    assert any(value.startswith("openai:") for value in available.values())
+
+    assert client.post("/api/v1/models/hide", json={"profileId": "openai", "hidden": True}).status_code == 200
+
+    # The profile is gone from the dropdown...
+    assert app._choice_available(configuration, "openai:gpt-5-mini") is False
+    # ...but hiding the only configured profile must not empty the dropdown.
+    fallback = app._available_model_choices(configuration)
+    assert any(value.startswith("openai:") for value in fallback.values())
+
+    assert client.post("/api/v1/models/hide", json={"profileId": "openai", "hidden": False}).status_code == 200
+    assert app._choice_available(configuration, "openai:gpt-5-mini") is True
+
+
+LEGACY_CONFIG = {
+    "mcp": {"rateLimits": {"server": {"requests": 5, "windowSeconds": 10}}},
+    "console": {
+        "defaultProfile": "openai",
+        "limits": {"toolRounds": 12},
+        "profiles": {
+            # Scalar-model layout as shipped by early config.example.json seeds.
+            "openai": {
+                "label": "OpenAI",
+                "model": "openai/gpt-5-mini",
+                "apiKeyEnv": "OPENAI_API_KEY",
+            },
+            "anthropic": {
+                "model": "anthropic/claude-sonnet-4-5",
+                "apiKeyEnv": "ANTHROPIC_API_KEY",
+            },
+        },
+    },
+}
+
+
+@pytest.fixture()
+def legacy_data_directory(tmp_path: Path) -> Path:
+    (tmp_path / "config.json").write_text(json.dumps(LEGACY_CONFIG), encoding="utf-8")
+    return tmp_path
+
+
+@pytest.fixture()
+def legacy_client(monkeypatch, legacy_data_directory: Path) -> TestClient:
+    monkeypatch.setattr(app, "DATA_DIRECTORY", legacy_data_directory)
+    monkeypatch.setattr(app, "_authenticated", lambda request: True)
+    return TestClient(app.chainlit_server)
+
+
+def test_remove_on_legacy_scalar_model_profile_is_supported(legacy_client: TestClient, legacy_data_directory: Path):
+    """A scalar-model profile must not fail with 'unsupported layout'.
+
+    The first mutation migrates it to the ``models`` map; afterwards the normal
+    rules apply (the last remaining model cannot be removed).
+    """
+
+    only_model = legacy_client.post("/api/v1/models/remove", json={"profileId": "anthropic", "modelId": "default"})
+    # The migration worked; the request now hits the regular single-model guard.
+    assert only_model.status_code == 400
+    assert "unsupported layout" not in only_model.json()["error"]["message"]
+    assert "last model" in only_model.json()["error"]["message"]
+
+    added = legacy_client.post(
+        "/api/v1/models/add",
+        json={"profileId": "anthropic", "modelId": "haiku", "label": "Haiku", "model": "anthropic/claude-haiku"},
+    )
+    assert added.status_code == 200
+
+    removed = legacy_client.post("/api/v1/models/remove", json={"profileId": "anthropic", "modelId": "default"})
+    assert removed.status_code == 200
+    profile = next(p for p in removed.json()["profiles"] if p["id"] == "anthropic")
+    assert [model["id"] for model in profile["models"]] == ["haiku"]
+    assert profile["defaultModel"] == "haiku"
+
+    root = json.loads((legacy_data_directory / "config.json").read_text(encoding="utf-8"))
+    anthropic = root["console"]["profiles"]["anthropic"]
+    assert anthropic["models"] == {"haiku": {"label": "Haiku", "model": "anthropic/claude-haiku"}}
+    assert "model" not in anthropic
+    assert anthropic["apiKeyEnv"] == "ANTHROPIC_API_KEY"
+    # The strict startup parser accepts the migrated file.
+    parse_console_configuration(root)
+
+
+def test_update_and_add_work_on_legacy_profiles_after_migration(legacy_client: TestClient, legacy_data_directory: Path):
+    relabeled = legacy_client.post(
+        "/api/v1/models/update",
+        json={"profileId": "openai", "modelId": "default", "label": "GPT-5 mini"},
+    )
+    assert relabeled.status_code == 200
+
+    added = legacy_client.post(
+        "/api/v1/models/add",
+        json={"profileId": "openai", "modelId": "o4-mini", "label": "o4 mini", "model": "openai/o4-mini"},
+    )
+    assert added.status_code == 200
+    models = {model["id"]: model for model in added.json()["profiles"][0]["models"]}
+    assert models["default"]["label"] == "GPT-5 mini"
+    assert models["default"]["model"] == "openai/gpt-5-mini"
+
+    root = json.loads((legacy_data_directory / "config.json").read_text(encoding="utf-8"))
+    openai_profile = root["console"]["profiles"]["openai"]
+    assert openai_profile["models"] == {
+        "default": {"label": "GPT-5 mini", "model": "openai/gpt-5-mini"},
+        "o4-mini": {"label": "o4 mini", "model": "openai/o4-mini"},
+    }
+    # The migrated file must satisfy the strict startup parser.
+    parsed = parse_console_configuration(root)
+    assert parsed.profile("openai").model_option("default").model == "openai/gpt-5-mini"
+
+
+def test_legacy_label_is_preserved_in_the_models_map(legacy_client: TestClient):
+    """The tolerant readers showed a legacy profile's model under the profile label."""
+
+    response = legacy_client.get("/api/v1/models")
+    assert response.status_code == 200
+    profiles = {profile["id"]: profile for profile in response.json()["profiles"]}
+    # Explicit label wins; an unlabeled legacy profile falls back to its id.
+    assert profiles["openai"]["models"][0]["label"] == "OpenAI"
+    assert profiles["anthropic"]["models"][0]["label"] == "anthropic"

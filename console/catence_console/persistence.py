@@ -283,6 +283,57 @@ class DisabledModelsStore:
             logger.exception("Could not enable Console model %s:%s", profile_id, model_id)
 
 
+class HiddenProfilesStore:
+    """Store which provider profiles the local user hid from the UI.
+
+    Profiles cannot be deleted from ``config.json`` while they still have a
+    model, so unused shipped profiles would otherwise be permanent noise on
+    the Models page and in the chat's Model dropdown. Hiding is per-user UI
+    state like disabled models: it lives here, never in shared configuration.
+    """
+
+    def __init__(self, data_directory: Path):
+        self.database_path = _database_path(data_directory)
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=5)
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+
+    def list(self) -> set[str]:
+        try:
+            with self._connect() as connection:
+                rows = connection.execute("SELECT profile_id FROM hidden_profiles").fetchall()
+        except sqlite3.Error:
+            logger.exception("Could not load hidden Console profiles")
+            return set()
+        return {row[0] for row in rows}
+
+    def add(self, profile_id: str) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO hidden_profiles (profile_id, updated_at)
+                    VALUES (?, ?)
+                    ON CONFLICT(profile_id) DO NOTHING
+                    """,
+                    (profile_id, datetime.now(UTC).isoformat()),
+                )
+        except sqlite3.Error:
+            logger.exception("Could not hide Console profile %s", profile_id)
+
+    def remove(self, profile_id: str) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "DELETE FROM hidden_profiles WHERE profile_id = ?",
+                    (profile_id,),
+                )
+        except sqlite3.Error:
+            logger.exception("Could not unhide Console profile %s", profile_id)
+
+
 def _json_object(value: str | None) -> dict[str, Any]:
     parsed = _json_object_or_none(value)
     return parsed if parsed is not None else {}
@@ -397,6 +448,10 @@ def _initialize_schema(database_path: Path) -> None:
                 "updated_at" TEXT NOT NULL,
                 PRIMARY KEY ("profile_id", "model_id")
             );
+            CREATE TABLE IF NOT EXISTS hidden_profiles (
+                "profile_id" TEXT NOT NULL PRIMARY KEY,
+                "updated_at" TEXT NOT NULL
+            );
             """
         )
 
@@ -456,3 +511,10 @@ def disabled_models_store(data_directory: Path) -> DisabledModelsStore:
 
     _initialize_schema(_database_path(data_directory))
     return DisabledModelsStore(data_directory)
+
+
+def hidden_profiles_store(data_directory: Path) -> HiddenProfilesStore:
+    """Return the hidden-profiles store used by in-app model management."""
+
+    _initialize_schema(_database_path(data_directory))
+    return HiddenProfilesStore(data_directory)
