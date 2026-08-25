@@ -135,8 +135,29 @@ describe('Catence Streamable HTTP server', () => {
     });
   });
 
-  it('reports 409 with a stable error code when a sync run is already active', async () => {
+  it('populates lastSync from completed runs via the read-only repository', async () => {
     const { paths, database } = await temporaryDatabase();
+    await database.run(
+      `INSERT INTO sync_runs (run_id, provider, from_date, started_at, completed_at, status, parser_version)
+       VALUES ($runId, 'garmin', '2026-08-01', now(), now(), 'completed', 1)`,
+      { runId: 'completed-run-1' },
+    );
+    await database.close();
+
+    const server = createCatenceHttpServer({ paths });
+    servers.push(server);
+    const origin = await listen(server);
+
+    const response = await fetch(`${origin}/api/v1/sync/status`);
+    expect(response.status).toBe(200);
+    const payload = (await response.json()) as {
+      lastSync: { lastCompletedAt: string | null; providers: Record<string, string> };
+    };
+    expect(payload.lastSync.providers.garmin).toBeTruthy();
+    expect(payload.lastSync.lastCompletedAt).toBe(payload.lastSync.providers.garmin);
+  });
+
+  it('reports 409 with a stable error code when a sync run is already active', async () => {    const { paths, database } = await temporaryDatabase();
     await database.close();
     const { mkdir, writeFile } = await import('node:fs/promises');
     await mkdir(path.join(paths.staging, 'garmin'), { recursive: true });

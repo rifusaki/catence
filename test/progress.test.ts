@@ -163,6 +163,36 @@ describe('sync run progress tracking', () => {
       await database.close();
     }
   });
+
+  it('syncProgress excludes a killed run whose heartbeat outlived the stale timeout', async () => {
+    // A container kill leaves the run row 'running' forever; it must not read
+    // as active or block new syncs once its heartbeat goes stale.
+    const { database } = await temporaryDatabase();
+    try {
+      const staleId = await database.beginRun('garmin', '2025-07-30');
+      await database.heartbeatRun(staleId, sampleState(staleId));
+      // heartbeatRun stamps now(); rewind both columns to simulate a run
+      // whose process died a day ago.
+      await database.run(
+        `UPDATE sync_run_progress SET heartbeat_at = heartbeat_at - INTERVAL 1 DAY WHERE run_id = $runId`,
+        { runId: staleId },
+      );
+      await database.run(`UPDATE sync_runs SET started_at = started_at - INTERVAL 1 DAY WHERE run_id = $runId`, {
+        runId: staleId,
+      });
+
+      const snapshot = await database.syncProgress();
+      expect(snapshot.running).toHaveLength(0);
+      expect(snapshot.recent[0]).toMatchObject({ runId: staleId });
+
+      // A fresh heartbeat on the same row reads as active again.
+      await database.heartbeatRun(staleId, sampleState(staleId));
+      const refreshed = await database.syncProgress();
+      expect(refreshed.running.map((state) => state.runId)).toEqual([staleId]);
+    } finally {
+      await database.close();
+    }
+  });
 });
 
 describe('sync run progress sidecars', () => {

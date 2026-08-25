@@ -157,7 +157,14 @@ export class CatenceDatabase implements WriteDataStore {
     return { runIds: stale.map((row) => row.run_id) };
   }
 
-  async syncProgress(): Promise<SyncProgressSnapshot> {
+  async syncProgress(timeoutMs: number = STALE_RUN_TIMEOUT_MS): Promise<SyncProgressSnapshot> {
+    // A run killed with its container (docker restart, OOM) keeps
+    // status='running' until something cleans it up, and that cleanup only
+    // runs inside a starting sync child — which the busy guard refuses to
+    // spawn while the row reads as active. Age-filtering here mirrors the
+    // sidecar contract: a heartbeat older than the stale timeout can never
+    // block a new run or disable the dashboard's Sync button forever.
+    const cutoff = new Date(Date.now() - timeoutMs).toISOString();
     const running = await this.rows<SyncProgressRow>(
       `SELECT runs.run_id, runs.provider,
          coalesce(progress.stage, 'starting') AS stage,
@@ -171,7 +178,9 @@ export class CatenceDatabase implements WriteDataStore {
        FROM sync_runs AS runs
        LEFT JOIN sync_run_progress AS progress USING (run_id)
        WHERE runs.status = 'running'
+         AND coalesce(progress.heartbeat_at, runs.started_at) > $cutoff
        ORDER BY runs.started_at DESC`,
+      { cutoff },
     );
     const recent = await this.rows<SyncProgressRow>(
       `SELECT progress.run_id, progress.provider, progress.stage, progress.current_step,

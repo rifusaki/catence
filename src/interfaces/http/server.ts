@@ -5,7 +5,6 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import {
   catenceRuntimeHealth,
   DashboardSnapshotService,
-  dataStatus,
   DetachedSyncBusyError,
   type DetachedSyncSpawner,
   DETACHED_SYNC_PROVIDERS,
@@ -13,7 +12,6 @@ import {
   loadCatalog,
   mergeOpenCodeGoConsoleProfiles,
   openReadOnlyRepository,
-  ReadOnlyDatabaseError,
   resolveAthlete,
   resolveCatalogPaths,
   startDetachedSync,
@@ -171,21 +169,33 @@ async function lastSyncSummary(paths: CatencePaths): Promise<LastSyncSummary | n
     return null;
   };
   try {
-    const status = await dataStatus(paths);
-    const runs = Array.isArray(status.syncRuns) ? (status.syncRuns as Array<Record<string, unknown>>) : [];
-    const completed = runs.filter((run) => String(run.status ?? '').startsWith('completed') && completedAtIso(run.completed_at));
-    const providers: Record<string, string> = {};
-    let lastCompletedAt: string | null = null;
-    for (const run of completed) {
-      const completedAt = completedAtIso(run.completed_at) as string;
-      const provider = String(run.provider ?? 'unknown');
-      if (!providers[provider] || providers[provider] < completedAt) providers[provider] = completedAt;
-      if (!lastCompletedAt || lastCompletedAt < completedAt) lastCompletedAt = completedAt;
+    // Read-only repository on purpose: it exposes per-run history (`syncRuns`)
+    // and degrades through the typed lock-conflict error while a detached
+    // sync holds DuckDB's single-writer lock. The write-capable dataStatus()
+    // would both block here and has no run history at all.
+    const repository = await openReadOnlyRepository(paths);
+    try {
+      const status = await repository.status();
+      const runs = Array.isArray(status.syncRuns) ? (status.syncRuns as Array<Record<string, unknown>>) : [];
+      const completed = runs.filter((run) => String(run.status ?? '').startsWith('completed') && completedAtIso(run.completed_at));
+      const providers: Record<string, string> = {};
+      let lastCompletedAt: string | null = null;
+      for (const run of completed) {
+        const completedAt = completedAtIso(run.completed_at) as string;
+        const provider = String(run.provider ?? 'unknown');
+        if (!providers[provider] || providers[provider] < completedAt) providers[provider] = completedAt;
+        if (!lastCompletedAt || lastCompletedAt < completedAt) lastCompletedAt = completedAt;
+      }
+      return { lastCompletedAt, providers, recentRuns: runs.slice(0, 5) };
+    } finally {
+      await repository.close();
     }
-    return { lastCompletedAt, providers, recentRuns: runs.slice(0, 5) };
-  } catch (error) {
-    if (error instanceof ReadOnlyDatabaseError) return null;
-    throw error;
+  } catch {
+    // Best-effort by contract: while a detached sync holds the single-writer
+    // DuckDB lock, even opening a snapshot fails cross-process. Progress (from
+    // sidecar heartbeats) must still reach the dashboard, so any failure here
+    // degrades to "no last-sync summary" instead of failing /sync/status.
+    return null;
   }
 }
 
@@ -310,7 +320,16 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
             }
           }
           const handle = await startSync(
-            { paths, athleteId: body.athleteId ?? 'local', provider: body.provider as never, from: body.from, refresh: body.refresh },
+            {
+              paths,
+              athleteId: body.athleteId ?? 'local',
+              provider: body.provider as never,
+              from: body.from,
+              refresh: body.refresh,
+              // The child resolves the athlete within the catalog, not within
+              // the athlete store this route resolved for locks and logs.
+              cliHome: catalogPaths ? catalogPaths.root : undefined,
+            },
             { spawnProcess: options.syncSpawnProcess },
           );
           json(response, 202, { ...handle, ...(discoveryWarning ? { warning: discoveryWarning } : {}), progressEndpoint: '/api/v1/sync/status' });

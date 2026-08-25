@@ -6,6 +6,7 @@ import type { SpawnOptions } from 'node:child_process';
 import { resolvePaths } from '../src/core/runtime/configuration.js';
 import { DetachedSyncBusyError, startDetachedSync } from '../src/elt/application/detached-sync.js';
 import { PROGRESS_SIDECAR_SUFFIX } from '../src/elt/storage/progress-sidecar.js';
+import { temporaryDatabase } from './helpers.js';
 
 async function temporaryStore() {
   const root = await mkdtemp(path.join(tmpdir(), 'catence-detached-sync-'));
@@ -58,7 +59,10 @@ describe('startDetachedSync', () => {
     expect(handle.logFile).toContain(path.join('logs', 'sync-alex-'));
     expect(captures).toHaveLength(1);
     const capture = captures[0]!;
-    expect(capture.command).toBe(process.execPath);
+    // Source checkouts launch the TypeScript CLI through the local tsx
+    // binary; built installs would use process.execPath with the dist entry.
+    expect(capture.command.endsWith('/tsx') || capture.command === process.execPath).toBe(true);
+    expect(capture.arguments_[0]).toMatch(/interfaces\/cli\/main\.[jt]s$/);
     const scriptIndex = capture.arguments_.indexOf('sync');
     expect(scriptIndex).toBeGreaterThan(0);
     expect(capture.arguments_).toEqual(expect.arrayContaining(['--home', paths.root, '--athlete', 'alex', 'sync', '--provider', 'garmin', '--from', '2026-07-01', '--refresh']));
@@ -80,6 +84,26 @@ describe('startDetachedSync', () => {
       runId: 'active-run',
     });
     expect(captures).toHaveLength(0);
+  });
+
+  it('starts despite a stale killed run still marked running in the database', async () => {
+    // A container kill mid-sync leaves status='running' behind; the busy guard
+    // must treat a heartbeat older than the stale timeout as non-blocking.
+    const { paths, database } = await temporaryDatabase();
+    try {
+      const staleId = await database.beginRun('garmin', '2025-07-30');
+      await database.run('UPDATE sync_runs SET started_at = started_at - INTERVAL 1 DAY WHERE run_id = $runId', {
+        runId: staleId,
+      });
+    } finally {
+      await database.close();
+    }
+    const { spawn, captures } = fakeSpawner();
+
+    const handle = await startDetachedSync({ paths, athleteId: 'alex' }, { spawnProcess: spawn });
+
+    expect(handle).toMatchObject({ started: true, athleteId: 'alex' });
+    expect(captures).toHaveLength(1);
   });
 
   it('validates provider and date inputs before touching the filesystem', async () => {
