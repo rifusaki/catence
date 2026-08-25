@@ -142,7 +142,7 @@ npm run catence-data -- --home "$CATENCE_HOME" sync --athlete alex --provider ga
 npm run catence-data -- --home "$CATENCE_HOME" build-retrieval-index --athlete alex
 
 # Hot-reload loop for MCP iteration (restarts on src/ change)
-npx tsx watch src/interfaces/mcp/main.ts -- --home "$CATENCE_HOME"
+npx tsx watch src/interfaces/mcp/main.ts --home "$CATENCE_HOME"
 
 # Tests (DuckDB integration tests use a 15s per-test timeout)
 npm test
@@ -157,15 +157,18 @@ npm run check
 The Console normally auto-starts a matching packaged runtime (`npx catence@<pinned>`). For development, point it at your live `tsx` runtime instead via `--mcp-url`:
 
 ```sh
-# Terminal 1 — live MCP/ELT runtime on loopback
-npx tsx watch src/interfaces/mcp/main.ts -- serve --home "$CATENCE_HOME" --host 127.0.0.1 --port 8787
+# Terminal 1 — live MCP/ELT runtime on loopback (no `--` separator; tsx
+# forwards arguments verbatim, so a bare `--` would reach the CLI unparsed)
+npx tsx watch src/interfaces/mcp/main.ts serve --home "$CATENCE_HOME" --host 127.0.0.1 --port 8787
 
-# Terminal 2 — Console using that runtime (no auto-started `npx` runtime)
+# Terminal 2 — Console using that runtime (no auto-started `npx` runtime).
+# The `console` npm script already ends in the `serve` subcommand, so extra
+# arguments after `--` are appended AFTER `serve` — never repeat it here.
 export CATENCE_CONSOLE_USERNAME='coach'
 export CATENCE_CONSOLE_PASSWORD_HASH="$(uv run --project console catence-console auth hash-password)"
 export CHAINLIT_AUTH_SECRET="$(openssl rand -hex 32)"
 export OPENAI_API_KEY='…'          # or ANTHROPIC_API_KEY / OPENCODE_API_KEY …
-npm run console -- serve --home "$CATENCE_HOME" --mcp-url http://127.0.0.1:8787/mcp --ui-port 8000
+npm run console -- --home "$CATENCE_HOME" --mcp-url http://127.0.0.1:8787/mcp --ui-port 8000
 # open http://127.0.0.1:8000
 ```
 
@@ -264,7 +267,7 @@ services:
                --home /data --ui-host 0.0.0.0 --ui-port 8000
                --mcp-host 0.0.0.0 --mcp-port 8787"
       # for no-restart TS hot-reload, replace the command with:
-      # npx tsx watch src/interfaces/mcp/main.ts -- serve --home /data --host 0.0.0.0 --port 8787
+      # npx tsx watch src/interfaces/mcp/main.ts serve --home /data --host 0.0.0.0 --port 8787
       # and run Console separately with --mcp-url
 
 volumes:
@@ -293,7 +296,7 @@ docker compose -f docker-compose.dev.yml --env-file .env.dev exec console \
   catence-data --home /data status --athlete alex
 ```
 
-An alternative that avoids running `npm` inside the mount loop is to keep the runtime on the host entirely: run `npx tsx watch src/interfaces/mcp/main.ts -- serve --home /srv/catence-dev ...` on the host and start the Console container with `--mcp-url http://host.docker.internal:8787/mcp` (or the host's Tailscale IP) and `--env-file .env.dev` — the same `--mcp-url` trick from the local Console section.
+An alternative that avoids running `npm` inside the mount loop is to keep the runtime on the host entirely: run `npx tsx watch src/interfaces/mcp/main.ts serve --home /srv/catence-dev ...` on the host and start the Console container with `--mcp-url http://host.docker.internal:8787/mcp` (or the host's Tailscale IP) and `--env-file .env.dev` — the same `--mcp-url` trick from the local Console section.
 
 ## Where secrets and model definitions live (dev and Docker)
 
@@ -323,3 +326,8 @@ Recommended dev defaults:
 - **Doctor reports runtime unreachable** — the Console was started without `--mcp-url` and its auto-started runtime is on a different port. Start the runtime explicitly and pass `--mcp-url http://127.0.0.1:8787/mcp` to the Console, or use `uv run --project console catence-console doctor --home "$CATENCE_HOME" --mcp-url http://127.0.0.1:8787/mcp`.
 - **Docker `run` container has a separate loopback** — `docker compose run` cannot see a `docker compose exec` MCP server. Use `exec` for `doctor`/`sync` against the running container, or use `run` only for one-off `setup`/`secret set` with `--value-stdin`.
 - **Refusing to initialize** — the data home contains unrelated files. The error lists them; only `config.json`, `console/`, and Chainlit's `.files/`, `.chainlit/`, `public/` are allowed alongside a catalog.
+- **Is a sync actually running? (no deploy scaffold needed)** — three checks, all safe while a sync holds the write lock:
+  1. Runtime status API: `curl -s "http://127.0.0.1:8787/api/v1/sync/status?athleteId=<id>" | jq '.progress.running'` (through the Console instead: `/api/v1/sync/status` behind your login).
+  2. Detached-child log files: `ls -t "$CATENCE_HOME/logs" | head`. A successful `POST /api/v1/sync` creates `logs/sync-<athlete>-<stamp>.log` before spawning, so an absent or empty `logs/` directory proves no detached sync ever started.
+  3. The MCP progress tools (`catence_sync_progress`) read the same heartbeats.
+- **Models page clutter** — unused shipped profiles can be hidden per device from the Models page (`Hide` on the profile card); hidden profiles disappear from the chat Model dropdown but stay configured, and are restored with `Unhide`. Hiding lives in the Console database, never in `config.json`.
