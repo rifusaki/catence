@@ -193,6 +193,36 @@ export class CatenceDatabase implements WriteDataStore {
     return { running: running.map(toSyncProgressState), recent: recent.map(toSyncProgressState) };
   }
 
+  async deleteMissingCalendarEntities(
+    provider: Provider,
+    entityTypes: readonly string[],
+    keepRemoteIds: readonly string[],
+    minOccurredOn: string,
+  ): Promise<void> {
+    // Calendar entities (joined races, scheduled workouts) are mutable and
+    // deletable upstream. Re-fetches upsert survivors via remote_id; this
+    // removes in-window rows absent from the latest authoritative listing so
+    // upstream deletions propagate instead of leaving ghosts forever. Rows
+    // without a date are preserved (they predate strict dating).
+    if (!entityTypes.length) return;
+    const values: Record<string, string> = { provider, minOccurredOn };
+    const typePlaceholders = entityTypes.map((name, index) => {
+      values[`type${index}`] = name;
+      return `$type${index}`;
+    });
+    let keepClause = '';
+    if (keepRemoteIds.length) {
+      keepClause = ` AND remote_id NOT IN (${keepRemoteIds.map((_, index) => `$keep${index}`).join(', ')})`;
+      keepRemoteIds.forEach((id, index) => { values[`keep${index}`] = id; });
+    }
+    for (const table of ['source_entities', 'domain_entities'] as const) {
+      await this.run(
+        `DELETE FROM ${table} WHERE provider = $provider AND entity_type IN (${typePlaceholders}) AND occurred_on >= $minOccurredOn${keepClause}`,
+        values,
+      );
+    }
+  }
+
   async addError(runId: string, provider: Provider, endpoint: string, remoteId: string | null, message: string, retryable: boolean): Promise<void> {
     await this.run(
       `INSERT INTO normalization_errors (error_id, run_id, provider, endpoint, remote_id, message, retryable)

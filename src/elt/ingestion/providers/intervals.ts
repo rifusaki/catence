@@ -82,6 +82,10 @@ export class IntervalsExtractor {
         const payload = await this.capture(runId, 'events', null, window, async () => this.getCollection('events', resolvedAthleteId, window.fromDate, window.toDate));
         if (payload === undefined) continue;
         await this.importEntities('event', 'events', payload, null, runId);
+        // The listing is authoritative: events deleted upstream must not
+        // linger as ghosts in the store once this sync succeeded.
+        const seenIds = asItems(payload).map((item) => idOf(item, '')).filter(Boolean);
+        await this.database.deleteMissingCalendarEntities('intervals', ['event'], seenIds, window.fromDate);
         continue;
       }
       if (!activityWindow) continue;

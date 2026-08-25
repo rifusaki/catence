@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { createInterface } from 'node:readline';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,6 +44,44 @@ type SyncResult = {
 
 function packageRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+}
+
+// Mirrors python/catence/providers/garmin/worker.py fetch windows: the events
+// listing looks back a year and scheduled workouts start three months ago, so
+// only rows inside those windows are authoritative for deletion sweeps.
+const GARMIN_EVENTS_LOOKBACK_DAYS = 365;
+const GARMIN_SCHEDULED_MONTHS_BACK = 3;
+
+/**
+ * Delete calendar entities that the latest Garmin listing no longer contains.
+ * The staging manifest is the authority on which ids were just fetched; any
+ * in-window row of the same type missing from it was deleted (or un-enrolled)
+ * upstream and would otherwise linger as a ghost.
+ */
+async function reconcileGarminCalendarEntities(database: CatenceDatabase, stagedManifestPath: string): Promise<void> {
+  const events: string[] = [];
+  const scheduled: string[] = [];
+  const file = createReadStream(stagedManifestPath, { encoding: 'utf8' });
+  const lines = createInterface({ input: file, crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line.trim()) continue;
+    let record: unknown;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue; // The importer owns malformed-line reporting.
+    }
+    const candidate = record as { kind?: unknown; provider?: unknown; entityType?: unknown; remoteId?: unknown };
+    if (candidate?.kind !== 'source_entity' || candidate.provider !== 'garmin') continue;
+    if (candidate.entityType === 'event' && typeof candidate.remoteId === 'string') events.push(candidate.remoteId);
+    if (candidate.entityType === 'scheduled_workout' && typeof candidate.remoteId === 'string') scheduled.push(candidate.remoteId);
+  }
+
+  const now = new Date();
+  const eventCutoff = new Date(now.getTime() - GARMIN_EVENTS_LOOKBACK_DAYS * 86_400_000).toISOString().slice(0, 10);
+  const scheduledCutoff = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - GARMIN_SCHEDULED_MONTHS_BACK, 1)).toISOString().slice(0, 10);
+  await database.deleteMissingCalendarEntities('garmin', ['event'], events, eventCutoff);
+  await database.deleteMissingCalendarEntities('garmin', ['scheduled_workout'], scheduled, scheduledCutoff);
 }
 
 type GarminWorkerOutcome = { code: number | null; signal: NodeJS.Signals | null };
@@ -335,6 +375,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       if (!guard.interrupted) {
         if (!existsSync(output)) throw new Error('Garmin staging worker completed without writing a JSONL manifest.');
         await importJsonl(database, runId, output, log);
+        await reconcileGarminCalendarEntities(database, output);
         if (provider === 'garmin') {
           try {
             await backfillGarminSwimLengths(database, paths, runId, log);
