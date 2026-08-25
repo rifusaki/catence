@@ -71,6 +71,7 @@ export const garminReadRegistry = registry('garmin', [
   ['activity_power_zones', 'activity', 'activity_zone'], ['activity_exercise_sets', 'activity', 'activity_exercise_set'], ['activity_gear', 'activity', 'activity_gear'],
   ['activity_original', 'activity', 'activity_file'], ['activity_tcx', 'activity', 'activity_file'], ['activity_gpx', 'activity', 'activity_file'], ['activity_kml', 'activity', 'activity_file'],
   ['activity_csv', 'activity', 'activity_file'], ['workouts', 'collection', 'workout'], ['scheduled_workouts', 'date_range', 'scheduled_workout'],
+  ['events', 'collection', 'event'],
   ['training_plans', 'collection', 'training_plan'], ['goals', 'collection', 'goal'], ['personal_records', 'singleton', 'personal_record'],
   ['earned_badges', 'collection', 'badge'], ['available_badges', 'collection', 'badge'], ['challenges', 'collection', 'challenge'],
   ['gear', 'collection', 'gear'], ['golf_summary', 'collection', 'golf_scorecard'], ['golf_user_stats', 'singleton', 'golf_user_stat'],

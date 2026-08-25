@@ -141,7 +141,10 @@ def test_scheduled_workout_calendar_items_stage_per_item_and_skip_empty_months(t
             self.calls.append((year, month))
             # Real calendar-service shape: a grid wrapper; exactly one month has items.
             if (year, month) == (2026, 8):
-                return {"calendarItems": [{"workoutId": 77, "date": "2026-08-10", "workoutName": "Threshold"}]}
+                return {"calendarItems": [
+                    {"workoutId": 77, "itemType": "workout", "date": "2026-08-10", "workoutName": "Threshold"},
+                    {"id": 555, "itemType": "activity", "date": "2026-08-11", "title": "Morning Ride", "distance": 32100},
+                ]}
             return {"calendarItems": []}
 
     writer = Writer()
@@ -157,6 +160,39 @@ def test_scheduled_workout_calendar_items_stage_per_item_and_skip_empty_months(t
     assert occurred_on == "2026-08-10"
     assert remote_id_value == "77"
     assert item["workoutName"] == "Threshold"
+    # itemType 'activity' entries are echoes of recorded activities; the
+    # activities pipeline owns those, so they never stage here.
+    assert not [entity for entity in writer.entities if entity[0] == "scheduled_workout" and "555" in str(entity[1])]
+
+
+def test_garmin_events_stage_per_item_from_a_one_year_lookback(tmp_path):
+    class EventsApi:
+        def __init__(self) -> None:
+            self.start_dates: list[str] = []
+
+        def get_events(self, start_date: str):
+            self.start_dates.append(start_date)
+            return [
+                {"id": 123, "eventName": "Race Day", "date": "2026-09-13", "eventType": "running", "location": "Berlin, DE", "shareableEventUuid": "abc-123"},
+                {"id": 124, "eventName": "Old Race", "date": "2026-02-01", "eventType": "cycling", "location": "Dresden, DE", "shareableEventUuid": "def-456"},
+            ]
+
+    writer = Writer()
+    api = EventsApi()
+    worker = GarminStagingWorker(api, writer, tmp_path)
+
+    worker._collections()
+
+    # Lookback is GARMIN_EVENTS_LOOKBACK_DAYS before today, so recently
+    # finished races stay associatable with their activities.
+    assert len(api.start_dates) == 1
+    lookback = date.fromisoformat(api.start_dates[0])
+    assert 0 < (date.today() - lookback).days <= 400
+    staged = [entity for entity in writer.entities if entity[0] == "event"]
+    assert len(staged) == 2
+    by_id = {entity[1]: entity for entity in staged}
+    assert by_id["123"][5] == "2026-09-13"
+    assert by_id["124"][5] == "2026-02-01"
 
 
 def test_historical_only_sync_skips_non_historical_endpoints_and_respects_activity_window(tmp_path):

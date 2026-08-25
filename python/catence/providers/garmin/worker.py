@@ -115,6 +115,11 @@ def remote_id(payload: dict[str, Any], fallback: str) -> str:
 SCHEDULED_WORKOUTS_MONTHS_BACK = 3
 SCHEDULED_WORKOUTS_MONTHS_AHEAD = 12
 
+# Joined Garmin events (races etc.) share the same cheap-calendar profile:
+# one GET per sync, looking back a year so recently finished races remain
+# associatable with their activities.
+GARMIN_EVENTS_LOOKBACK_DAYS = 365
+
 
 def shift_month(base: date, offset: int) -> date:
     """Return the first day of the month `offset` months from `base`'s month."""
@@ -722,6 +727,7 @@ class GarminStagingWorker:
         today = date.today()
         calls = {
             "workouts": ("get_workouts", (), "workout"),
+            "garmin_events": ("get_events", ((today - timedelta(days=GARMIN_EVENTS_LOOKBACK_DAYS)).isoformat(),), "event"),
             "goals": ("get_goals", (), "goal"), "golf_summary": ("get_golf_summary", (), "golf_scorecard"),
         }
         months = [shift_month(today, offset) for offset in range(-SCHEDULED_WORKOUTS_MONTHS_BACK, SCHEDULED_WORKOUTS_MONTHS_AHEAD + 1)]
@@ -751,6 +757,11 @@ class GarminStagingWorker:
                 scope={"month": month.isoformat()},
             )
             items = payload.get("calendarItems") if isinstance(payload, Mapping) else payload
+            # itemType 'activity' entries are echoes of already-recorded
+            # activities (the activities endpoint owns those); only true
+            # scheduled workout templates belong in this entity family.
+            if items:
+                items = [item for item in items if isinstance(item, Mapping) and item.get("itemType") == "workout"]
             if items:
                 self._entity("scheduled_workouts", "scheduled_workout", items, raw_hash)
             if self.progress is not None:
