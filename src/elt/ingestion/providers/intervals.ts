@@ -4,7 +4,7 @@ import type { CatenceDatabase } from '../../storage/database.js';
 import type { CatencePaths } from '../../../contracts/runtime.js';
 import { stableJsonHash, storeArtifact, storeJsonArtifact } from '../../storage/artifacts.js';
 import { importRecord, queueWorkItem, completeWorkItem, failWorkItem } from '../importer.js';
-import { intervalsActivityReadEndpoints, intervalsSecondaryReadRegistry, assertReadOnlyRegistry } from './registry.js';
+import { intervalsActivityReadEndpoints, intervalsSecondaryReadRegistry, intervalsEventSyncWindow, assertReadOnlyRegistry } from './registry.js';
 import { intervalsStreamsToSamples, writeParquetSamples } from '../../streams.js';
 import type { SourceEntity } from '../../../contracts/staging.js';
 import type { SyncLogger } from '../../../core/logging.js';
@@ -74,6 +74,16 @@ export class IntervalsExtractor {
 
     for (const endpoint of intervalsSecondaryReadRegistry) {
       if (endpoint.name === 'athlete') continue;
+      // Calendar events straddle today (past for activity association,
+      // future for planning); they must not inherit the cursor-bounded
+      // activity window, which always ends at today.
+      if (endpoint.name === 'events') {
+        const window = intervalsEventSyncWindow();
+        const payload = await this.capture(runId, 'events', null, window, async () => this.getCollection('events', resolvedAthleteId, window.fromDate, window.toDate));
+        if (payload === undefined) continue;
+        await this.importEntities('event', 'events', payload, null, runId);
+        continue;
+      }
       if (!activityWindow) continue;
       const { fromDate, toDate } = activityWindow;
       const payload = await this.capture(runId, endpoint.name, null, { fromDate, toDate }, async () => this.getCollection(endpoint.name, resolvedAthleteId, fromDate, toDate));

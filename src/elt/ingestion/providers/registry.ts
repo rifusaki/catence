@@ -27,7 +27,27 @@ export const intervalsReadRegistry = registry('intervals', [
  * supplies the separately named training calculations without duplicating
  * Garmin's activity detail, files, streams, or account data.
  */
-export const intervalsSecondaryReadRegistry = intervalsReadRegistry.filter((endpoint) => endpoint.name === 'athlete' || endpoint.name === 'activities');
+export const intervalsSecondaryReadRegistry = intervalsReadRegistry.filter(
+  (endpoint) =>
+    endpoint.name === 'athlete' || endpoint.name === 'activities' || endpoint.name === 'events'
+);
+
+/** How far back and ahead of today the planned-events fetch reaches. */
+export const EVENT_WINDOW_PAST_DAYS = 365;
+export const EVENT_WINDOW_FUTURE_DAYS = 365;
+
+/**
+ * Deliberately cursor-free: activities chase a past-only incremental window,
+ * while calendar events must straddle today so upcoming races and recently
+ * completed ones (associatable with their finished activities) both arrive.
+ */
+export function intervalsEventSyncWindow(now: Date = new Date()): { fromDate: string; toDate: string } {
+  const dayMs = 86_400_000;
+  return {
+    fromDate: new Date(now.getTime() - EVENT_WINDOW_PAST_DAYS * dayMs).toISOString().slice(0, 10),
+    toDate: new Date(now.getTime() + EVENT_WINDOW_FUTURE_DAYS * dayMs).toISOString().slice(0, 10),
+  };
+}
 
 export const intervalsActivityReadEndpoints = [
   'activity', 'streams', 'intervals', 'map', 'weather', 'weather_summary', 'best_efforts', 'power_curve', 'pace_curve', 'hr_curve',

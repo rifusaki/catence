@@ -2,7 +2,7 @@ import hashlib
 import json
 from datetime import date
 
-from python.catence.providers.garmin.worker import GarminStagingWorker
+from python.catence.providers.garmin.worker import GarminStagingWorker, shift_month
 
 
 class Writer:
@@ -126,7 +126,37 @@ def test_range_limited_endpoints_are_chunked_and_scheduled_workouts_receive_a_mo
     assert len(menstrual_calls) == 3
     assert all((date.fromisoformat(arguments[1]) - date.fromisoformat(arguments[0])).days < 90 for arguments in menstrual_calls)
     scheduled = [arguments for name, arguments in api.calls if name == "get_scheduled_workouts"]
-    assert scheduled == [(date.today().year, date.today().month)]
+    # Months run from SCHEDULED_WORKOUTS_MONTHS_BACK to _AHEAD relative to
+    # today, each requested exactly once, oldest first.
+    expected_months = [shift_month(date.today(), offset) for offset in range(-3, 13)]
+    assert scheduled == [(month.year, month.month) for month in expected_months]
+
+
+def test_scheduled_workout_calendar_items_stage_per_item_and_skip_empty_months(tmp_path):
+    class CalendarApi:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+
+        def get_scheduled_workouts(self, year: int, month: int):
+            self.calls.append((year, month))
+            # Real calendar-service shape: a grid wrapper; exactly one month has items.
+            if (year, month) == (2026, 8):
+                return {"calendarItems": [{"workoutId": 77, "date": "2026-08-10", "workoutName": "Threshold"}]}
+            return {"calendarItems": []}
+
+    writer = Writer()
+    api = CalendarApi()
+    worker = GarminStagingWorker(api, writer, tmp_path)
+
+    worker._collections()
+
+    assert len(api.calls) == 16  # months back + current + months ahead
+    staged = [entity for entity in writer.entities if entity[0] == "scheduled_workout"]
+    assert len(staged) == 1
+    endpoint, remote_id_value, item, raw_hash, parent, occurred_on, _kwargs = staged[0]
+    assert occurred_on == "2026-08-10"
+    assert remote_id_value == "77"
+    assert item["workoutName"] == "Threshold"
 
 
 def test_historical_only_sync_skips_non_historical_endpoints_and_respects_activity_window(tmp_path):

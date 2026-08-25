@@ -109,6 +109,19 @@ def remote_id(payload: dict[str, Any], fallback: str) -> str:
     return fallback
 
 
+# Scheduled workouts are tiny calendar payloads (one GET per month), so a year
+# of lookahead costs little next to a normal Garmin sync. Months back keep
+# recently completed schedules associatable with their finished activities.
+SCHEDULED_WORKOUTS_MONTHS_BACK = 3
+SCHEDULED_WORKOUTS_MONTHS_AHEAD = 12
+
+
+def shift_month(base: date, offset: int) -> date:
+    """Return the first day of the month `offset` months from `base`'s month."""
+    total = base.year * 12 + (base.month - 1) + offset
+    return date(total // 12, total % 12 + 1, 1)
+
+
 def payload_date(payload: Mapping[str, Any]) -> str | None:
     """Return the first ISO calendar day exposed by a Garmin payload."""
     for key in ("calendarDate", "date", "until", "from", "timestamp", "timestampLocal", "startTimestampGMT"):
@@ -708,12 +721,13 @@ class GarminStagingWorker:
     def _collections(self) -> None:
         today = date.today()
         calls = {
-            "workouts": ("get_workouts", (), "workout"), "scheduled_workouts": ("get_scheduled_workouts", (today.year, today.month), "scheduled_workout"),
+            "workouts": ("get_workouts", (), "workout"),
             "goals": ("get_goals", (), "goal"), "golf_summary": ("get_golf_summary", (), "golf_scorecard"),
         }
+        months = [shift_month(today, offset) for offset in range(-SCHEDULED_WORKOUTS_MONTHS_BACK, SCHEDULED_WORKOUTS_MONTHS_AHEAD + 1)]
         if self.progress is not None:
             self.progress.set_stage("collections")
-            self.progress.advance(total=len(calls))
+            self.progress.advance(total=len(calls) + len(months))
         for index, (endpoint, (method, arguments, entity_type)) in enumerate(calls.items(), start=1):
             self._check_interrupted()
             if self.progress is not None:
@@ -723,3 +737,21 @@ class GarminStagingWorker:
                 self._entity(endpoint, entity_type, payload, raw_hash)
             if self.progress is not None:
                 self.progress.advance(completed=index)
+        # Scheduled workouts span past-to-future months so upcoming sessions
+        # surface ahead of time and recently completed ones stay associatable
+        # with their finished activities. The calendar service answers each
+        # month with a grid wrapper whose items live under `calendarItems`;
+        # empty months must stage nothing, and real items stage one row each
+        # with their own calendar date.
+        for month_index, month in enumerate(months, start=1):
+            self._check_interrupted()
+            payload, raw_hash = self._capture(
+                "scheduled_workouts",
+                lambda month=month: self.api.get_scheduled_workouts(month.year, month.month),
+                scope={"month": month.isoformat()},
+            )
+            items = payload.get("calendarItems") if isinstance(payload, Mapping) else payload
+            if items:
+                self._entity("scheduled_workouts", "scheduled_workout", items, raw_hash)
+            if self.progress is not None:
+                self.progress.advance(completed=len(calls) + month_index)
