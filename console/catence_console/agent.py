@@ -23,6 +23,11 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 from .config import DEFAULT_TOOL_RESULT_CHARACTER_LIMIT, DEFAULT_TOOL_ROUND_LIMIT, ProviderProfile
+from .generation_sidecar import (
+    finish_generation_sidecar,
+    start_generation_sidecar,
+    update_generation_sidecar,
+)
 from .persistence import SavedToolCall, ToolCallStore
 
 SYSTEM_PROMPT = """You are a careful endurance-training data assistant.
@@ -261,6 +266,27 @@ def _scoped_tool_arguments(name: str, arguments: dict[str, Any], athlete_id: str
     return arguments
 
 
+async def _emit_reasoning_step(
+    text: str, *, parent_id: str | None = None
+) -> None:
+    """Best-effort display of a model's thinking/reasoning tokens.
+
+    Rendered as a collapsed chain-of-thought step so the user can tell the
+    agent is still reasoning (not stalled). Never raised: a display failure
+    must not break the turn.
+    """
+
+    try:
+        step = cl.Step(
+            name="Reasoning", type="reasoning", default_open=False, parent_id=parent_id
+        )
+        step.output = text
+        await step.send()
+    except Exception:
+        # Display is optional; ignore any context/send failure.
+        pass
+
+
 async def _invoke_tool(
     session: ClientSession,
     name: str,
@@ -352,6 +378,9 @@ async def respond(
                     if tool_history:
                         messages.insert(1, {"role": "system", "content": tool_history})
 
+                start_generation_sidecar(thread_id)
+                tool_calls_total = 0
+
                 for _ in range(tool_round_limit):
                     options: dict[str, Any] = {
                         **profile.litellm_options(model_id),
@@ -366,7 +395,17 @@ async def respond(
                     message = completion.choices[0].message
                     content = getattr(message, "content", None)
                     tool_calls = list(getattr(message, "tool_calls", None) or [])
+                    reasoning = (
+                        getattr(message, "reasoning_content", None)
+                        or getattr(message, "reasoning", None)
+                        or getattr(message, "thinking", None)
+                    )
+                    if reasoning:
+                        await _emit_reasoning_step(reasoning, parent_id=step_parent_id)
                     if not tool_calls:
+                        finish_generation_sidecar(
+                            thread_id, stage="completed", tool_call_count=tool_calls_total
+                        )
                         return content or "The provider finished without a written response."
 
                     messages.append(
@@ -404,8 +443,17 @@ async def respond(
                                 "content": json.dumps(payload, ensure_ascii=False, default=str),
                             }
                         )
+                    tool_calls_total += len(tool_calls)
+                    update_generation_sidecar(
+                        thread_id,
+                        tool_call_count=tool_calls_total,
+                        last_tool=f"Catence · {name}",
+                    )
 
     except BaseExceptionGroup as group:
         raise _unwrap_exception_group(group) from None
 
+    finish_generation_sidecar(
+        thread_id, stage="completed", tool_call_count=tool_calls_total
+    )
     return f"I stopped after {tool_round_limit} Catence tool calls. Please narrow the question or raise the tool-round limit in settings."

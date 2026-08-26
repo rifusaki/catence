@@ -20,6 +20,7 @@ import {
   type CatencePaths,
 } from '../../runtime/index.js';
 import { createCatenceMcpServer } from '../mcp/server.js';
+import { generationStatus } from './generation-status.js';
 
 const MAX_REQUEST_BYTES = 1_000_000;
 
@@ -368,6 +369,34 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           json(response, 200, { athleteId, progress: await syncProgress(paths), lastSync: await lastSyncSummary(paths) });
         } catch (error) {
           json(response, 400, { error: { code: 'sync_status_unavailable', message: error instanceof Error ? error.message : String(error) } });
+        }
+        return;
+      }
+
+      if (
+        pathname.startsWith('/api/v1/threads/') &&
+        pathname.endsWith('/generation') &&
+        request.method === 'GET'
+      ) {
+        try {
+          const segments = pathname.split('/').filter(Boolean);
+          const threadId = segments[segments.length - 2];
+          if (!threadId) throw new Error('Missing threadId in request path.');
+          const base = (catalogPaths ?? staticPaths ?? resolveCatalogPaths()) as {
+            root?: string;
+          } | null;
+          const root = base?.root;
+          if (!root || typeof root !== 'string') {
+            throw new Error('No Catence data store is configured.');
+          }
+          json(response, 200, await generationStatus(root, threadId));
+        } catch (error) {
+          json(response, 400, {
+            error: {
+              code: 'generation_status_unavailable',
+              message: error instanceof Error ? error.message : String(error)
+            }
+          });
         }
         return;
       }
