@@ -165,17 +165,19 @@ def test_scheduled_workout_calendar_items_stage_per_item_and_skip_empty_months(t
     assert not [entity for entity in writer.entities if entity[0] == "scheduled_workout" and "555" in str(entity[1])]
 
 
-def test_garmin_events_stage_per_item_from_a_one_year_lookback(tmp_path):
+def test_garmin_events_default_to_a_short_lookback_and_paginate(tmp_path):
     class EventsApi:
         def __init__(self) -> None:
-            self.start_dates: list[str] = []
+            self.calls: list[tuple[str, int, int]] = []
 
-        def get_events(self, start_date: str):
-            self.start_dates.append(start_date)
-            return [
-                {"id": 123, "eventName": "Race Day", "date": "2026-09-13", "eventType": "running", "location": "Berlin, DE", "shareableEventUuid": "abc-123"},
-                {"id": 124, "eventName": "Old Race", "date": "2026-02-01", "eventType": "cycling", "location": "Dresden, DE", "shareableEventUuid": "def-456"},
-            ]
+        def get_events(self, start_date: str, limit: int = 100, page: int = 1):
+            self.calls.append((start_date, limit, page))
+            if page == 1:
+                return [
+                    {"id": 123, "eventName": "Race Day", "date": "2026-09-13", "eventType": "running", "location": "Berlin, DE", "shareableEventUuid": "abc-123"},
+                    {"id": 124, "eventName": "Old Race", "date": "2026-02-01", "eventType": "cycling", "location": "Dresden, DE", "shareableEventUuid": "def-456"},
+                ]
+            return []  # A short final page stops pagination after one call.
 
     writer = Writer()
     api = EventsApi()
@@ -183,17 +185,37 @@ def test_garmin_events_stage_per_item_from_a_one_year_lookback(tmp_path):
 
     worker._collections()
 
-    # Lookback is GARMIN_EVENTS_LOOKBACK_DAYS before today, so recently
-    # finished races stay associatable with their activities.
-    assert len(api.start_dates) == 1
-    lookback = date.fromisoformat(api.start_dates[0])
-    assert 0 < (date.today() - lookback).days <= 400
+    # Default lookback is EVENTS_PAST_DAYS before today.
+    assert len(api.calls) == 1
+    start_date, limit, page = api.calls[0]
+    assert (date.today() - date.fromisoformat(start_date)).days == 30
+    assert (limit, page) == (100, 1)
     staged = [entity for entity in writer.entities if entity[0] == "event"]
     assert len(staged) == 2
     by_id = {entity[1]: entity for entity in staged}
     assert by_id["123"][5] == "2026-09-13"
     assert by_id["124"][5] == "2026-02-01"
 
+
+def test_garmin_events_fetch_follows_pagination_until_a_short_page(tmp_path):
+    class PagingApi:
+        def __init__(self) -> None:
+            self.pages: list[int] = []
+
+        def get_events(self, _start_date: str, limit: int = 100, page: int = 1):
+            self.pages.append(page)
+            count = limit if page == 1 else 20  # A short final page stops pagination.
+            return [{"id": f"{page}-{index}", "eventName": f"E{index}", "date": "2026-09-13"} for index in range(count)]
+
+    writer = Writer()
+    api = PagingApi()
+    worker = GarminStagingWorker(api, writer, tmp_path)
+
+    worker._fetch_garmin_events("2025-08-25")
+
+    assert api.pages == [1, 2]
+    staged = [entity for entity in writer.entities if entity[0] == "event"]
+    assert len(staged) == 120
 
 def test_historical_only_sync_skips_non_historical_endpoints_and_respects_activity_window(tmp_path):
     writer = Writer()

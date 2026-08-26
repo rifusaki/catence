@@ -78,7 +78,7 @@ export class IntervalsExtractor {
       // future for planning); they must not inherit the cursor-bounded
       // activity window, which always ends at today.
       if (endpoint.name === 'events') {
-        const window = intervalsEventSyncWindow();
+        const window = await this.resolveEventsSyncWindow();
         const payload = await this.capture(runId, 'events', null, window, async () => this.getCollection('events', resolvedAthleteId, window.fromDate, window.toDate));
         if (payload === undefined) continue;
         await this.importEntities('event', 'events', payload, null, runId);
@@ -104,6 +104,22 @@ export class IntervalsExtractor {
         }
       }
     }
+  }
+
+  /**
+   * Regular syncs reach back EVENT_WINDOW_PAST_DAYS — just enough to
+   * associate recently finished events with their activities. A store whose
+   * own activity history predates that span gets an automatic one-time
+   * coverage backfill instead: the window stretches to the earliest
+   * activity until an event older than the short window lands (self-
+   * clearing), after which deeper history is the backfill command's job.
+   */
+  private async resolveEventsSyncWindow(): Promise<{ fromDate: string; toDate: string }> {
+    const short = intervalsEventSyncWindow();
+    if (await this.database.hasCalendarEventOlderThan('intervals', short.fromDate)) return short;
+    const earliest = await this.database.earliestActivityStartDate('intervals');
+    if (!earliest || earliest >= short.fromDate) return short;
+    return { fromDate: earliest, toDate: short.toDate };
   }
 
   private async captureCollectionChildren(runId: string, collection: string, payload: unknown, athleteId: string): Promise<void> {

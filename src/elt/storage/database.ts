@@ -193,6 +193,19 @@ export class CatenceDatabase implements WriteDataStore {
     return { running: running.map(toSyncProgressState), recent: recent.map(toSyncProgressState) };
   }
 
+  async hasCalendarEventOlderThan(provider: Provider, beforeIsoDate: string, entityType = 'event'): Promise<boolean> {
+    // Coverage signal for the automatic calendar-events backfill: true once
+    // the store already holds an event older than the regular short window,
+    // meaning the one-time deep pull has landed and normal syncs can stay
+    // narrow. Athletes with genuinely no old events re-run the deep window;
+    // it costs one small paginated listing per sync.
+    const rows = await this.rows(
+      `SELECT 1 FROM source_entities WHERE provider = $provider AND entity_type = $entityType AND occurred_on < $before LIMIT 1`,
+      { provider, entityType, before: beforeIsoDate },
+    );
+    return rows.length > 0;
+  }
+
   async deleteMissingCalendarEntities(
     provider: Provider,
     entityTypes: readonly string[],

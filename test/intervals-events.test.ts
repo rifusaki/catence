@@ -8,9 +8,9 @@ import {
 } from '../src/elt/ingestion/providers/registry.js';
 
 describe('intervals planned-events sync', () => {
-  it('builds a symmetric past/future window around today', () => {
+  it('builds a short past lookback with a year of lookahead', () => {
     const window = intervalsEventSyncWindow(new Date('2026-08-25T12:00:00.000Z'));
-    expect(window.fromDate).toBe('2025-08-25'); // 365 days back spans a non-leap year
+    expect(window.fromDate).toBe('2026-07-26'); // 30 days back
     expect(window.toDate).toBe('2027-08-25');
 
     const lengthMs = Date.parse(window.toDate) - Date.parse(window.fromDate);
@@ -20,7 +20,7 @@ describe('intervals planned-events sync', () => {
 
   it('keeps the window anchored to the passed instant, not wall-clock drift', () => {
     const jan = intervalsEventSyncWindow(new Date('2026-01-01T00:00:00.000Z'));
-    expect(jan.fromDate).toBe('2025-01-01');
+    expect(jan.fromDate).toBe('2025-12-02');
     expect(jan.toDate).toBe('2027-01-01');
   });
 

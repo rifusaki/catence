@@ -32,8 +32,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lt-history-from",
         dest="lt_history_from",
+        type=date.fromisoformat,        help="Backfill lactate-threshold history from this date instead of the daily window.",
+    )
+    parser.add_argument(
+        "--events-from",
+        dest="events_from",
         type=date.fromisoformat,
-        help="Backfill lactate-threshold history from this date instead of the daily window.",
+        help="Fetch calendar events from this date instead of the default short lookback.",
     )
     return parser.parse_args()
 
@@ -79,6 +84,7 @@ def main() -> None:
             activity_to_date=args.activity_to_date,
             include_non_historical=not args.historical_only,
             lactate_threshold_history_from=args.lt_history_from,
+            events_from=args.events_from.isoformat() if args.events_from else None,
         )
     except WorkerInterrupted:
         reporter.finish("interrupted")

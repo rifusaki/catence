@@ -115,10 +115,11 @@ def remote_id(payload: dict[str, Any], fallback: str) -> str:
 SCHEDULED_WORKOUTS_MONTHS_BACK = 3
 SCHEDULED_WORKOUTS_MONTHS_AHEAD = 12
 
-# Joined Garmin events (races etc.) share the same cheap-calendar profile:
-# one GET per sync, looking back a year so recently finished races remain
-# associatable with their activities.
-GARMIN_EVENTS_LOOKBACK_DAYS = 365
+# Regular syncs reach back only far enough to associate recently finished
+# events with their activities; deeper history arrives via the automatic
+# coverage backfill (the parent passes --events-from when the store's own
+# window predates this span).
+EVENTS_PAST_DAYS = 30
 
 
 def shift_month(base: date, offset: int) -> date:
@@ -176,6 +177,7 @@ class GarminStagingWorker:
         activity_to_date: date | None = None,
         include_non_historical: bool = True,
         lactate_threshold_history_from: date | None = None,
+        events_from: str | None = None,
     ) -> None:
         assert_read_only_registry()
         end = to_date or date.today()
@@ -210,7 +212,7 @@ class GarminStagingWorker:
             self._activities(activity_from_date, activity_end)
         if include_non_historical:
             self._check_interrupted()
-            self._collections()
+            self._collections(events_from=events_from)
 
     def _capture(self, endpoint: str, action: Callable[[], Any], remote_id_value: str | None = None, scope: dict[str, Any] | None = None) -> tuple[Any | None, str | None]:
         try:
@@ -723,17 +725,33 @@ class GarminStagingWorker:
                         occurred_on=start_date[:10],
                     )
 
-    def _collections(self) -> None:
+    def _fetch_garmin_events(self, start_date: str) -> None:
+        """Fetch calendar events from start_date, following pagination."""
+        page = 1
+        while True:
+            payload, raw_hash = self._capture(
+                "garmin_events",
+                lambda page=page: self.api.get_events(start_date, limit=100, page=page),
+                scope={"startDate": start_date, "page": page},
+            )
+            items = payload if isinstance(payload, list) else []
+            if items:
+                self._entity("garmin_events", "event", items, raw_hash)
+            if len(items) < 100:
+                return
+            page += 1
+
+    def _collections(self, events_from: str | None = None) -> None:
         today = date.today()
         calls = {
             "workouts": ("get_workouts", (), "workout"),
-            "garmin_events": ("get_events", ((today - timedelta(days=GARMIN_EVENTS_LOOKBACK_DAYS)).isoformat(),), "event"),
             "goals": ("get_goals", (), "goal"), "golf_summary": ("get_golf_summary", (), "golf_scorecard"),
         }
         months = [shift_month(today, offset) for offset in range(-SCHEDULED_WORKOUTS_MONTHS_BACK, SCHEDULED_WORKOUTS_MONTHS_AHEAD + 1)]
+        events_start = events_from or (today - timedelta(days=EVENTS_PAST_DAYS)).isoformat()
         if self.progress is not None:
             self.progress.set_stage("collections")
-            self.progress.advance(total=len(calls) + len(months))
+            self.progress.advance(total=len(calls) + len(months) + 1)
         for index, (endpoint, (method, arguments, entity_type)) in enumerate(calls.items(), start=1):
             self._check_interrupted()
             if self.progress is not None:
@@ -766,3 +784,28 @@ class GarminStagingWorker:
                 self._entity("scheduled_workouts", "scheduled_workout", items, raw_hash)
             if self.progress is not None:
                 self.progress.advance(completed=len(calls) + month_index)
+        # Joined events (races etc.) look back only far enough to associate
+        # finished activities; the parent widens start_date into a one-time
+        # coverage backfill when the store predates this span.
+        self._check_interrupted()
+        if self.progress is not None:
+            self.progress.advance(step="garmin_events")
+        self._fetch_garmin_events(events_start)
+        if self.progress is not None:
+            self.progress.advance(completed=len(calls) + len(months) + 1)
+
+    def _fetch_garmin_events(self, start_date: str) -> None:
+        """Fetch calendar events from start_date, following pagination."""
+        page = 1
+        while True:
+            payload, raw_hash = self._capture(
+                "garmin_events",
+                lambda page=page: self.api.get_events(start_date, limit=100, page=page),
+                scope={"startDate": start_date, "page": page},
+            )
+            items = payload if isinstance(payload, list) else []
+            if items:
+                self._entity("garmin_events", "event", items, raw_hash)
+            if len(items) < 100:
+                return
+            page += 1

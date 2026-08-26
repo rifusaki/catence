@@ -33,7 +33,8 @@ export const intervalsSecondaryReadRegistry = intervalsReadRegistry.filter(
 );
 
 /** How far back and ahead of today the planned-events fetch reaches. */
-export const EVENT_WINDOW_PAST_DAYS = 365;
+/** Regular syncs look back a month for activity association; deeper history arrives via the automatic coverage backfill. */
+export const EVENT_WINDOW_PAST_DAYS = 30;
 export const EVENT_WINDOW_FUTURE_DAYS = 365;
 
 /**

@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
+import { EVENT_WINDOW_PAST_DAYS } from '../ingestion/providers/registry.js';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -354,6 +355,15 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       if (!(await database.hasGarminLactateThresholdHistory())) {
         const earliest = await database.earliestActivityStartDate('garmin');
         if (earliest) arguments_.push('--lt-history-from', earliest);
+      }
+      // Calendar-events coverage backfill: a store whose activities predate
+      // the short lookback gets exactly one deep pull (to its earliest
+      // activity); once an older event lands, normal syncs stay narrow.
+      const eventsShortFrom = new Date(Date.now() - EVENT_WINDOW_PAST_DAYS * 86_400_000).toISOString().slice(0, 10);
+      const needsEventBackfill = !(await database.hasCalendarEventOlderThan('garmin', eventsShortFrom));
+      const earliestActivity = needsEventBackfill ? await database.earliestActivityStartDate('garmin') : null;
+      if (needsEventBackfill && earliestActivity && earliestActivity < eventsShortFrom) {
+        arguments_.push('--events-from', earliestActivity);
       }
       let interruptChild: (() => void) | null = null;
       await runWithInterruptGuard(runId, database, () => interruptChild?.(), guard, async () => {
