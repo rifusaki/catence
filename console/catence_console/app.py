@@ -35,6 +35,7 @@ from catence_console.config import (
     write_provider_setup,
 )
 from catence_console.config_io import read_config_root, write_console_section
+from catence_console.generation_sidecar import finish_generation_sidecar
 from catence_console.persistence import (
     SavedConsolePreferences,
     console_preferences_store,
@@ -47,6 +48,11 @@ from catence_console.persistence import (
 DATA_DIRECTORY = Path(os.environ.get("CATENCE_HOME", str(Path.home() / ".catence"))).expanduser().resolve()
 MCP_URL = os.environ.get("CATENCE_MCP_URL", "http://127.0.0.1:8787/mcp")
 logger = logging.getLogger(__name__)
+
+# Detached generation tasks, keyed by thread id. A turn runs here (not bound to
+# the websocket session) so a page refresh or disconnect cannot abort it; the
+# answer is persisted to the data layer and recovered when the thread reloads.
+_ACTIVE_GENERATIONS: dict[str, "asyncio.Task[None]"] = {}
 
 
 def _mcp_http_url(path: str) -> str:
@@ -940,6 +946,67 @@ async def update_settings(settings: dict[str, Any]) -> None:
     ).send()
 
 
+async def _run_generation(
+    message: cl.Message,
+    profile,
+    model_id: str,
+    reasoning_effort,
+    history: list[dict[str, Any]],
+    tool_round_limit: int,
+    tool_result_character_limit: int,
+    athlete_id: str | None,
+) -> None:
+    """Execute one agent turn detached from the websocket session.
+
+    The answer is persisted to the data layer so a client that refreshes or
+    disconnects mid-turn can recover it when the thread reloads.
+    """
+
+    thread_id = cl.context.session.thread_id
+    try:
+        answer = await respond(
+            profile=profile,
+            model_id=model_id,
+            reasoning_effort=reasoning_effort,
+            history=history,
+            mcp_url=MCP_URL,
+            tool_round_limit=tool_round_limit,
+            tool_result_character_limit=tool_result_character_limit,
+            tool_call_store=tool_call_store(DATA_DIRECTORY),
+            thread_id=thread_id,
+            athlete_id=athlete_id,
+            step_parent_id=message.id,
+        )
+        await cl.Message(content=answer).send()
+    except asyncio.CancelledError:
+        logger.info("Catence generation cancelled for thread %s", thread_id)
+        finish_generation_sidecar(thread_id, stage="interrupted")
+        return
+    except Exception as error:
+        logger.exception(
+            "Catence model request failed for profile %s and model %s",
+            profile.id,
+            model_id,
+        )
+        try:
+            await _notice(content=describe_model_failure(profile, model_id, error)).send()
+        except Exception:
+            pass
+    finally:
+        finish_generation_sidecar(thread_id, stage="completed")
+        _ACTIVE_GENERATIONS.pop(thread_id, None)
+
+
+@cl.on_stop
+async def on_stop() -> None:
+    """Cancel a detached generation when the user presses Stop."""
+
+    thread_id = cl.context.session.thread_id
+    task = _ACTIVE_GENERATIONS.get(thread_id)
+    if task is not None and not task.done():
+        task.cancel()
+
+
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     try:
@@ -957,22 +1024,26 @@ async def on_message(message: cl.Message) -> None:
         ).send()
         return
 
-    try:
-        answer = await respond(
-            profile=profile,
-            model_id=model_id,
-            reasoning_effort=reasoning_effort,
-            history=_model_history(),
-            mcp_url=MCP_URL,
-            tool_round_limit=tool_round_limit,
-            tool_result_character_limit=tool_result_character_limit,
-            tool_call_store=tool_call_store(DATA_DIRECTORY),
-            thread_id=cl.context.session.thread_id,
-            athlete_id=athlete_id,
-            step_parent_id=message.id,
-        )
-    except Exception as error:
-        logger.exception("Catence model request failed for profile %s and model %s", profile.id, model_id)
-        await _notice(content=describe_model_failure(profile, model_id, error)).send()
+    thread_id = cl.context.session.thread_id
+    existing = _ACTIVE_GENERATIONS.get(thread_id)
+    if existing is not None and not existing.done():
+        await _notice(
+            content="A generation is already running for this chat. Wait for it to finish, or press Stop."
+        ).send()
         return
-    await cl.Message(content=answer).send()
+
+    # Detach the turn so a disconnect/refresh cannot abort it. The live client
+    # still receives streamed steps over the socket while connected; the answer
+    # is persisted to the data layer and recovered when the thread reloads.
+    _ACTIVE_GENERATIONS[thread_id] = asyncio.create_task(
+        _run_generation(
+            message,
+            profile,
+            model_id,
+            reasoning_effort,
+            _model_history(),
+            tool_round_limit,
+            tool_result_character_limit,
+            athlete_id,
+        )
+    )
