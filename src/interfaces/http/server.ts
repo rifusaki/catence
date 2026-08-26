@@ -277,6 +277,11 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
         return;
       }
 
+      if (pathname === '/api/v1/health' && request.method === 'GET') {
+        json(response, 200, catenceRuntimeHealth());
+        return;
+      }
+
       if (pathname === '/api/v1/athletes' && request.method === 'GET') {
         if (!catalogPaths) {
           json(response, 200, { defaultAthleteId: 'local', athletes: [{ id: 'local', label: 'Local athlete' }] });

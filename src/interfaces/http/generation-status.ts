@@ -61,7 +61,7 @@ export async function generationStatus(
     return emptyStatus(threadId);
   }
 
-  const base: GenerationStatus = {
+  const base: Omit<GenerationStatus, 'running' | 'stale'> = {
     threadId,
     stage: typeof data.stage === 'string' ? data.stage : undefined,
     heartbeatAt: typeof data.heartbeatAt === 'string' ? data.heartbeatAt : undefined,
