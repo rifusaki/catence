@@ -18,9 +18,31 @@ export type SeriesRequest = {
   pageSize?: number;
 };
 
+export type DeriveDecouplingRequest = {
+  activityId: string;
+};
+
+export type DeriveGapRequest = {
+  activityId: string;
+};
+
 const resolutionIntervals: Record<Exclude<Resolution, 'raw' | 'auto'>, string> = {
   '1m': 'minute', '5m': 'minute', '15m': 'minute', '1h': 'hour', day: 'day', week: 'week',
 };
+
+// Decoupling / GAP thresholds — kept conservative so short or walk-heavy efforts
+// are reported as insufficient rather than silently producing a misleading drift.
+const MIN_TOTAL_SAMPLES = 300;
+const MIN_MOVING_SAMPLES = 360;
+const MIN_VALID_SAMPLES = 360;
+const MOVING_RATIO_THRESHOLD = 0.55;
+const HR_COVERAGE_THRESHOLD = 0.6;
+const METRIC_COVERAGE_THRESHOLD = 0.6;
+const WALK_SPEED_THRESHOLD_MPS = 2.0;
+const CYCLING_MOVING_SPEED_THRESHOLD_MPS = 1.0;
+const RUNNING_MOVING_SPEED_THRESHOLD_MPS = 0.8;
+const MIN_MOVING_DURATION_S = 600;
+const GRADE_CLAMP = 0.3;
 
 function quoteIdentifier(identifier: string): string {
   return `"${identifier.replaceAll('"', '""')}"`;
@@ -132,6 +154,51 @@ function bucketExpression(timestamp: string, resolution: Resolution): string {
 function sourceRelation(relation: string): string {
   return relation.trimStart().toLowerCase().startsWith('select') ? `(${relation})` : quoteIdentifier(relation);
 }
+
+function isCyclingSport(sport: string | null): boolean {
+  if (!sport) return false;
+  const normalized = sport.toLowerCase();
+  return normalized.includes('cycl') || normalized.includes('bik') || normalized.includes('ride') || normalized === 'virtual_ride';
+}
+
+function isRunningSport(sport: string | null): boolean {
+  if (!sport) return false;
+  const normalized = sport.toLowerCase();
+  return normalized.includes('run') || normalized.includes('trail');
+}
+
+function clampGrade(grade: number): number {
+  if (grade > GRADE_CLAMP) return GRADE_CLAMP;
+  if (grade < -GRADE_CLAMP) return -GRADE_CLAMP;
+  return grade;
+}
+
+// Minetti et al. 2002 energy cost of running (J/kg/m). grade is rise/run as a
+// fraction (0.10 = 10 %). The polynomial reproduces the U-shaped cost curve:
+// cheaper slightly downhill, markedly more expensive uphill and very steep downhill.
+function runningCost(gradeFraction: number): number {
+  const g = clampGrade(gradeFraction);
+  return 155.4 * g ** 5 - 30.4 * g ** 4 - 43.3 * g ** 3 + 46.3 * g ** 2 + 19.5 * g + 3.6;
+}
+
+type ActivitySourceIdentity = {
+  activity_source_id: string;
+  provider: string;
+  sport: string | null;
+  activity_id: string;
+  started_at_utc: string | null;
+};
+
+type SampleRow = {
+  timestamp_utc: string | null;
+  elapsed_s: number | null;
+  distance_m: number | null;
+  altitude_m: number | null;
+  heart_rate_bpm: number | null;
+  power_w: number | null;
+  speed_mps: number | null;
+  grade_pct: number | null;
+};
 
 export class AnalyticsService {
   constructor(private readonly repository: ReadOnlyRepository) {}
@@ -335,6 +402,483 @@ export class AnalyticsService {
     const predictions = x.map((item) => predict(fit.coefficients as number[], item));
     const residuals = y.map((item, index) => item - predictions[index]);
     return jsonSafe({ data: { model: request.model, xMetric: request.xMetric ?? 'observation_index', yMetric, coefficients: fit.coefficients, rSquared: rSquared(y, predictions), residuals: { mean: mean(residuals), standardDeviation: standardDeviation(residuals), min: Math.min(...residuals), max: Math.max(...residuals) } }, provenance: series.provenance, query: series.query, caveats: ['Descriptive fit only; it is not a physiological or sport-performance model.', 'Rows with null x or y values were excluded.', ...(series.nextCursor ? ['Input was capped at the first 5,000 points after the declared resolution.'] : [])], input: { selectedRows: rows.length, fittedRows: pairs.length, excludedRows: rows.length - pairs.length, cappedRows: series.nextCursor ? 'at least 1 additional page' : 0, dateCoverage: coverage(rows) } });
+  }
+
+  // ---- Aerobic decoupling (Pa:Hr / Pw:Hr) and GAP ----
+
+  async deriveDecoupling(request: DeriveDecouplingRequest): Promise<Record<string, unknown>> {
+    const activityId = request.activityId?.trim();
+    if (!activityId) throw new QueryValidationError('activityId is required. Provide an activity_source_id (e.g. garmin:123) or a canonical activity_id.');
+
+    const identity = await this.resolveActivitySource(activityId);
+    const samples = await this.loadActivitySamples(identity.activity_source_id);
+
+    const totalSamples = samples.length;
+    if (totalSamples === 0) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', columns: ['heart_rate_bpm', 'power_w', 'speed_mps'], activitySourceId: identity.activity_source_id, sport: identity.sport },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id, sport: identity.sport, provider: identity.provider },
+        caveats: [
+          'No activity_samples are available for this activity. The stream may not have been synced or the Parquet lake contains no registered manifest for this source.',
+          'Decoupling is derived only from FIT samples; it cannot be inferred from summary statistics alone.',
+          'Null remains null: insufficient samples produce no decoupling value rather than a synthesized placeholder.',
+        ],
+        input: { totalSamples },
+      });
+    }
+
+    if (totalSamples < MIN_TOTAL_SAMPLES) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id, sport: identity.sport },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id, sport: identity.sport },
+        caveats: [
+          `Insufficient samples: ${totalSamples} total points, fewer than the ${MIN_TOTAL_SAMPLES} minimum. Short efforts do not provide stable first/second-half aerobic drift.`,
+          'Derived decoupling is descriptive only; do not treat absence as evidence of good or poor aerobic fitness.',
+        ],
+        input: { totalSamples },
+      });
+    }
+
+    const isCycling = isCyclingSport(identity.sport);
+    const isRunning = isRunningSport(identity.sport);
+    // Fallback when sport label is absent: choose metric with better coverage.
+    let metricField: 'power_w' | 'speed_mps';
+    if (isCycling) metricField = 'power_w';
+    else if (isRunning) metricField = 'speed_mps';
+    else {
+      const powerCoverage = samples.filter((row) => numberOrNull(row.power_w) !== null).length / totalSamples;
+      const speedCoverage = samples.filter((row) => numberOrNull(row.speed_mps) !== null).length / totalSamples;
+      metricField = powerCoverage > speedCoverage && powerCoverage > 0.5 ? 'power_w' : 'speed_mps';
+    }
+
+    const movingThreshold = isCycling ? CYCLING_MOVING_SPEED_THRESHOLD_MPS : RUNNING_MOVING_SPEED_THRESHOLD_MPS;
+    const movingSamples = samples.filter((row) => {
+      const speed = numberOrNull(row.speed_mps);
+      const power = numberOrNull(row.power_w);
+      if (speed !== null) return speed > movingThreshold;
+      if (isCycling && power !== null) return power > 10;
+      return false;
+    });
+
+    const movingRatio = movingSamples.length / totalSamples;
+    const movingDurationS = (() => {
+      const elapsedValues = movingSamples.map((row) => numberOrNull(row.elapsed_s)).filter((value): value is number => value !== null);
+      if (elapsedValues.length >= 2) return Math.max(...elapsedValues) - Math.min(...elapsedValues);
+      return movingSamples.length;
+    })();
+
+    if (movingSamples.length < MIN_MOVING_SAMPLES) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id, metricField, sport: identity.sport },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id, metricField },
+        caveats: [
+          `Insufficient moving samples: ${movingSamples.length} moving points < ${MIN_MOVING_SAMPLES} minimum (total ${totalSamples}, moving ratio ${(movingRatio * 100).toFixed(1)} %).`,
+          'Stopped or highly interrupted efforts cannot support a stable first-half vs second-half drift comparison.',
+          'Guard: filtered by speed threshold; walk-heavy and stop-heavy activities are excluded by design.',
+        ],
+        input: { totalSamples, movingSamples: movingSamples.length, movingRatio, movingDurationS },
+      });
+    }
+
+    if (movingRatio < MOVING_RATIO_THRESHOLD) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id, metricField },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id },
+        caveats: [
+          `Moving-time ratio too low: ${(movingRatio * 100).toFixed(1)} % < ${(MOVING_RATIO_THRESHOLD * 100).toFixed(0)} % threshold (moving ${movingSamples.length} / total ${totalSamples}).`,
+          'Stop-heavy or trail activities with prolonged pauses bias a naive first/second-half split. Paused portions are excluded and the activity is reported as insufficient for decoupling.',
+        ],
+        input: { totalSamples, movingSamples: movingSamples.length, movingRatio },
+      });
+    }
+
+    if (movingDurationS < MIN_MOVING_DURATION_S) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id },
+        caveats: [
+          `Insufficient moving duration: ~${Math.round(movingDurationS)} s < ${MIN_MOVING_DURATION_S} s minimum for a steady aerobic drift comparison.`,
+        ],
+        input: { movingDurationS, movingSamples: movingSamples.length },
+      });
+    }
+
+    // Walk-heavy guard for running: median moving speed should look like running, not walking.
+    if (!isCycling) {
+      const speeds = movingSamples.map((row) => numberOrNull(row.speed_mps)).filter((value): value is number => value !== null);
+      if (speeds.length) {
+        const medianSpeed = median(speeds);
+        if (medianSpeed < WALK_SPEED_THRESHOLD_MPS) {
+          return jsonSafe({
+            data: null,
+            provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id, sport: identity.sport },
+            query: { activityId, resolvedActivitySourceId: identity.activity_source_id },
+            caveats: [
+              `Walk-heavy effort: median moving speed ${medianSpeed.toFixed(2)} m/s < ${WALK_SPEED_THRESHOLD_MPS.toFixed(1)} m/s threshold. Aerobic decoupling on walking segments is misleading; the activity is reported as insufficient.`,
+              'This guards against the false-low the agent noted for trail ultras where hiking dominates moving time.',
+            ],
+            input: { medianSpeedMps: medianSpeed, movingSamples: movingSamples.length },
+          });
+        }
+      }
+    }
+
+    const validSamples = movingSamples.filter((row) => {
+      const hr = numberOrNull(row.heart_rate_bpm);
+      const metric = numberOrNull(row[metricField]);
+      if (hr === null || metric === null) return false;
+      if (hr < 30 || hr > 220) return false;
+      if (metric <= 0) return false;
+      return true;
+    });
+
+    const hrCoverage = validSamples.length / movingSamples.length;
+    const metricCoverage = validSamples.length / movingSamples.length;
+
+    if (validSamples.length < MIN_VALID_SAMPLES) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id, metricField },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id },
+        caveats: [
+          `Insufficient valid paired HR/${metricField} samples: ${validSamples.length} < ${MIN_VALID_SAMPLES} (HR coverage ${(hrCoverage * 100).toFixed(1)} %, metric coverage ${(metricCoverage * 100).toFixed(1)} %).`,
+          'Decoupling requires steady paired heart-rate and power (cycling) or speed (running) across the effort. Missing or sparse sensor streams cannot be inferred.',
+        ],
+        input: { validSamples: validSamples.length, movingSamples: movingSamples.length, hrCoverage, metricCoverage },
+      });
+    }
+
+    if (hrCoverage < HR_COVERAGE_THRESHOLD || metricCoverage < METRIC_COVERAGE_THRESHOLD) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id, metricField },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id },
+        caveats: [
+          `Sparse paired coverage: HR ${(hrCoverage * 100).toFixed(1)} % / ${metricField} ${(metricCoverage * 100).toFixed(1)} % below thresholds ${(HR_COVERAGE_THRESHOLD * 100).toFixed(0)} % / ${(METRIC_COVERAGE_THRESHOLD * 100).toFixed(0)} %.`,
+        ],
+        input: { validSamples: validSamples.length, hrCoverage, metricCoverage },
+      });
+    }
+
+    // Steady first/second halves: chronological split of the valid moving samples.
+    const half = Math.floor(validSamples.length / 2);
+    const firstHalf = validSamples.slice(0, half);
+    const secondHalf = validSamples.slice(half);
+
+    if (firstHalf.length < 60 || secondHalf.length < 60) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id },
+        caveats: ['Split halves are too small for a stable comparison.'],
+        input: { firstHalf: firstHalf.length, secondHalf: secondHalf.length },
+      });
+    }
+
+    const avgHrFirst = mean(firstHalf.map((row) => numberOrNull(row.heart_rate_bpm) as number));
+    const avgHrSecond = mean(secondHalf.map((row) => numberOrNull(row.heart_rate_bpm) as number));
+    const avgMetricFirst = mean(firstHalf.map((row) => numberOrNull(row[metricField]) as number));
+    const avgMetricSecond = mean(secondHalf.map((row) => numberOrNull(row[metricField]) as number));
+
+    if (avgHrFirst === 0 || avgMetricFirst === 0) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id },
+        caveats: ['First-half averages are degenerate (zero divisor); cannot form a drift ratio.'],
+        input: { avgHrFirst, avgMetricFirst },
+      });
+    }
+
+    const efficiencyFirst = avgMetricFirst / avgHrFirst;
+    const efficiencySecond = avgMetricSecond / avgHrSecond;
+    if (efficiencyFirst === 0) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id },
+        caveats: ['Efficiency ratio is degenerate; cannot compute decoupling.'],
+        input: { efficiencyFirst },
+      });
+    }
+
+    const decouplingPct = (1 - efficiencySecond / efficiencyFirst) * 100;
+    const hrDriftPct = avgHrFirst === 0 ? null : ((avgHrSecond - avgHrFirst) / avgHrFirst) * 100;
+    const metricDriftPct = avgMetricFirst === 0 ? null : ((avgMetricSecond - avgMetricFirst) / avgMetricFirst) * 100;
+
+    const medianSpeedMps = (() => {
+      const speeds = movingSamples.map((row) => numberOrNull(row.speed_mps)).filter((value): value is number => value !== null);
+      return speeds.length ? median(speeds) : null;
+    })();
+
+    return jsonSafe({
+      data: {
+        activityId: identity.activity_id,
+        activitySourceId: identity.activity_source_id,
+        provider: identity.provider,
+        sport: identity.sport,
+        startedAtUtc: identity.started_at_utc,
+        metricUsed: metricField,
+        decouplingPct,
+        efficiencyFirst,
+        efficiencySecond,
+        avgHrFirst,
+        avgHrSecond,
+        avgMetricFirst,
+        avgMetricSecond,
+        hrDriftPct,
+        metricDriftPct,
+        samples: { totalSamples, movingSamples: movingSamples.length, validSamples: validSamples.length, firstHalf: firstHalf.length, secondHalf: secondHalf.length, movingRatio, movingDurationS, medianSpeedMps },
+        interpretation: {
+          decouplingPct,
+          direction: decouplingPct > 5 ? 'hr_drift_positive' : decouplingPct < -5 ? 'negative_drift' : 'stable',
+          note: 'Positive decoupling means HR rose relative to power/speed in the second half ( cardiac drift at similar output).',
+        },
+      },
+      provenance: {
+        dataset: 'activity_samples',
+        derivation: 'derived',
+        method: 'Pw:Hr or Pa:Hr drift across steady first/second moving halves (chronological split of valid HR+metric samples). Efficiency = metric / HR; decouplingPct = (1 - EF_second / EF_first) * 100.',
+        metricField,
+        columns: ['heart_rate_bpm', metricField, 'speed_mps', 'timestamp_utc', 'elapsed_s'],
+        activitySourceId: identity.activity_source_id,
+      },
+      query: { activityId, resolvedActivitySourceId: identity.activity_source_id, metricField, sport: identity.sport },
+      caveats: [
+        'Derived decoupling is descriptive only; it is not a physiological model or training prescription.',
+        'Derived values never overwrite provider-supplied decoupling (e.g. Intervals decoupling in metrics_json); provider values remain authoritative when present.',
+        'First/second halves are chronological moving halves after walk/stop filtering; warm-up and cool-down are not separately excluded — steady-state drift should be interpreted with that limit in mind.',
+        'Null remains null: when samples are sparse, walk-heavy, or stop-heavy the tool returns data:null with explanatory caveats rather than a fabricated value.',
+        `Thresholds: total ≥${MIN_TOTAL_SAMPLES}, moving ≥${MIN_MOVING_SAMPLES}, valid ≥${MIN_VALID_SAMPLES}, movingRatio ≥${(MOVING_RATIO_THRESHOLD * 100).toFixed(0)} %, movingDuration ≥${MIN_MOVING_DURATION_S}s, HR/metric coverage ≥${(HR_COVERAGE_THRESHOLD * 100).toFixed(0)} %.`,
+      ],
+      input: { totalSamples, movingSamples: movingSamples.length, validSamples: validSamples.length, movingRatio, medianSpeedMps, metricField },
+    });
+  }
+
+  async deriveGap(request: DeriveGapRequest): Promise<Record<string, unknown>> {
+    const activityId = request.activityId?.trim();
+    if (!activityId) throw new QueryValidationError('activityId is required. Provide an activity_source_id (e.g. garmin:123) or a canonical activity_id.');
+
+    const identity = await this.resolveActivitySource(activityId);
+    const samples = await this.loadActivitySamples(identity.activity_source_id);
+
+    const totalSamples = samples.length;
+    if (totalSamples === 0) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id },
+        caveats: ['No activity_samples are available for this activity; GAP cannot be derived.'],
+        input: { totalSamples },
+      });
+    }
+
+    const isRunning = isRunningSport(identity.sport);
+    const isCycling = isCyclingSport(identity.sport);
+    if (isCycling) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id, sport: identity.sport },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id, sport: identity.sport },
+        caveats: [
+          'GAP (grade-adjusted pace) is a running metric. This activity is cycling; grade-adjusted pace is not applicable. Use power/HR decoupling for cycling aerobic assessment instead.',
+        ],
+        input: { sport: identity.sport },
+      });
+    }
+
+    // Non-running, non-cycling: still attempt GAP but flag as generic.
+    const expectedRunning = isRunning || (!identity.sport);
+
+    // Moving filter for GAP: requires speed; altitude or grade for the grade model.
+    const movingSamples = samples
+      .filter((row) => {
+        const speed = numberOrNull(row.speed_mps);
+        if (speed === null || speed <= RUNNING_MOVING_SPEED_THRESHOLD_MPS) return false;
+        return true;
+      })
+      .map((row, index, array) => {
+        // Grades are ordered by timestamp; compute fallback grade when grade_pct is missing.
+        const gradePct = numberOrNull(row.grade_pct);
+        if (gradePct !== null && Number.isFinite(gradePct)) return { row, grade: gradePct / 100 };
+        // Fallback: derive from altitude/distance delta over a short window.
+        const previous = array[Math.max(0, index - 1)] as SampleRow | undefined;
+        const altitude = numberOrNull(row.altitude_m);
+        const previousAltitude = previous ? numberOrNull(previous.altitude_m) : null;
+        const distance = numberOrNull(row.distance_m);
+        const previousDistance = previous ? numberOrNull(previous.distance_m) : null;
+        if (altitude !== null && previousAltitude !== null && distance !== null && previousDistance !== null) {
+          const distanceDelta = distance - previousDistance;
+          if (distanceDelta > 5) return { row, grade: (altitude - previousAltitude) / distanceDelta };
+        }
+        return { row, grade: 0 };
+      });
+
+    const gapEligibleSamples = movingSamples.filter(({ row }) => {
+      const speed = numberOrNull(row.speed_mps);
+      return speed !== null && speed > 0;
+    });
+
+    const totalMovingForGap = gapEligibleSamples.length;
+    if (totalMovingForGap < MIN_MOVING_SAMPLES) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id, sport: identity.sport },
+        caveats: [
+          `Insufficient moving samples for GAP: ${totalMovingForGap} < ${MIN_MOVING_SAMPLES}. GAP requires steady moving running samples with speed and grade/altitude.`,
+        ],
+        input: { gapEligibleSamples: totalMovingForGap, totalSamples },
+      });
+    }
+
+    const gaps = gapEligibleSamples.map(({ row, grade }) => {
+      const speed = numberOrNull(row.speed_mps) as number;
+      const cost = runningCost(grade);
+      const factor = cost / 3.6;
+      const gapSpeed = speed * factor;
+      const gapPaceSPerKm = gapSpeed > 0 ? 1000 / gapSpeed : null;
+      const paceSPerKm = speed > 0 ? 1000 / speed : null;
+      return { speed, grade, cost, factor, gapSpeed, gapPaceSPerKm, paceSPerKm, altitude: numberOrNull(row.altitude_m), distance: numberOrNull(row.distance_m) };
+    }).filter((item) => item.gapPaceSPerKm !== null && Number.isFinite(item.gapPaceSPerKm));
+
+    if (gaps.length < MIN_VALID_SAMPLES) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id },
+        caveats: ['Insufficient valid GAP points after grade modeling.'],
+        input: { gaps: gaps.length },
+      });
+    }
+
+    const avgSpeed = mean(gaps.map((item) => item.speed));
+    const avgGapSpeed = mean(gaps.map((item) => item.gapSpeed));
+    const avgGrade = mean(gaps.map((item) => item.grade));
+    const avgPaceSPerKm = 1000 / avgSpeed;
+    const avgGapPaceSPerKm = 1000 / avgGapSpeed;
+    const minPace = Math.min(...gaps.map((item) => item.paceSPerKm as number));
+    const maxPace = Math.max(...gaps.map((item) => item.paceSPerKm as number));
+    const minGapPace = Math.min(...gaps.map((item) => item.gapPaceSPerKm as number));
+    const maxGapPace = Math.max(...gaps.map((item) => item.gapPaceSPerKm as number));
+
+    // Elevation gain/loss from altitude when available
+    const altitudes = samples.map((row) => numberOrNull(row.altitude_m)).filter((value): value is number => value !== null);
+    let elevationGainM: number | null = null;
+    let elevationLossM: number | null = null;
+    if (altitudes.length >= 2) {
+      let gain = 0;
+      let loss = 0;
+      for (let index = 1; index < altitudes.length; index++) {
+        const delta = altitudes[index]! - altitudes[index - 1]!;
+        if (delta > 0) gain += delta;
+        else loss += Math.abs(delta);
+      }
+      elevationGainM = gain;
+      elevationLossM = loss;
+    }
+
+    const distanceM = (() => {
+      const distances = samples.map((row) => numberOrNull(row.distance_m)).filter((value): value is number => value !== null);
+      if (distances.length < 2) return null;
+      return Math.max(...distances) - Math.min(...distances);
+    })();
+
+    // Guard walk-heavy for GAP as well.
+    const medianSpeed = median(gaps.map((item) => item.speed));
+    if (medianSpeed < WALK_SPEED_THRESHOLD_MPS) {
+      return jsonSafe({
+        data: null,
+        provenance: { dataset: 'activity_samples', derivation: 'derived', activitySourceId: identity.activity_source_id },
+        query: { activityId, resolvedActivitySourceId: identity.activity_source_id },
+        caveats: [
+          `Walk-heavy effort: median speed ${medianSpeed.toFixed(2)} m/s < ${WALK_SPEED_THRESHOLD_MPS.toFixed(1)} m/s. GAP on predominantly walking segments is not meaningful and is suppressed.`,
+        ],
+        input: { medianSpeedMps: medianSpeed, gapSamples: gaps.length },
+      });
+    }
+
+    return jsonSafe({
+      data: {
+        activityId: identity.activity_id,
+        activitySourceId: identity.activity_source_id,
+        provider: identity.provider,
+        sport: identity.sport,
+        startedAtUtc: identity.started_at_utc,
+        method: 'Minetti 2002 cost model',
+        samples: { totalSamples, movingSamplesForGap: gaps.length, expectedRunning },
+        averages: {
+          speed_mps: avgSpeed,
+          gap_speed_mps: avgGapSpeed,
+          pace_s_per_km: avgPaceSPerKm,
+          gap_pace_s_per_km: avgGapPaceSPerKm,
+          grade_pct: avgGrade * 100,
+        },
+        ranges: {
+          pace_s_per_km: { min: minPace, max: maxPace },
+          gap_pace_s_per_km: { min: minGapPace, max: maxGapPace },
+        },
+        elevation: { gain_m: elevationGainM, loss_m: elevationLossM, distance_m: distanceM },
+        interpretation: {
+          note: 'GAP re-expresses each moving second as its flat-equivalent pace for the same metabolic cost. Uphill → GAP faster than raw pace; downhill → GAP slower than raw pace.',
+        },
+      },
+      provenance: {
+        dataset: 'activity_samples',
+        derivation: 'derived',
+        model: 'Minetti et al. 2002: C(g) = 155.4 g^5 -30.4 g^4 -43.3 g^3 +46.3 g^2 +19.5 g +3.6; GAP factor = C(g)/C(0); GAP speed = speed * factor',
+        columns: ['speed_mps', 'altitude_m', 'grade_pct', 'distance_m', 'timestamp_utc'],
+        activitySourceId: identity.activity_source_id,
+      },
+      query: { activityId, resolvedActivitySourceId: identity.activity_source_id, sport: identity.sport },
+      caveats: [
+        'Derived GAP is descriptive only; it is not a certified replacement for Strava or device GAP and is not a physiological performance model.',
+        'Derived GAP never overwrites a provider-supplied grade_adjusted_pace when present; treat provider values as authoritative.',
+        'Grades are clamped to ±30 % and smoothed only lightly; noisy altitude and GPS can still bias short rolling segments — prefer the averaged GAP for the whole activity over per-second values.',
+        ...(expectedRunning ? [] : ['Sport is not running; GAP is reported but should be interpreted cautiously outside running/trail.']),
+      ],
+      input: { totalSamples, gapSamples: gaps.length, avgGradePct: avgGrade * 100 },
+    });
+  }
+
+  private async resolveActivitySource(activityId: string): Promise<ActivitySourceIdentity> {
+    const trimmed = activityId.trim();
+    if (!trimmed) throw new QueryValidationError('activityId is required.');
+    const bySource = await this.repository.rows<ActivitySourceIdentity>(`
+      SELECT source.activity_source_id, source.provider, activity.sport, source.activity_id, cast(activity.started_at_utc AS VARCHAR) AS started_at_utc
+      FROM activity_sources AS source
+      JOIN activities AS activity USING (activity_id)
+      WHERE source.activity_source_id = $activityId
+      LIMIT 1
+    `, { activityId: trimmed });
+    if (bySource[0]) return bySource[0];
+    const byLogical = await this.repository.rows<ActivitySourceIdentity>(`
+      SELECT source.activity_source_id, source.provider, activity.sport, source.activity_id, cast(activity.started_at_utc AS VARCHAR) AS started_at_utc
+      FROM activity_sources AS source
+      JOIN activities AS activity USING (activity_id)
+      WHERE source.activity_id = $activityId
+      ORDER BY CASE source.provider WHEN 'garmin' THEN 0 WHEN 'intervals' THEN 1 ELSE 2 END, source.activity_source_id ASC
+      LIMIT 1
+    `, { activityId: trimmed });
+    if (byLogical[0]) return byLogical[0];
+    throw new QueryValidationError(`No activity source matched ${trimmed}. Use find_activities to locate a valid activityId or activity_source_id.`);
+  }
+
+  private async loadActivitySamples(activitySourceId: string): Promise<SampleRow[]> {
+    const relation = await this.repository.datasetRelation('activity_samples');
+    const source = sourceRelation(relation);
+    const rows = await this.repository.rows<SampleRow>(`
+      SELECT timestamp_utc, elapsed_s, distance_m, altitude_m, heart_rate_bpm, power_w, speed_mps, grade_pct
+      FROM ${source} AS source
+      WHERE activity_source_id = $activitySourceId
+      ORDER BY timestamp_utc ASC NULLS LAST, elapsed_s ASC NULLS LAST
+    `, { activitySourceId });
+    return rows;
   }
 }
 

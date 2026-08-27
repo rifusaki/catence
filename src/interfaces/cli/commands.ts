@@ -6,6 +6,7 @@ import {
   addAthlete,
   athleteStorePaths,
   CATENCE_RUNTIME_VERSION,
+  CatenceDatabase,
   channelForVersion,
   createDemoStore,
   dataStatus,
@@ -306,6 +307,41 @@ program
     const { paths } = await currentAthlete();
     const runIds = Array.isArray(options.run) ? options.run : options.run ? [options.run] : undefined;
     process.stdout.write(`${JSON.stringify(await resolveExtractionErrors(paths, { runIds, provider: options.provider, before: options.before, all: options.all }), null, 2)}\n`);
+  });
+
+program
+  .command('migrate')
+  .description('Apply pending DuckDB schema migrations. Without --all it migrates the selected --athlete store; with --all it migrates every athlete in the catalog.')
+  .option('--all', 'migrate every athlete in the catalog')
+  .option('--home <directory>', 'Catence catalog home directory (also accepts global --home)')
+  .action(async (options: { all?: boolean; home?: string }) => {
+    const effectiveHome = options.home ?? program.opts<{ home: string }>().home;
+    const effectiveCatalog = effectiveHome ? resolveCatalogPaths(effectiveHome) : currentCatalog();
+    const migratePaths = async (paths: CatencePaths): Promise<Record<string, unknown>> => {
+      const database = await CatenceDatabase.open(paths);
+      const applied = await database.rows<{ version: number }>('SELECT version FROM schema_migrations ORDER BY version');
+      await database.close();
+      return { migrated: true, appliedVersions: applied.map((row) => row.version) };
+    };
+    if (options.all) {
+      const catalog = await loadCatalog(effectiveCatalog);
+      const results: Record<string, unknown> = {};
+      for (const athlete of catalog.athletes) {
+        const paths = athleteStorePaths(effectiveCatalog, athlete.id);
+        try {
+          results[athlete.id] = await migratePaths(paths);
+        } catch (error) {
+          results[athlete.id] = { migrated: false, error: error instanceof Error ? error.message : String(error) };
+        }
+      }
+      process.stdout.write(`${JSON.stringify({ catalog: effectiveCatalog.root, results }, null, 2)}\n`);
+      return;
+    }
+    const athleteId = program.opts<{ athlete?: string }>().athlete;
+    if (!athleteId) throw new Error('--athlete is required for this command. Run catence-data athlete list to inspect the catalog or use --all.');
+    const { athlete, paths } = await resolveAthlete(effectiveCatalog, athleteId);
+    const result = await migratePaths(paths);
+    process.stdout.write(`${JSON.stringify({ athleteId: athlete.id, ...result }, null, 2)}\n`);
   });
 
 await program.parseAsync();

@@ -73,6 +73,10 @@ const MCP_INSTRUCTIONS = [
   'That tool performs the targeted Strava hydration itself. Do not say segment data is unavailable before it returns; if it reports not_found, ambiguous, authorization, throttling, or an error, report that exact outcome instead.',
   'For Garmin running VO₂max, call get_vo2max_history with sport: running. Garmin stores the source value as generic; returned rows preserve that source label.',
   'Aggregate elevation alone cannot support an individual-climb conclusion. Use source-specific facts and their stated coverage.',
+  'For race-readiness / fitness-target questions, establish a trend-first baseline (readiness_baseline, analyze_series, aggregate_data time buckets) before comparing any single activity.',
+  'Never conclude from VO2max alone; pull full indicator set (LT/FTP/power/race-prediction).',
+  'When summary metric is NULL (e.g. avg_power), fall through to FIT-derived/samples layer before declaring absence.',
+  'Before reusing any prior course/elevation profile, resolve event\'s courseId and diff it against past activity\'s course; different courseId => different profile.',
 ].join(' ');
 
 function textResult(value: unknown): ToolResult {
@@ -270,7 +274,7 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
   }, ({ activityId, ...input }) => ({
     messages: [{
       role: 'user',
-      content: { type: 'text', text: `Run review_activity_deep_dive for ${activityId}${typeof (input as { athleteId?: unknown }).athleteId === 'string' ? ` with athleteId ${(input as { athleteId: string }).athleteId}` : ''}. Use its source records and intervals first; load read_series only if a specific sampled metric is needed.` },
+      content: { type: 'text', text: `Run review_activity_deep_dive for ${activityId}${typeof (input as { athleteId?: unknown }).athleteId === 'string' ? ` with athleteId ${(input as { athleteId: string }).athleteId}` : ''}. Use its source records and intervals first; load read_series only if a specific sampled metric is needed. Use as anchor for current form only after trend baseline exists.` },
     }],
   }));
 
@@ -420,6 +424,34 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     inputSchema: { ...seriesInput, model: z.enum(['ols_linear', 'theil_sen_linear', 'polynomial_2', 'polynomial_3']), xMetric: z.string().min(1).optional(), yMetric: z.string().min(1).optional() },
   }, tool('fit_series_model', async (input) => useRepository(activePaths(), (repository) => new AnalyticsService(repository).fitSeriesModel({ ...input, filters: input.filters as DataFilter[] | undefined }))));
 
+  server.registerTool('activity_decoupling', {
+    title: 'Derive aerobic decoupling and GAP for one activity',
+    description: 'Derive aerobic decoupling (Pa:Hr for running using speed/HR, Pw:Hr for cycling using power/HR — drift across steady first/second halves) and grade-adjusted pace (GAP, Minetti 2002 cost model) from stored activity_samples for one activity. Returns null with explanatory caveats when samples are insufficient, walk-heavy, or stop-heavy. Derived values are descriptive only and never overwrite provider-supplied decoupling/GAP. Read-only.',
+    inputSchema: { activityId: z.string().min(1), includeGap: z.boolean().optional() },
+  }, tool('activity_decoupling', async (input) => useRepository(activePaths(), async (repository) => {
+    const analytics = new AnalyticsService(repository);
+    const decoupling = await analytics.deriveDecoupling({ activityId: input.activityId });
+    const gap = input.includeGap === false ? null : await analytics.deriveGap({ activityId: input.activityId });
+    const decouplingData = decoupling as Record<string, unknown>;
+    const gapData = gap as Record<string, unknown> | null;
+    const combinedCaveats = [
+      ...((decouplingData.caveats as string[] | undefined) ?? []),
+      ...((gapData?.caveats as string[] | undefined) ?? []),
+    ];
+    return jsonSafe({
+      data: { decoupling: decouplingData.data ?? null, gap: gapData?.data ?? null, decouplingRaw: decouplingData, gapRaw: gapData },
+      provenance: {
+        decoupling: decouplingData.provenance,
+        gap: gapData?.provenance ?? null,
+        derivation: 'derived',
+        note: 'Both metrics are derived from activity_samples (Parquet lake) when provider summaries do not supply them; provider values remain authoritative.',
+      },
+      query: { activityId: input.activityId, includeGap: input.includeGap ?? true, decouplingQuery: decouplingData.query, gapQuery: gapData?.query ?? null },
+      caveats: combinedCaveats.length ? combinedCaveats : ['Derived metrics are descriptive only; not a physiological performance model.'],
+      inputs: { decouplingInput: decouplingData.input, gapInput: gapData?.input ?? null },
+    });
+  })));
+
   server.registerTool('wellness_correlate', {
     title: 'Correlate recovery and training metrics',
     description: 'Calculate a compact daily Pearson or Spearman correlation between curated wellness and training metrics, with an optional -7 through +7 day lag scan. Descriptive only.',
@@ -452,6 +484,12 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     description: 'Return normalized cycling FTP settings and activity-summary observations with source-aware preferred daily values. Read-only.',
     inputSchema: { sport: z.string().min(1).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional(), sourcePreference: z.enum(['settings', 'settings_then_activity', 'all']).optional() },
   }, tool('get_ftp_history', async (input) => useRepository(activePaths(), (repository) => new FitnessService(repository).ftpHistory(input))));
+
+  server.registerTool('readiness_baseline', {
+    title: 'Read a running/race readiness baseline',
+    description: 'Combine the full performance-indicator set — running lactate threshold (pace/power/HR), VO₂max, race predictions, fitness trend, endurance score, and FIT-derived power bests/coverage — as trends in one call. Use this before any single-activity comparison for race-readiness or fitness-target questions.',
+    inputSchema: { sport: z.string().min(1).optional(), startDate: z.string().date().optional(), endDate: z.string().date().optional() },
+  }, tool('readiness_baseline', async (input) => useRepository(activePaths(), (repository) => new FitnessService(repository).readinessBaseline(input))));
 
   server.registerTool('get_vo2max_history', {
     title: 'Get sport-specific VO₂max history',

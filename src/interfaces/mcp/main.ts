@@ -1,11 +1,40 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { existsSync } from 'node:fs';
-import { addAthlete, athleteStorePaths, createDemoStore, defaultCatalogHome, initializeCatalog, loadCatalog, resolveCatalogPaths } from '../../runtime/index.js';
+import { addAthlete, athleteStorePaths, CatenceDatabase, createDemoStore, defaultCatalogHome, initializeCatalog, loadCatalog, resolveCatalogPaths } from '../../runtime/index.js';
 import { parseServeCliOptions, SERVE_USAGE } from '../http/cli-options.js';
 import { createCatenceHttpServer } from '../http/server.js';
 import { MCP_USAGE, parseMcpCliOptions } from './cli-options.js';
 import { createCatenceMcpServer } from './server.js';
+
+async function migrateCatalogStores(home: string | undefined): Promise<void> {
+  // On Docker image bumps the DuckDB schema version increases. The
+  // read-only MCP health probe would otherwise report "version X required"
+  // until the next manual sync. Proactively opening each athlete store in
+  // writable mode runs the idempotent migrations (database.ts:migrate)
+  // before the HTTP server starts listening, so a plain `docker compose up`
+  // after `deploy-console.sh beta` heals existing installs without an extra
+  // manual `catence-data migrate --all` step. Failures are best-effort:
+  // a missing catalog or a store still locked by another process is retried
+  // on the next sync or health check.
+  try {
+    const catalogPaths = resolveCatalogPaths(home);
+    const catalog = await loadCatalog(catalogPaths).catch(() => null);
+    if (!catalog || catalog.athletes.length === 0) return;
+    for (const athlete of catalog.athletes) {
+      const paths = athleteStorePaths(catalogPaths, athlete.id);
+      try {
+        const database = await CatenceDatabase.open(paths);
+        await database.close();
+      } catch {
+        // Best-effort: a lock or a corrupted store must not prevent the
+        // server from starting; the next sync will retry the migration.
+      }
+    }
+  } catch {
+    // Catalog read failures are non-fatal for startup.
+  }
+}
 
 async function run(): Promise<void> {
   const arguments_ = process.argv.slice(2);
@@ -15,6 +44,7 @@ async function run(): Promise<void> {
       process.stderr.write(`${SERVE_USAGE}\n`);
       return;
     }
+    await migrateCatalogStores(options.home);
     const httpServer = createCatenceHttpServer({
       catalogPaths: resolveCatalogPaths(options.home),
       allowedOrigins: options.allowedOrigins,

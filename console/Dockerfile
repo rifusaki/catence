@@ -32,4 +32,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:8000/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
-ENTRYPOINT ["uv", "run", "--project", "/app/console", "catence-console", "serve", "--ui-host", "0.0.0.0", "--mcp-host", "127.0.0.1"]
+ENTRYPOINT ["/bin/sh", "-c", "catence-data --home /data migrate --all 2>/dev/null || npx --yes catence@$(node -p \"require('/app/package.json').version\") --home /data migrate --all 2>/dev/null || true; exec uv run --project /app/console catence-console serve --ui-host 0.0.0.0 --mcp-host 127.0.0.1"]

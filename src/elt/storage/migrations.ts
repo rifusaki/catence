@@ -862,5 +862,75 @@ const syncRunProgressMigration: Migration = {
   `,
 };
 
-export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration, syncRunProgressMigration];
+const canonicalTrainingDerivedAvgPowerMigration: Migration = {
+  version: 15,
+  name: 'canonical_training_derived_avg_power_w',
+  sql: `
+    -- A2: Stop "NULL avg_power => no power" inference without rewriting provenance.
+    -- activity_summaries.avg_power is sparse (NULL for many 2024 running
+    -- activities) while authoritative Garmin FIT-derived power is present as
+    -- per-duration rows in activity_power_bests (exposed as power_best_facts).
+    -- Overwriting the summary value would conflate two layers and break the
+    -- provenance contract (summary vs FIT-derived). Instead, extend the
+    -- canonical view with a derived column that aggregates the FIT signal:
+    -- derived_avg_power_w is the per-activity mean of best_power_w across
+    -- all stored durations. Callers should prefer
+    -- coalesce(avg_power, derived_avg_power_w) or use power_coverage_report /
+    -- read_series on activity_samples for the full signal. NULL remains NULL
+    -- when no FIT bests exist for that activity, making absence explicit.
+    -- Idempotent via CREATE OR REPLACE VIEW; no table mutation.
+    -- Older test fixtures (v9) created activity_summaries with only a subset
+    -- of columns; ensure the full canonical set exists so this view's
+    -- intervals_analysis (which unconditionally references training_load etc.)
+    -- does not throw Binder Error on upgrade.
+    ALTER TABLE activity_summaries ADD COLUMN IF NOT EXISTS elevation_gain_m DOUBLE;
+    ALTER TABLE activity_summaries ADD COLUMN IF NOT EXISTS calories DOUBLE;
+    ALTER TABLE activity_summaries ADD COLUMN IF NOT EXISTS max_hr DOUBLE;
+    ALTER TABLE activity_summaries ADD COLUMN IF NOT EXISTS avg_power DOUBLE;
+    ALTER TABLE activity_summaries ADD COLUMN IF NOT EXISTS weighted_power DOUBLE;
+    ALTER TABLE activity_summaries ADD COLUMN IF NOT EXISTS avg_cadence DOUBLE;
+    ALTER TABLE activity_summaries ADD COLUMN IF NOT EXISTS training_load DOUBLE;
+    ALTER TABLE activity_summaries ADD COLUMN IF NOT EXISTS rpe DOUBLE;
+    ALTER TABLE activity_summaries ADD COLUMN IF NOT EXISTS feel DOUBLE;
+    CREATE OR REPLACE VIEW canonical_activity_training AS
+    WITH ranked AS (
+      SELECT a.*, source.activity_source_id, source.provider, source.remote_activity_id, source.raw_object_hash,
+        summary.*, row_number() OVER (
+          PARTITION BY a.activity_id
+          ORDER BY CASE source.provider WHEN 'garmin' THEN 0 WHEN 'intervals' THEN 1 ELSE 2 END
+        ) AS source_rank
+      FROM activities a
+      JOIN activity_sources source USING (activity_id)
+      LEFT JOIN activity_summaries summary USING (activity_source_id)
+    ), intervals_analysis AS (
+      SELECT source.activity_id,
+        max(summary.training_load) AS intervals_training_load,
+        max(summary.rpe) AS intervals_rpe,
+        max(summary.feel) AS intervals_feel,
+        max(summary.weighted_power) AS intervals_weighted_power
+      FROM activity_sources source
+      JOIN activity_summaries summary USING (activity_source_id)
+      WHERE source.provider = 'intervals'
+      GROUP BY source.activity_id
+    ), derived_power AS (
+      SELECT activity_source_id, avg(best_power_w) AS derived_avg_power_w
+      FROM activity_power_bests
+      GROUP BY activity_source_id
+    )
+    SELECT ranked.* EXCLUDE (source_rank),
+      intervals_analysis.intervals_training_load,
+      intervals_analysis.intervals_rpe,
+      intervals_analysis.intervals_feel,
+      intervals_analysis.intervals_weighted_power,
+      derived_power.derived_avg_power_w
+    FROM ranked
+    LEFT JOIN intervals_analysis USING (activity_id)
+    LEFT JOIN derived_power USING (activity_source_id)
+    WHERE source_rank = 1;
+
+    UPDATE retrieval_index_state SET status = 'stale' WHERE index_name = 'context';
+  `,
+};
+
+export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration, syncRunProgressMigration, canonicalTrainingDerivedAvgPowerMigration];
 export type { Migration };

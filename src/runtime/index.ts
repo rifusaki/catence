@@ -87,8 +87,9 @@ export {
 } from '../core/runtime/opencode-go.js';
 export type { OpenCodeGoConsoleProfiles, OpenCodeGoMergeResult, OpenCodeGoRoute } from '../core/runtime/opencode-go.js';
 export type { InterruptedRuns, SyncProgressSnapshot, SyncProgressState } from '../contracts/progress.js';
-export { openReadOnlyRepository, ReadOnlyDatabaseError } from '../elt/storage/database.js';
+export { CatenceDatabase, openReadOnlyRepository, ReadOnlyDatabaseError } from '../elt/storage/database.js';
 export { DataWriteBusyError } from '../elt/storage/write-lock.js';
+export { migrations } from '../elt/storage/migrations.js';
 export {
   hydrateStravaActivity,
   hydrateStravaSegmentHistory,

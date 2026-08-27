@@ -41,6 +41,10 @@ export type LatestCyclingActivitiesRequest = FitnessDateRange & {
   limit?: number;
 };
 
+export type ReadinessBaselineRequest = FitnessDateRange & {
+  sport?: string;
+};
+
 type MetricRow = {
   observation_id: string;
   observed_at: string;
@@ -383,6 +387,67 @@ export class FitnessService {
       caveats: [
         'This is a descriptive, source-aware report—not a physiological performance model.',
         'FTP settings, VO₂max snapshots, volume/load, and power bests retain their individual provenance in the nested results.',
+      ],
+    };
+  }
+
+  async readinessBaseline(request: ReadinessBaselineRequest = {}): Promise<Record<string, unknown>> {
+    const sport = request.sport ?? 'running';
+    const isRunning = /run/i.test(sport);
+    const values: QueryValues = { sport };
+    const metricClauses = [
+      `metric_name IN ('running_lactate_threshold_pace_s_per_km','running_lactate_threshold_power_w','running_lactate_threshold_hr_bpm','running_lactate_threshold_power_w_kg','race_prediction_time5_k','race_prediction_time10_k','race_prediction_time_half_marathon','race_prediction_time_marathon','training_status_fitness_trend','endurance_score_overall_score')`,
+      `(lower(sport) = lower($sport) OR lower(sport) = 'generic')`,
+      ...addDateRange('observed_at', request, values),
+    ];
+    const observations = await this.repository.rows<MetricRow & { metric_name: string }>(`
+      SELECT observation_id, cast(observed_at AS VARCHAR) AS observed_at, value_number, value_text, unit, sport,
+        source_type, source_remote_id, activity_source_id, raw_object_hash, metric_name
+      FROM training_metric_observations
+      WHERE ${metricClauses.join(' AND ')}
+      ORDER BY observed_at DESC, observation_id DESC
+    `, values);
+    const [vo2max, powerCurve, powerCoverage] = await Promise.all([
+      this.vo2MaxHistory({ ...request, sport }),
+      this.powerCurveTrend({ ...request, sportFamily: isRunning ? 'running' : 'cycling' }),
+      this.powerCoverageReport({ ...request, sportFamily: isRunning ? 'running' : 'cycling' }),
+    ]);
+    const byMetric = new Map<string, Array<MetricRow & { metric_name: string }>>();
+    for (const row of observations) {
+      const arr = byMetric.get(row.metric_name) ?? [];
+      arr.push(row);
+      byMetric.set(row.metric_name, arr);
+    }
+    const latest = (name: string): (MetricRow & { metric_name: string }) | null => byMetric.get(name)?.[0] ?? null;
+    const series = (name: string): Array<MetricRow & { metric_name: string }> => byMetric.get(name) ?? [];
+    return {
+      data: {
+        sport,
+        lactateThreshold: {
+          pace_s_per_km: latest('running_lactate_threshold_pace_s_per_km'),
+          power_w: latest('running_lactate_threshold_power_w'),
+          hr_bpm: latest('running_lactate_threshold_hr_bpm'),
+          power_w_kg: latest('running_lactate_threshold_power_w_kg'),
+          powerSeries: series('running_lactate_threshold_power_w'),
+        },
+        vo2max,
+        racePrediction: {
+          time5_k: latest('race_prediction_time5_k'),
+          time10_k: latest('race_prediction_time10_k'),
+          timeHalfMarathon: latest('race_prediction_time_half_marathon'),
+          timeMarathon: latest('race_prediction_time_marathon'),
+        },
+        fitnessTrend: latest('training_status_fitness_trend'),
+        enduranceScore: latest('endurance_score_overall_score'),
+        powerCurve,
+        powerCoverage,
+      },
+      provenance: { dataset: 'training_metric_observations', powerDataset: 'power_best_facts' },
+      query: request,
+      caveats: [
+        'Readiness baseline is descriptive, not a physiological performance model; it combines lactate threshold, VO₂max, race prediction, fitness trend, and FIT-derived power.',
+        'Running power uses Garmin FIT-derived power bests (power_best_facts), not sparse activity-summary average power; a NULL summary avg_power does not mean no power.',
+        'Course/elevation profile for a specific race is not included here; resolve the event courseId separately before reusing any prior course profile.',
       ],
     };
   }

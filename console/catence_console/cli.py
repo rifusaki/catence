@@ -144,6 +144,35 @@ def serve(args: argparse.Namespace) -> int:
     console_root = Path(__file__).resolve().parent
     validate_auth_configuration()
 
+    # Best-effort data migration for Docker updates. The Node runtime bumps
+    # the DuckDB schema (canonical_training_derived_avg_power_w etc.); a
+    # stale file would make the read-only MCP health probe reject requests
+    # until the next manual sync. Running `catence-data migrate --all`
+    # here (when Node is available) heals an existing beta install on plain
+    # `docker compose up` without wiping the volume. Failures are ignored
+    # so a missing Node binary or a locked store does not block the console.
+    try:
+        catence_bin = shutil.which("catence-data") or shutil.which("catence")
+        if catence_bin:
+            subprocess.run(
+                [catence_bin, "--home", str(catalog_home), "migrate", "--all"],
+                timeout=30,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            # Fallback for source checkouts where the binary is only via npx.
+            subprocess.run(
+                ["npx", "--yes", f"catence@{CATENCE_RELEASE_VERSION}", "--home", str(catalog_home), "migrate", "--all"],
+                timeout=30,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+    except Exception:
+        pass
+
     environment = dict(os.environ)
     environment.update(
         {
