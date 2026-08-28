@@ -264,3 +264,83 @@ def test_max_metrics_history_retains_distinct_historical_days(tmp_path):
         ("max_metric", "max_metrics:2025-06-02", "2025-06-02"),
     ]
     assert api.fallback_calls == []
+
+
+def test_stage_course_fetches_and_stages_a_course_source_entity(tmp_path):
+    class CourseApi:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def connectapi(self, path: str) -> dict[str, object]:
+            self.calls.append(path)
+            return {"courseId": 507213271, "courseName": "Autumn Half", "geoPoints": [
+                {"latitude": 47.3, "longitude": 11.2, "elevation": 540, "distance": 0},
+            ]}
+
+    writer = Writer()
+    api = CourseApi()
+    worker = GarminStagingWorker(api, writer, tmp_path)
+
+    worker.stage_course("507213271")
+
+    assert api.calls == ["course-service/course/507213271"]
+    courses = [entity for entity in writer.entities if entity[0] == "course"]
+    assert len(courses) == 1
+    # entity tuple: (entity_type, remote_id, item, raw_hash, parent_remote_id, occurred_on, kwargs)
+    assert courses[0][1] == "507213271"
+    assert courses[0][4] == "507213271"
+
+
+def test_event_course_auto_discovery_stages_each_distinct_course_once(tmp_path):
+    class DiscoveryApi:
+        def __init__(self) -> None:
+            self.course_calls: list[str] = []
+
+        def get_events(self, _start_date, limit=100, page=1):
+            return [
+                {"id": page * 10 + 1, "eventName": "Race A", "courseId": "507213271"},
+                {"id": page * 10 + 2, "eventName": "Race B", "course_id": 507213272},
+                {"id": page * 10 + 3, "eventName": "Race A dup", "courseId": "507213271"},
+            ]
+
+        def connectapi(self, path):
+            self.course_calls.append(path)
+            return {"courseId": 507213271, "courseName": f"c{path}", "geoPoints": [
+                {"latitude": 1, "longitude": 2, "elevation": 3, "distance": 0},
+            ]}
+
+    writer = Writer()
+    api = DiscoveryApi()
+    worker = GarminStagingWorker(api, writer, tmp_path)
+
+    worker._fetch_garmin_events("2026-08-01")
+
+    # Two distinct courseIds -> one course fetch each; the duplicate courseId is fetched once.
+    assert api.course_calls == ["course-service/course/507213271", "course-service/course/507213272"]
+    courses = [entity for entity in writer.entities if entity[0] == "course"]
+    assert [entity[1] for entity in courses] == ["507213271", "507213272"]
+
+
+def test_event_course_auto_discovery_skips_already_archived_courses(tmp_path):
+    class ArchivedApi:
+        def __init__(self) -> None:
+            self.course_calls: list[str] = []
+
+        def connectapi(self, path):
+            self.course_calls.append(path)
+            return {}
+
+        def get_events(self, _start_date, limit=100, page=1):
+            return [{"id": 9, "eventName": "Race A", "courseId": "507213271"}]
+
+    archive = tmp_path / "raw" / "garmin" / "course" / "507213271"
+    archive.mkdir(parents=True)
+    (archive / "existing.json").write_text("{}")
+
+    writer = Writer()
+    api = ArchivedApi()
+    worker = GarminStagingWorker(api, writer, tmp_path)
+
+    worker._fetch_garmin_events("2026-08-01")
+
+    assert api.course_calls == []

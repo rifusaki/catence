@@ -932,5 +932,58 @@ const canonicalTrainingDerivedAvgPowerMigration: Migration = {
   `,
 };
 
-export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration, syncRunProgressMigration, canonicalTrainingDerivedAvgPowerMigration];
+const courseGeometryMigration: Migration = {
+  version: 16,
+  name: 'course_geometry',
+  sql: `
+    -- A4: Garmin course/route geometry so a race's elevation/grade profile can be
+    -- resolved and compared against a prior activity's course. garminconnect
+    -- 0.3.x has no dedicated course method, so courses are staged from the raw
+    -- Connect API (connectapi("course-service/course/{id}"), validated live:
+    -- returns metadata + a geoPoints geometry array) and normalized here.
+    -- courseId is the Garmin course identifier referenced by an event's courseId.
+    CREATE TABLE IF NOT EXISTS course_geometry (
+      course_id VARCHAR NOT NULL,
+      seq INTEGER NOT NULL,
+      lat DOUBLE,
+      lon DOUBLE,
+      altitude_m DOUBLE,
+      distance_m DOUBLE,
+      raw_object_hash VARCHAR,
+      PRIMARY KEY (course_id, seq)
+    );
+
+    UPDATE retrieval_index_state SET status = 'stale' WHERE index_name = 'context';
+  `,
+};
+
+const activityDecouplingFactsMigration: Migration = {
+  version: 17,
+  name: 'activity_decoupling_facts',
+  sql: `
+    -- A3 (persistence): make aerobic decoupling (Pa:Hr) and grade-adjusted pace
+    -- (GAP) queryable historically instead of only inside one activity's raw
+    -- metrics_json. Rows are provider-supplied when the provider payload carries
+    -- them (source_type 'provider'); locally derived values are tagged 'derived'
+    -- with caveats_json. Provider values remain authoritative and are never
+    -- overwritten by derivation.
+    CREATE TABLE IF NOT EXISTS activity_decoupling_facts (
+      provider VARCHAR NOT NULL,
+      activity_source_id VARCHAR NOT NULL,
+      sport VARCHAR,
+      started_at_utc TIMESTAMPTZ,
+      metric VARCHAR NOT NULL,
+      value_number DOUBLE,
+      unit VARCHAR,
+      source_type VARCHAR NOT NULL,
+      caveats_json JSON,
+      raw_object_hash VARCHAR,
+      PRIMARY KEY (provider, activity_source_id, metric)
+    );
+
+    UPDATE retrieval_index_state SET status = 'stale' WHERE index_name = 'context';
+  `,
+};
+
+export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration, syncRunProgressMigration, canonicalTrainingDerivedAvgPowerMigration, courseGeometryMigration, activityDecouplingFactsMigration];
 export type { Migration };

@@ -46,6 +46,7 @@ export type { DataFilter } from '../core/query/analytics.js';
 export { ActivityDiscoveryService } from '../core/query/activity-discovery.js';
 export { DATASET_CATALOG, getDataset, QueryValidationError } from '../core/query/catalog.js';
 export { FitnessService } from '../core/query/fitness.js';
+export { EventsService, extractCourseId } from '../core/query/events.js';
 export { SwimmingService } from '../core/query/swimming.js';
 export { WELLNESS_METRICS, WellnessService } from '../core/query/wellness.js';
 export { jsonSafe, ReadOnlyRepository } from '../core/query/repository.js';

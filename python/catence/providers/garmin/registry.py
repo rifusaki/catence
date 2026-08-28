@@ -33,6 +33,7 @@ GARMIN_READ_METHODS = {
     ),
     "workouts": ("get_workouts", "get_scheduled_workouts"),
     "events": ("get_events",),
+    "course": ("connectapi",),
     "goals": ("get_goals",),
     "gear": ("get_gear",),
     "golf": ("get_golf_summary",),

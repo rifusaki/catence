@@ -277,6 +277,7 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
 
   if (entity.entityType === 'activity') {
     await importActivity(database, entity.provider, entity.remoteId, payload, rawHash);
+    await importActivityDecoupling(database, entity.provider, entity.remoteId, payload, rawHash);
     if (entity.provider === 'intervals') await importIntervalsAutoSwimSets(database, entity.remoteId, payload, rawHash);
     if (entity.provider === 'garmin') {
       await importGarminCyclingFtpFromActivity(database, entity.remoteId, payload, rawHash);
@@ -301,6 +302,7 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
   if (entity.provider === 'garmin' && ['endurance_score', 'hill_score', 'running_tolerance', 'race_prediction'].includes(entity.entityType)) await importGarminNumericSeries(database, entity.entityType, entity.remoteId, entity.occurredOn, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'health_event') await importHealthSession(database, entity.remoteId, entity.occurredOn, 'daily_event', payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'activity_power_best') await importActivityPowerBest(database, entity.parentRemoteId, payload, rawHash);
+  if (entity.provider === 'garmin' && entity.entityType === 'course') await importGarminCourse(database, entity.remoteId, payload, rawHash);
 }
 
 async function importActivity(database: CatenceDatabase, provider: Provider, remoteId: string, payload: JsonObject, rawHash: string | null): Promise<void> {
@@ -549,6 +551,102 @@ async function importGarminNumericSeries(database: CatenceDatabase, entityType: 
       sport, observedAt, value: leaf.number, valueText: leaf.text, unit: null, deviceId,
       sourceType: entityType, sourceRemoteId: remoteId, activitySourceId: null, rawHash,
     });
+  }
+}
+
+const DECOUPLING_METRICS: ReadonlyArray<{ metric: string; unit: string; keys: readonly string[] }> = [
+  { metric: 'aerobic_decoupling_pct', unit: 'pct', keys: ['decoupling', 'aerobicDecoupling', 'icu_decoupling', 'paHrDecoupling', 'pwHrDecoupling', 'aerobic_decoupling'] },
+  { metric: 'grade_adjusted_pace_s_per_km', unit: 's_per_km', keys: ['gap', 'gradeAdjustedPace', 'icu_gap', 'grade_adjusted_pace'] },
+];
+
+/** Containers searched for provider-supplied decoupling/GAP: the payload itself,
+ * its common nested analysis/metrics objects, and the stored metrics_json. */
+function decouplingContainers(payload: JsonObject): JsonObject[] {
+  const containers: JsonObject[] = [payload];
+  for (const key of ['analysis', 'data', 'metrics', 'icuAnalysis', 'summaries']) {
+    const nested = payload[key];
+    if (nested !== null && typeof nested === 'object' && !Array.isArray(nested)) containers.push(nested as JsonObject);
+  }
+  const metricsJson = payload.metrics_json;
+  if (metricsJson !== undefined && metricsJson !== null) containers.push(objectFromJson(metricsJson));
+  return containers;
+}
+
+/** A3 (persistence): persist provider-supplied aerobic decoupling (Pa:Hr) and
+ * grade-adjusted pace from an activity payload so they are queryable historically
+ * instead of only inside one activity's raw metrics_json. Provider values are
+ * stored as source_type 'provider' and are authoritative. Locally derived values
+ * (deriveDecoding/deriveGap) are a separate, still-derived path. */
+async function importActivityDecoupling(database: CatenceDatabase, provider: Provider, remoteId: string, payload: JsonObject, rawHash: string | null): Promise<void> {
+  const activitySourceId = providerActivityId(provider, remoteId);
+  const fields = activityFields(provider, payload);
+  const containers = decouplingContainers(payload);
+  for (const spec of DECOUPLING_METRICS) {
+    let value: number | null = null;
+    for (const container of containers) {
+      const found = firstNumber(container, spec.keys);
+      if (found !== null) { value = found; break; }
+    }
+    if (value === null) continue;
+    await database.run(
+      `INSERT INTO activity_decoupling_facts (provider, activity_source_id, sport, started_at_utc, metric, value_number, unit, source_type, caveats_json, raw_object_hash)
+       VALUES ($provider, $activitySourceId, $sport, try_cast($startedAtUtc AS TIMESTAMPTZ), $metric, $value, $unit, 'provider', $caveats, $rawHash)
+       ON CONFLICT (provider, activity_source_id, metric) DO UPDATE SET
+         sport = excluded.sport, started_at_utc = excluded.started_at_utc, value_number = excluded.value_number,
+         unit = excluded.unit, source_type = excluded.source_type, caveats_json = excluded.caveats_json, raw_object_hash = excluded.raw_object_hash`,
+      { provider, activitySourceId, sport: fields.sport, startedAtUtc: fields.startAtUtc, metric: spec.metric, value, unit: spec.unit, caveats: json({}), rawHash },
+    );
+  }
+}
+
+/** Pull a course's ordered geometry samples, tolerating the several shapes a
+ * Garmin course payload may use (a flat ``geoPoints`` array on the live course
+ * endpoint, legacy ``coursePoints``, or points nested under a geo/route object).
+ * Returns an empty list when no geometry is present. */
+function courseGeometryPoints(payload: JsonObject): JsonObject[] {
+  const candidates: unknown[] = [payload.geoPoints, payload.coursePoints, payload.geo, payload.points, payload.geometry, payload.locations, payload.geoRoute];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return objectArray(candidate);
+    if (candidate !== null && typeof candidate === 'object' && !Array.isArray(candidate)) {
+      const obj = candidate as JsonObject;
+      for (const key of ['coursePoints', 'points', 'locations', 'coursePoint']) {
+        if (Array.isArray(obj[key])) return objectArray(obj[key]);
+      }
+    }
+  }
+  return [];
+}
+
+/** A4: normalize Garmin course geometry into course_geometry so a race's
+ * elevation/grade profile can be resolved and diffed. The raw payload is also
+ * stored by importSourceEntity, so this only fans the points into rows. Live
+ * Garmin courses carry a ``geoPoints`` array (one row per sample); inserts are
+ * batched because a full course is roughly two thousand points. */
+async function importGarminCourse(database: CatenceDatabase, remoteId: string, payload: JsonObject, rawHash: string | null): Promise<void> {
+  const points = courseGeometryPoints(payload);
+  const CHUNK = 500;
+  for (let offset = 0; offset < points.length; offset += CHUNK) {
+    const chunk = points.slice(offset, offset + CHUNK);
+    const values: Record<string, unknown> = { courseId: remoteId, rawHash };
+    const rows: string[] = [];
+    for (let i = 0; i < chunk.length; i++) {
+      const point = chunk[i];
+      const seq = offset + i;
+      values[`seq${i}`] = seq;
+      values[`lat${i}`] = firstNumber(point, ['latitude', 'lat']);
+      values[`lon${i}`] = firstNumber(point, ['longitude', 'lon', 'lng']);
+      values[`alt${i}`] = firstNumber(point, ['elevation', 'altitude', 'altitudeMeters', 'ele']);
+      values[`dist${i}`] = firstNumber(point, ['distance', 'distanceMeters', 'distance_m']);
+      rows.push(`($courseId, $seq${i}, $lat${i}, $lon${i}, $alt${i}, $dist${i}, $rawHash)`);
+    }
+    await database.run(
+      `INSERT INTO course_geometry (course_id, seq, lat, lon, altitude_m, distance_m, raw_object_hash)
+       VALUES ${rows.join(', ')}
+       ON CONFLICT (course_id, seq) DO UPDATE SET
+         lat = excluded.lat, lon = excluded.lon, altitude_m = excluded.altitude_m,
+         distance_m = excluded.distance_m, raw_object_hash = excluded.raw_object_hash`,
+      values,
+    );
   }
 }
 

@@ -447,7 +447,7 @@ export class FitnessService {
       caveats: [
         'Readiness baseline is descriptive, not a physiological performance model; it combines lactate threshold, VO₂max, race prediction, fitness trend, and FIT-derived power.',
         'Running power uses Garmin FIT-derived power bests (power_best_facts), not sparse activity-summary average power; a NULL summary avg_power does not mean no power.',
-        'Course/elevation profile for a specific race is not included here; resolve the event courseId separately before reusing any prior course profile.',
+        'Course/elevation profile for a specific race is not included here; call resolve_event_course(eventId) before reusing any prior course profile.',
       ],
     };
   }

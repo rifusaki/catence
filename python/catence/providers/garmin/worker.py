@@ -8,7 +8,7 @@ from typing import Any, Callable, Mapping
 
 from .progress import ProgressReporter
 from .registry import GARMIN_READ_METHODS, assert_read_only_registry
-from .staging import StagingWriter
+from .staging import StagingWriter, safe_segment
 from .streams import SAMPLE_COLUMNS, activity_details_to_samples, activity_power_bests, fit_archive_to_samples, fit_archive_to_swim_lengths, write_parquet
 
 
@@ -794,9 +794,37 @@ class GarminStagingWorker:
         if self.progress is not None:
             self.progress.advance(completed=len(calls) + len(months) + 1)
 
+    def stage_course(self, course_id: str) -> None:
+        """Fetch one Garmin course by id and stage it as a source entity.
+
+        garminconnect 0.3.x exposes no first-class course method, so this uses
+        the authenticated Connect API directly:
+        ``connectapi("course-service/course/{course_id}")``. Validated against a
+        live account (returns course metadata plus a ``geoPoints`` geometry array).
+        Failures are captured per call and reported as extraction errors without
+        aborting the rest of the sync.
+
+        The course is staged with remote_id == course_id (not an auto-derived
+        id) so event resolution can match the courseId an event references.
+        """
+        payload, raw_hash = self._capture(
+            "course",
+            lambda course_id=course_id: self.api.connectapi(f"course-service/course/{course_id}"),
+            course_id,
+        )
+        if payload is not None:
+            self.writer.source_entity("course", course_id, payload, raw_hash, course_id)
+
     def _fetch_garmin_events(self, start_date: str) -> None:
-        """Fetch calendar events from start_date, following pagination."""
+        """Fetch calendar events from start_date, following pagination.
+
+        Any event that references a Garmin course (``courseId``/``course_id``)
+        triggers an automatic course fetch via stage_course, so a race's
+        geometry is synced without a manual recon run. Already-archived courses
+        are skipped to avoid re-fetching unchanged geometry every sync.
+        """
         page = 1
+        discovered_course_ids: set[str] = set()
         while True:
             payload, raw_hash = self._capture(
                 "garmin_events",
@@ -806,6 +834,20 @@ class GarminStagingWorker:
             items = payload if isinstance(payload, list) else []
             if items:
                 self._entity("garmin_events", "event", items, raw_hash)
+                for item in items:
+                    if isinstance(item, Mapping):
+                        course_id = item.get("courseId") or item.get("course_id")
+                        if course_id:
+                            discovered_course_ids.add(str(course_id))
             if len(items) < 100:
-                return
+                break
             page += 1
+        for course_id in sorted(discovered_course_ids):
+            self._check_interrupted()
+            if not self._course_archived(course_id):
+                self.stage_course(course_id)
+
+    def _course_archived(self, course_id: str) -> bool:
+        """True when a course archive already exists under raw/garmin/course/{id}."""
+        directory = self.data_dir / "raw" / "garmin" / "course" / safe_segment(course_id)
+        return directory.is_dir() and any(directory.glob("*.json"))

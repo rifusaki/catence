@@ -15,6 +15,7 @@ export type DatasetName =
   | 'wellness_samples'
   | 'health_sessions'
   | 'power_bests'
+  | 'activity_decoupling'
   | 'nutrition_days'
   | 'nutrition_items'
   | 'events'
@@ -118,6 +119,10 @@ export const DATASET_CATALOG: Record<Exclude<DatasetName, 'training_metrics'>, D
   power_bests: {
     name: 'power_bests', relation: 'power_best_facts', description: 'Power-duration bests derived from Garmin FIT streams; they are labelled derived while retaining the Garmin activity provenance.', dateColumn: 'started_at_utc', provenanceColumns: ['provider', 'activity_source_id', 'source_type', 'raw_object_hash'], permittedGroupings: ['provider', 'sport', 'duration_s', 'source_type'],
     columns: [column('provider', 'VARCHAR', { filterable: true, groupable: true }), column('activity_source_id', 'VARCHAR', { filterable: true, groupable: true }), column('activity_id', 'VARCHAR', { filterable: true, groupable: true }), column('started_at_utc', 'TIMESTAMPTZ', { filterable: true }), column('sport', 'VARCHAR', { filterable: true, groupable: true }), column('duration_s', 'INTEGER', { filterable: true, groupable: true }), column('best_power_w', 'DOUBLE', { unit: 'W', metric: true }), column('source_type', 'VARCHAR', { filterable: true, groupable: true }), column('raw_object_hash', 'VARCHAR')],
+  },
+  activity_decoupling: {
+    name: 'activity_decoupling', relation: 'activity_decoupling_facts', description: 'Persisted per-activity aerobic decoupling (Pa:Hr, pct) and grade-adjusted pace (s/km) with provenance. source_type provider means the provider payload supplied the value (authoritative); derived values are tagged locally. Values never overwrite provider output. Not a physiological performance model.', dateColumn: 'started_at_utc', provenanceColumns: ['provider', 'activity_source_id', 'raw_object_hash'], permittedGroupings: ['provider', 'sport', 'metric', 'source_type'],
+    columns: [column('provider', 'VARCHAR', { filterable: true, groupable: true }), column('activity_source_id', 'VARCHAR', { filterable: true, groupable: true }), column('sport', 'VARCHAR', { filterable: true, groupable: true }), column('started_at_utc', 'TIMESTAMPTZ', { filterable: true }), column('metric', 'VARCHAR', { filterable: true, groupable: true }), column('value_number', 'DOUBLE', { metric: true }), column('unit', 'VARCHAR', { filterable: true, groupable: true }), column('source_type', 'VARCHAR', { filterable: true, groupable: true }), column('raw_object_hash', 'VARCHAR')],
   },
   nutrition_days: {
     name: 'nutrition_days', relation: 'nutrition_days', description: 'Daily nutrition totals, never a replacement for the item-level food log.', dateColumn: 'nutrition_date', provenanceColumns: ['provider', 'raw_object_hash'], permittedGroupings: ['provider'],

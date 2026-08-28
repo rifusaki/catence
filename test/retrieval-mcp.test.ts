@@ -214,4 +214,31 @@ describe('read-only retrieval and analytics', () => {
       await server.close();
     }
   });
+
+  it('exposes a complete tool index via the catence://tools resource', async () => {
+    const paths = await fixture();
+    const server = createCatenceMcpServer(paths);
+    const client = new Client({ name: 'catence-test-client', version: '0.1.0' });
+    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    try {
+      const resource = await client.readResource({ uri: 'catence://tools' });
+      const payload = JSON.parse(((resource as { contents: Array<{ text: string }> }).contents[0]?.text) ?? '{}') as {
+        count: number;
+        tools: Array<{ name: string; purpose: string; description: string }>;
+      };
+      expect(payload.count).toBeGreaterThanOrEqual(30);
+      const names = payload.tools.map((tool) => tool.name);
+      expect(names).toEqual(expect.arrayContaining([
+        'readiness_baseline', 'read_series', 'aggregate_data', 'analyze_series',
+        'query_read_only_data', 'describe_data', 'get_ftp_history', 'get_vo2max_history',
+        'power_coverage_report', 'find_activities',
+      ]));
+      expect(payload.tools.find((tool) => tool.name === 'readiness_baseline')?.purpose).toMatch(/readiness/i);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
 });
