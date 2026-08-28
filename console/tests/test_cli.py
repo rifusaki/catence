@@ -103,5 +103,10 @@ def test_serve_runs_chainlit_from_the_installed_console_package(monkeypatch, tmp
     )
 
     assert result == 0
-    assert calls[0]["cwd"] == Path(cli.__file__).resolve().parent
-    assert calls[0]["command"][4] == str(Path(cli.__file__).resolve().with_name("app.py"))
+    # serve() first runs a best-effort `catence-data migrate --all` via
+    # subprocess.run, which internally constructs a Popen; the patched Popen
+    # therefore captures that migrate call too. Find the chainlit process by
+    # command instead of assuming it is the very first call.
+    chainlit_call = next(call for call in calls if "chainlit" in call["command"])
+    assert chainlit_call["cwd"] == Path(cli.__file__).resolve().parent
+    assert chainlit_call["command"][4] == str(Path(cli.__file__).resolve().with_name("app.py"))
