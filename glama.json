@@ -6,10 +6,10 @@
   "transport": "stdio",
   "install": {
     "command": "npx",
-    "args": ["--yes", "catence@0.2.0-beta.24"]
+    "args": ["--yes", "catence@0.2.0-beta.25"]
   },
   "demo": {
     "command": "npx",
-    "args": ["--yes", "catence@0.2.0-beta.24", "demo"]
+    "args": ["--yes", "catence@0.2.0-beta.25", "demo"]
   }
 }

@@ -215,10 +215,27 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     const originalRegister = server.registerTool.bind(server) as unknown as (name: string, configuration: Record<string, unknown>, handler: unknown) => unknown;
     (server as unknown as { registerTool: (name: string, configuration: Record<string, unknown>, handler: unknown) => unknown }).registerTool = (name, configuration, handler) => {
       const originalInput = configuration.inputSchema as Record<string, z.ZodType> | undefined;
+      let mergedInputSchema: unknown;
+      if (originalInput) {
+        const hasV4 = '_zod' in originalInput;
+        const hasV3 = '_def' in originalInput;
+        if (hasV4 || hasV3) {
+          // originalInput is already a Zod object schema; extract its shape and
+          // merge athleteId into a new object of the same Zod version.
+          const rawShape = (originalInput as unknown as { shape?: Record<string, z.ZodType> }).shape;
+          const shape: Record<string, z.ZodType> = typeof rawShape === 'object' && rawShape !== null ? rawShape : {};
+          mergedInputSchema = z.object({ ...shape, athleteId: athleteIdSchema });
+        } else {
+          // originalInput is a raw shape (plain object of Zod schemas).
+          mergedInputSchema = { athleteId: athleteIdSchema, ...originalInput };
+        }
+      } else {
+        mergedInputSchema = { athleteId: athleteIdSchema };
+      }
       return originalRegister(name, {
         ...configuration,
         description: `${String(configuration.description ?? '')} Requires athleteId from list_athletes.`,
-        inputSchema: { athleteId: athleteIdSchema, ...(originalInput ?? {}) },
+        inputSchema: mergedInputSchema,
       }, handler);
     };
   }
