@@ -167,6 +167,8 @@ if [ -f "$DEPLOY_DIR/.env" ]; then
   [ -n "$USERNAME" ]          || USERNAME="$(dotenv_get CATENCE_CONSOLE_USERNAME "$DEPLOY_DIR/.env")"
   [ -n "$PASSWORD_HASH" ]      || PASSWORD_HASH="$(dotenv_get CATENCE_CONSOLE_PASSWORD_HASH "$DEPLOY_DIR/.env")"
   [ -n "$AUTH_SECRET" ]        || AUTH_SECRET="$(dotenv_get CHAINLIT_AUTH_SECRET "$DEPLOY_DIR/.env")"
+  [ -n "${NPM_VERSION:-}" ]              || NPM_VERSION="$(dotenv_get CATENCE_NPM_VERSION "$DEPLOY_DIR/.env")"
+  [ -n "${CONSOLE_VERSION:-}" ]          || CONSOLE_VERSION="$(dotenv_get CATENCE_CONSOLE_VERSION "$DEPLOY_DIR/.env")"
   [ -n "${OPENAI_API_KEY:-}" ]    || OPENAI_API_KEY="$(dotenv_get OPENAI_API_KEY "$DEPLOY_DIR/.env")"
   [ -n "${OPENAI_API_BASE:-}" ]   || OPENAI_API_BASE="$(dotenv_get OPENAI_API_BASE "$DEPLOY_DIR/.env")"
   [ -n "${ANTHROPIC_API_KEY:-}" ] || ANTHROPIC_API_KEY="$(dotenv_get ANTHROPIC_API_KEY "$DEPLOY_DIR/.env")"
