@@ -109,7 +109,7 @@ export class SwimmingService {
         availability: {
           explicitLengthFacts: lengths.length > 0,
           setFacts: sets.length > 0,
-          perLengthPaceAvailable: lengths.some((length) => Number(length.duration_s) > 0 && Number(length.distance_m) > 0),
+          perLengthPaceAvailable: lengths.some((length) => Number(length.duration_s) > 0),
         },
       };
     }));
@@ -167,7 +167,7 @@ export class SwimmingService {
         FROM activity_quality_flags GROUP BY activity_source_id
       ), lengths AS (
         SELECT activity_source_id, count(*) AS length_fact_count,
-          count(*) FILTER (WHERE duration_s > 0 AND distance_m > 0) AS pace_length_fact_count
+          count(*) FILTER (WHERE duration_s > 0) AS pace_length_fact_count
         FROM swim_lengths GROUP BY activity_source_id
       ), sets AS (
         SELECT activity_source_id, count(*) AS set_fact_count FROM swim_sets GROUP BY activity_source_id

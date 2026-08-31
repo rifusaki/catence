@@ -5,6 +5,8 @@ import { jsonSafe, ReadOnlyRepository } from './repository.js';
 
 export type FindActivitiesRequest = {
   sports?: string[];
+  /** Accepted as a convenience alias for `sports: [sport]`. */
+  sport?: string;
   distanceKm?: [number, number];
   nameContains?: string[];
   startDate?: string;
@@ -80,7 +82,7 @@ export class ActivityDiscoveryService {
   constructor(private readonly repository: ReadOnlyRepository) {}
 
   async findActivities(request: FindActivitiesRequest = {}): Promise<Record<string, unknown>> {
-    const sports = [...new Set((request.sports ?? []).map((sport) => sport.trim()).filter(Boolean))];
+    const sports = [...new Set((request.sports ?? (request.sport ? [request.sport] : [])).map((sport) => sport.trim()).filter(Boolean))];
     const names = [...new Set((request.nameContains ?? []).map((name) => name.trim()).filter(Boolean))];
     if (sports.length > 12 || names.length > 12) throw new QueryValidationError('sports and nameContains each permit at most 12 values.');
     if (request.distanceKm && (!Number.isFinite(request.distanceKm[0]) || !Number.isFinite(request.distanceKm[1]) || request.distanceKm[0] < 0 || request.distanceKm[0] > request.distanceKm[1])) {

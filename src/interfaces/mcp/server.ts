@@ -79,6 +79,7 @@ const MCP_INSTRUCTIONS = [
   'When summary metric is NULL (e.g. avg_power), fall through to FIT-derived/samples layer before declaring absence.',
   'Before reusing any prior course/elevation profile, resolve event\'s courseId and diff it against past activity\'s course; different courseId => different profile.',
   'If a needed tool is not visible in your current tool list (the host may truncate it to a subset), read the catence://tools resource to discover all available tools before concluding a capability is absent.',
+  'For swim analysis: use find_activities (sports: ["lap_swimming"] or sport: "lap_swimming") to list pool sessions. Use get_swim_laps for per-length data (pace from duration_s/pool_length_m, SPL from stroke_count, SWOLF from duration_s+stroke_count). Use swim_progress_report for session-level SWOLF, fastest-100, and stroke cadence. Per-length SWOLF is derived when the provider does not supply it. Per-length distance is typically null in Garmin FIT; use pool_length_m for pace calculations.',
 ].join(' ');
 
 function textResult(value: unknown): ToolResult {
@@ -530,6 +531,7 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     title: 'Find activities and likely races',
     description: 'Find canonical activities by sport, distance, name, and date. Results are paginated and transparently flag likely-race signals without claiming provider-confirmed race metadata. Read-only.',
     inputSchema: {
+      sport: z.string().min(1).optional(),
       sports: z.array(z.string().min(1)).min(1).max(12).optional(),
       distanceKm: z.tuple([z.number().min(0), z.number().min(0)]).optional(),
       nameContains: z.array(z.string().min(1)).min(1).max(12).optional(),
