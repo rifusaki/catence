@@ -1,7 +1,5 @@
 # Distribution and release readiness
 
-Catence now has a repeatable distribution path.
-
 ## Artifacts
 
 | Surface | Source | Consumer path |
@@ -45,14 +43,3 @@ For beta tags, the dedicated `Beta` workflow publishes npm with the `beta`
 dist-tag and creates a GitHub prerelease after the corresponding Chainlit beta
 is available. The server procedure and acceptance criteria are in
 [release/beta-checklist.md](../release/beta-checklist.md).
-
-## Current operational gaps
-
-- The npm package name is available at the time this document was written, but it is not claimed until the first successful npm publish.
-- The MCPB demo bundle includes Node dependencies for its target platform. It is intentionally a generated-data experience; live Garmin/Intervals/Strava setup remains explicit so a desktop extension never receives provider credentials by surprise.
-- Live Garmin and Strava extraction still require Python 3.12 and `uv`; a future fully bundled provider runtime would remove that prerequisite.
-- MCPB artifacts are unsigned until a production code-signing certificate is configured. MCPB-capable clients may show an unsigned-extension warning.
-- `catence-chainlit` must be released from the maintained UI fork before each matching Catence tag. Until the first public wheel exists, Console source development uses a locally built wheel.
-- CI produces native MCPB assets for the standard GitHub runner architectures. ARM Linux and Windows-on-ARM need additional runners before assets can be advertised for those targets.
-
-These gaps are product/release work, not silent runtime fallbacks: the npm and APM paths make their assumptions explicit, and the demo stays synthetic until the user runs the separate live sync workflow.

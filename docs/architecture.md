@@ -74,7 +74,7 @@ Normalized tables preserve provenance rather than force an early merge:
 
 ### 3. Queries, tools and methods
 
-The MCP process is a separate stdio consumer. Ordinary tools and resources open DuckDB `READ_ONLY` snapshots. The only write capabilities are the explicit `hydrate_strava_activity`, serial `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history` tools: each acquires the shared data-directory lock, calls only the Strava GET allowlist, archives responses before normalization, commits, and releases the lock. If another writer owns it, the result is retryable `data_sync_in_progress`.
+The MCP process is a separate stdio consumer. Ordinary tools and resources open DuckDB `READ_ONLY` snapshots. The only direct database writers are the explicit `hydrate_strava_activity`, serial `hydrate_recent_strava_activities`, and `hydrate_strava_segment_history` tools: each acquires the shared data-directory lock, calls only the Strava GET allowlist, archives responses before normalization, commits, and releases the lock. If another writer owns it, the result is retryable `data_sync_in_progress`. `start_detached_sync` is also a write tool: it spawns a detached `catence-data sync` child process (which acquires the lock itself) and returns immediately with the run handle.
 
 The query layer has four shared pieces:
 
@@ -93,11 +93,12 @@ The server exposes these tools, grouped by purpose:
 - Review workflows: `review_daily_recovery_load`, `review_weekly_training`, `review_activity_deep_dive`, plus the matching `daily_recovery_load_review`, `weekly_training_review`, and `activity_deep_dive` prompts.
 - General data and analytics: `describe_data`, `describe_dataset`, `read_series`, `aggregate_data`, `analyze_series`, `fit_series_model`, `query_read_only_data`, `search_context`.
 - Wellness: `wellness_correlate`, `wellness_baselines`, `wellness_anomalies`, `wellness_coverage`.
-- Fitness and progress: `get_ftp_history`, `get_vo2max_history`, `power_curve_trend`, `power_coverage_report`, `latest_cycling_activities`, `cycling_progress_report`, `get_swim_laps`, `swim_progress_report`.
-- Activity detail and segments: `find_activities`, `get_activity_segments`.
-- Strava hydration (the only writers): `hydrate_strava_activity`, `hydrate_recent_strava_activities`, `hydrate_strava_segment_history`.
+- Fitness, readiness, and progress: `get_ftp_history`, `get_vo2max_history`, `readiness_baseline`, `power_curve_trend`, `power_coverage_report`, `activity_decoupling`, `latest_cycling_activities`, `cycling_progress_report`, `get_swim_laps`, `swim_progress_report`.
+- Activity detail and segments: `find_activities`, `get_activity_segments`, `resolve_event_course`.
+- Background sync (write): `start_detached_sync` — spawns a detached `catence-data sync` child process and returns immediately; track progress with `catence_sync_progress`.
+- Strava hydration (the only direct database writers): `hydrate_strava_activity`, `hydrate_recent_strava_activities`, `hydrate_strava_segment_history`.
 
-Resources are mode-dependent. In catalog mode the server registers only `athletes` (`catence://athletes`), the machine-readable roster of configured athlete IDs and labels; in a single-store (non-catalog) deployment it registers resources for status, catalog, a single activity template (`catence://activity/{activityId}`), and a date-range summary template (`catence://summary/{startDate}/{endDate}`).
+Resources are mode-dependent. In catalog mode the server registers only `athletes` (`catence://athletes`), the machine-readable roster of configured athlete IDs and labels; in a single-store (non-catalog) deployment it registers resources for status, catalog, a single activity template (`catence://activity/{activityId}`), and a date-range summary template (`catence://summary/{startDate}/{endDate}`). Both modes also register `tools` (`catence://tools`), a machine-readable index of all registered tools — useful when a host truncates the tool list.
 
 `catence serve` is a loopback-only-by-default Streamable HTTP adapter. It creates a stateless MCP server and transport for each `/mcp` request, so the HTTP and stdio surfaces use the same tool implementation. `GET /health` is a versioned client handshake with runtime version, protocol version, and capabilities; distributed Console builds reject an incompatible protocol before starting a chat. The same listener serves a small read-only `/api/v1/dashboard` snapshot for the local Console: canonical daily-health rows, weekly canonical activity aggregates, recent canonical activities, status, coverage, and explicit missing-data caveats.
 

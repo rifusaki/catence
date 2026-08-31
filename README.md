@@ -1,8 +1,12 @@
 # Catence
 
-Catence is a local-first fitness MCP server for Garmin, Intervals.icu, and targeted Strava enrichment. It gives an agent evidence-backed access to normalized training, wellness, activity, stream, segment, and gear data without uploading the underlying dataset to Catence.
+Local MCP server for primary Garmin data, with added Intervals.icu metrics and Strava enrichment.
 
 ![Catence](docs/assets/image.png)
+
+## ... what?
+
+As a context, I'm both an endurance athlete and a data junkie. I already got a coach for all the serious stuff, but I wanted to hook up some—any—LLM to the insane amount of data collected from Garmin, derived on Intervals.icu (I don't pay for TrainingPeaks) and comparable efforts on Strava segments. Naturally, the first answer was a local MCP server for my current tooling.
 
 ## What is included
 
@@ -95,22 +99,6 @@ catence-data update
 | [MCP activity retrieval](docs/mcp-activity-retrieval.md) | Implementation contract for answering questions, current tools, planned endpoints |
 | [Distribution](docs/distribution.md) | Release artifacts: npm, PyPI, APM, MCPB |
 
-## Safe demo and Glama
-
-Run a clearly marked generated dataset without provider accounts:
-
-```sh
-npx --yes catence@beta demo
-```
-
-It creates or reuses `~/.catence-demo` with one `demo` athlete. The generated data has explicit caveats in every tool response and never contains personal measurements. The Glama registry entry uses this command for **Try in Browser**, so the hosted sandbox has no access to local credentials or personal data.
-
-From a checkout:
-
-```sh
-npm run mcp -- demo
-```
-
 ## MCP clients and HTTP
 
 For a packaged installation, point a client at `catence`:
@@ -132,11 +120,11 @@ Optional local Streamable HTTP MCP and dashboard APIs:
 catence serve --host 127.0.0.1 --port 8787
 ```
 
-`GET /api/v1/athletes` returns IDs and labels only. `GET /api/v1/dashboard` requires `athleteId`, for example `http://127.0.0.1:8787/api/v1/dashboard?athleteId=alex&days=28`. Browser origins must be listed with `--allow-origin`; the packaged Console instead proxies the dashboard through its authenticated same-origin route. The MCP server has no authentication of its own — keep it on loopback or restrict it at the network layer (see [Docker MCP exposure](docs/deployment/docker.md#connecting-to-the-docker-based-mcp-from-outside) for the remote-access patterns).
+`GET /api/v1/athletes` returns IDs and labels only. `GET /api/v1/dashboard` requires `athleteId`, for example `http://127.0.0.1:8787/api/v1/dashboard?athleteId=alex&days=28`. Browser origins must be listed with `--allow-origin`; the packaged Console instead proxies the dashboard through its authenticated same-origin route. The MCP server has no authentication of its own.
 
 ## Configuration
 
-[`config.example.json`](config.example.json) documents rate limits, Strava budgets, and Console model profiles. It intentionally contains environment-variable names rather than credential values. Keep per-athlete provider values in `catence-data secret set`, not in `.env` or `config.json`. The full `config.json` schema — including per-model reasoning effort — is documented in [`docs/configuration.md`](docs/configuration.md) and [`docs/llm-providers.md`](docs/llm-providers.md).
+[`config.example.json`](config.example.json) documents rate limits, Strava budgets, and Console model profiles. Keep per-athlete provider values in `catence-data secret set`, not in `.env` or `config.json`. The full `config.json` schema —including per-model reasoning effort— is documented in [`docs/configuration.md`](docs/configuration.md) and [`docs/llm-providers.md`](docs/llm-providers.md).
 
 For source development:
 
@@ -147,17 +135,20 @@ npm test
 UV_CACHE_DIR=$PWD/.cache/uv uv run --project console --group dev python -m pytest console/tests -q
 ```
 
-## Beta releases
-
-Registry betas use distinct npm, console, and UI-runtime prerelease formats. Each `catence@0.2.0-beta.N` npm release maps to a `catence-console==0.2.0bN` wheel, but the console depends on a range of `catence-chainlit` (the UI runtime), so the `catence-chainlit` version does not need to match the npm or console version. For example, `catence@0.2.0-beta.1` pairs with `catence-console==0.2.0b1` and can use any compatible `catence-chainlit` (such as `0.2.0b1`). The protected `beta` branch verifies candidates;
-a `v0.2.0-beta.1` tag publishes to npm's `beta` channel and creates a GitHub
-prerelease. Follow [the beta release checklist](release/beta-checklist.md) to
-publish the UI wheel first, deploy the registry artifacts with Compose, and
-test the MCP and authenticated Console on a server without touching production
-data.
-
 ## Data and caveats
 
-Garmin is the primary source for activity and wellness data; Intervals.icu supplements training analysis; Strava is used for targeted segments, efforts, and gear. Missing fields mean a provider did not supply a value. The source credentials and source APIs determine the data available. Catence does not use the official Garmin API; Garmin sync relies on the selected athlete's email/password credentials.
+The current available sources respond to my own used platforms. I used some wrappers:
 
-See [distribution notes](docs/distribution.md) for release artifacts, including APM and MCPB demo bundles.
+- [cyberjunky/python-garminconnect](https://github.com/cyberjunky/python-garminconnect)
+- [paladini/node-intervals-icu](https://github.com/paladini/node-intervals-icu)
+- [stravalib/stravalib](https://github.com/stravalib/stravalib)
+
+Strava is only used for segments and gear.
+
+### Caveats
+
+There are two caveats to the data fetching, both coming from the fact that this was created to be used by a single person. Accessing the full Garmin API requires applying via a company—which I don't have—and getting Strava data for multiple users is another headache I don't want to get into.
+
+- I don't use the official Garmin Connect API. The library uses email/pwd.
+- Connecting Strava requires the user to be a Strava Premium subscriber and create an [API application](https://stravalib.readthedocs.io/en/latest/get-started/authenticate-with-strava.html). The rotating token is stored locally in
+`<data-dir>/secrets/strava.json`.
