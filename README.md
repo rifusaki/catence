@@ -31,7 +31,7 @@ Install Catence and create the first athlete. The default catalog home is `~/.ca
 Every `catence-data` command requires `--athlete <id>`; there is no default athlete. Pair it with `--home <dir>` to select the catalog when not using the default home.
 
 ```sh
-npm install --global catence@beta          # or catence@latest for stable
+npm install --global catence@latest          # or catence@beta
 catence-data setup --athlete alex --label "Alex"
 ```
 
