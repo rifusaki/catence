@@ -34,7 +34,8 @@ export type DatasetName =
   | 'activity_segments'
   | 'segments'
   | 'segment_effort_history'
-  | 'strava_gear';
+  | 'strava_gear'
+  | 'course_geometry';
 
 export type CatalogColumn = {
   name: string;
@@ -172,6 +173,10 @@ export const DATASET_CATALOG: Record<Exclude<DatasetName, 'training_metrics'>, D
   activity_samples: {
     name: 'activity_samples', description: 'Registered normalized activity samples from immutable Parquet; callers cannot supply file paths.', dateColumn: 'timestamp_utc', provenanceColumns: ['provider', 'activity_source_id', 'content_hash'], permittedGroupings: ['provider', 'activity_source_id'], samplesOnly: true,
     columns: [column('provider', 'VARCHAR', { filterable: true, groupable: true }), column('content_hash', 'VARCHAR', { filterable: true, groupable: true }), column('activity_source_id', 'VARCHAR', { filterable: true, groupable: true }), column('timestamp_utc', 'TIMESTAMPTZ', { filterable: true }), column('elapsed_s', 'DOUBLE', { unit: 's', metric: true }), column('distance_m', 'DOUBLE', { unit: 'm', metric: true }), column('latitude', 'DOUBLE', { unit: 'degrees', metric: true }), column('longitude', 'DOUBLE', { unit: 'degrees', metric: true }), column('altitude_m', 'DOUBLE', { unit: 'm', metric: true }), column('heart_rate_bpm', 'DOUBLE', { unit: 'bpm', metric: true }), column('power_w', 'DOUBLE', { unit: 'W', metric: true }), column('cadence_rpm', 'DOUBLE', { unit: 'rpm', metric: true }), column('speed_mps', 'DOUBLE', { unit: 'm/s', metric: true }), column('temperature_c', 'DOUBLE', { unit: 'C', metric: true }), column('grade_pct', 'DOUBLE', { unit: '%', metric: true }), column('left_right_balance_pct', 'DOUBLE', { unit: '%', metric: true }), column('left_torque_effectiveness_pct', 'DOUBLE', { unit: '%', metric: true }), column('right_torque_effectiveness_pct', 'DOUBLE', { unit: '%', metric: true }), column('left_pedal_smoothness_pct', 'DOUBLE', { unit: '%', metric: true }), column('right_pedal_smoothness_pct', 'DOUBLE', { unit: '%', metric: true }), column('left_power_phase_start_deg', 'DOUBLE', { unit: 'degrees', metric: true }), column('left_power_phase_end_deg', 'DOUBLE', { unit: 'degrees', metric: true }), column('right_power_phase_start_deg', 'DOUBLE', { unit: 'degrees', metric: true }), column('right_power_phase_end_deg', 'DOUBLE', { unit: 'degrees', metric: true }), column('left_power_phase_peak_start_deg', 'DOUBLE', { unit: 'degrees', metric: true }), column('left_power_phase_peak_end_deg', 'DOUBLE', { unit: 'degrees', metric: true }), column('right_power_phase_peak_start_deg', 'DOUBLE', { unit: 'degrees', metric: true }), column('right_power_phase_peak_end_deg', 'DOUBLE', { unit: 'degrees', metric: true }), column('left_platform_center_offset_mm', 'DOUBLE', { unit: 'mm', metric: true }), column('right_platform_center_offset_mm', 'DOUBLE', { unit: 'mm', metric: true }), column('extras_json', 'JSON')],
+  },
+  course_geometry: {
+    name: 'course_geometry', relation: 'course_geometry', description: 'Per-point Garmin course/route geometry (lat/lon/altitude_m/distance_m) normalized from a race event course. Resolve a courseId first with resolve_event_course, then query these rows for an elevation/height profile, gradient, or GPX-style track.', provenanceColumns: ['course_id', 'raw_object_hash'], permittedGroupings: ['course_id'],
+    columns: [column('course_id', 'VARCHAR', { filterable: true, groupable: true }), column('seq', 'INTEGER', { metric: true }), column('lat', 'DOUBLE', { unit: 'degrees', metric: true }), column('lon', 'DOUBLE', { unit: 'degrees', metric: true }), column('altitude_m', 'DOUBLE', { unit: 'm', metric: true }), column('distance_m', 'DOUBLE', { unit: 'm', metric: true }), column('raw_object_hash', 'VARCHAR')],
   },
 };
 

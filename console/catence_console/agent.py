@@ -46,7 +46,18 @@ read_series accepts numeric metrics only; use string identifiers as filters.
 For a selected activity's Strava segments, climbs, grades, KOMs, or PRs, call
 get_activity_segments before querying tables or claiming data is unavailable.
 For Garmin running VO₂max, call get_vo2max_history with sport set to running;
-Garmin labels its source rows generic, and the tool resolves that safely."""
+Garmin labels its source rows generic, and the tool resolves that safely.
+
+Tool-first routing (do not jump to raw SQL for these):
+- Next race / upcoming event: aggregate_data on the events dataset by occurred_on,
+  search_context for the event name, then resolve_event_course(eventId) for its course.
+- Course elevation / height profile / GPX: call resolve_event_course(eventId) first;
+  then read course_geometry with read_series / aggregate_data for altitude_m per point.
+  Never claim an elevation profile is absent before resolve_event_course returns.
+- Swim per-length pace / SPL / SWOLF: find_activities, then get_swim_laps,
+  then swim_progress_report for session-level trends.
+If a tool call errors or returns empty, treat it as guidance to switch strategy
+or re-read the routing above — do not retry the same query with variations."""
 
 _RECALL_SAVED_TOOL_RESULT = "recall_saved_tool_result"
 _TOOL_HISTORY_LIMIT = 24

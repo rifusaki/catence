@@ -226,19 +226,40 @@ describe('read-only retrieval and analytics', () => {
       const resource = await client.readResource({ uri: 'catence://tools' });
       const payload = JSON.parse(((resource as { contents: Array<{ text: string }> }).contents[0]?.text) ?? '{}') as {
         count: number;
-        tools: Array<{ name: string; purpose: string; description: string }>;
+        routing: Array<{ question: string; steps: Array<string> }>;
+        tools: Array<{ name: string; purpose: string; description: string; keywords: Array<string> }>;
       };
       expect(payload.count).toBeGreaterThanOrEqual(30);
       const names = payload.tools.map((tool) => tool.name);
       expect(names).toEqual(expect.arrayContaining([
         'readiness_baseline', 'read_series', 'aggregate_data', 'analyze_series',
         'query_read_only_data', 'describe_data', 'get_ftp_history', 'get_vo2max_history',
-        'power_coverage_report', 'find_activities',
+        'power_coverage_report', 'find_activities', 'discover_tools',
       ]));
       expect(payload.tools.find((tool) => tool.name === 'readiness_baseline')?.purpose).toMatch(/readiness/i);
+      expect(payload.routing).toEqual(expect.arrayContaining([
+        expect.objectContaining({ question: expect.stringMatching(/next race/i), steps: expect.arrayContaining(['resolve_event_course']) }),
+        expect.objectContaining({ question: expect.stringMatching(/elevation/i), steps: expect.any(Array) }),
+      ]));
+      const course = payload.tools.find((tool) => tool.name === 'resolve_event_course');
+      expect(course?.keywords).toEqual(expect.arrayContaining(['elevation profile', 'height profile', 'GPX track']));
+      const discover = payload.tools.find((tool) => tool.name === 'discover_tools');
+      expect(discover?.description).toMatch(/resolve_event_course/);
     } finally {
       await client.close();
       await server.close();
+    }
+  });
+
+  it('resolves cataloged domain views in guarded SQL but still rejects raw base tables', async () => {
+    const paths = await fixture();
+    const repository = await openReadOnlyRepository(paths);
+    try {
+      const events = await queryReadOnlyData(repository, { sql: 'SELECT provider, event_id FROM events ORDER BY event_id' });
+      expect(events.data).toEqual(expect.arrayContaining([expect.objectContaining({ provider: 'intervals', event_id: 'event-1' })]));
+      await expect(queryReadOnlyData(repository, { sql: 'SELECT * FROM domain_entities' })).rejects.toThrow('not in the read-only catalog');
+    } finally {
+      await repository.close();
     }
   });
 });

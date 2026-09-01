@@ -47,6 +47,28 @@ function normalizeRelation(name: string): string {
   return relation.replaceAll('"', '').split('.').at(-1)!.toLowerCase();
 }
 
+// Physical base tables that are reachable only through cataloged views
+// (e.g. the events/workouts/routes/… domain projections over domain_entities).
+// They must be accepted when DuckDB resolves a cataloged view down to its base
+// table after tableNames(), but must never be writable directly by name.
+const INDIRECT_BASE_TABLES = new Set(['domain_entities']);
+
+// dataset->named tool hints for the common dead-end relations, so a rejected
+// query tells the agent where to go instead of just that it was denied.
+const RELATION_HINTS: Record<string, string> = {
+  events: 'events is a domain projection; use aggregate_data on events or resolve_event_course(eventId) / search_context to read events and races.',
+  workouts: 'workouts is a domain projection; use aggregate_data on workouts or search_context to read workouts.',
+  workout_documents: 'workout_documents is a domain projection; use aggregate_data on workout_documents or search_context to read workout documents.',
+  training_plans: 'training_plans is a domain projection; use aggregate_data on training_plans or search_context to read training plans.',
+  routes: 'routes is a domain projection; use aggregate_data on routes or search_context to read routes.',
+  gear: 'gear is a domain projection; use aggregate_data on gear or search_context to read saved gear.',
+  devices: 'devices is a domain projection; use aggregate_data on devices or search_context to read devices.',
+  goals: 'goals is a domain projection; use aggregate_data on goals or search_context to read goals and challenges.',
+  achievements: 'achievements is a domain projection; use aggregate_data on achievements or search_context to read badges and personal records.',
+  messages: 'messages is a domain projection; use aggregate_data on messages or search_context to read provider messages.',
+  course_geometry: 'course_geometry is the per-point course track (lat/lon/altitude_m/distance_m); resolve a race course first with resolve_event_course, then query it for elevation/height profiles.',
+};
+
 export async function queryReadOnlyData(repository: ReadOnlyRepository, request: { sql: string; values?: Record<string, string | number | boolean | null>; cursor?: string; pageSize?: number }): Promise<Record<string, unknown>> {
   const sql = safeSql(request.sql);
   let relations: string[];
@@ -55,14 +77,29 @@ export async function queryReadOnlyData(repository: ReadOnlyRepository, request:
   } catch (error) {
     throw new QueryValidationError(`SQL could not be inspected: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const allowed = new Set(Object.values(DATASET_CATALOG).filter((dataset) => !dataset.samplesOnly && dataset.relation).map((dataset) => dataset.relation!.toLowerCase()));
+  // The catalog relation names form the strict allow-list for what a query may
+  // name directly (Check B below). Base tables reached only through cataloged
+  // views are additionally permitted after DuckDB resolves views for Check A,
+  // but they are never valid relation names in the SQL text.
+  const allowedNamed = new Set(Object.values(DATASET_CATALOG).filter((dataset) => !dataset.samplesOnly && dataset.relation).map((dataset) => dataset.relation!.toLowerCase()));
+  const allowedForExpansion = new Set([...allowedNamed, ...INDIRECT_BASE_TABLES]);
+  const rejected: string[] = [];
   for (const relation of relations) {
-    if (!allowed.has(normalizeRelation(relation))) throw new QueryValidationError(`Relation ${relation} is not in the read-only catalog.`);
+    const normalized = normalizeRelation(relation);
+    if (!allowedForExpansion.has(normalized)) rejected.push(relation);
+  }
+  if (rejected.length > 0) {
+    const name = normalizeRelation(rejected[0]!);
+    throw new QueryValidationError(
+      `Relation ${rejected[0]!} is not in the read-only catalog.${RELATION_HINTS[name] ? ` ${RELATION_HINTS[name]}` : ''}`
+    );
   }
   const ctes = new Set([...sql.matchAll(/(?:\bwith|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s+as\s*\(/gi)].map((match) => match[1].toLowerCase()));
   for (const match of sql.matchAll(/\b(?:from|join)\s+([A-Za-z_][A-Za-z0-9_.]*)/gi)) {
     const relation = normalizeRelation(match[1]);
-    if (!allowed.has(relation) && !ctes.has(relation)) throw new QueryValidationError(`Relation ${match[1]} is not in the read-only catalog.`);
+    if (!allowedNamed.has(relation) && !ctes.has(relation)) {
+      throw new QueryValidationError(`Relation ${match[1]} is not in the read-only catalog.${RELATION_HINTS[relation] ? ` ${RELATION_HINTS[relation]}` : ''}`);
+    }
   }
   const values = request.values ?? {};
   if ('__catence_page_size' in values || '__catence_offset' in values) throw new QueryValidationError('Bind names prefixed with __catence_ are reserved for pagination.');

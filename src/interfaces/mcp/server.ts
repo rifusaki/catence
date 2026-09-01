@@ -78,7 +78,10 @@ const MCP_INSTRUCTIONS = [
   'Never conclude from VO2max alone; pull full indicator set (LT/FTP/power/race-prediction).',
   'When summary metric is NULL (e.g. avg_power), fall through to FIT-derived/samples layer before declaring absence.',
   'Before reusing any prior course/elevation profile, resolve event\'s courseId and diff it against past activity\'s course; different courseId => different profile.',
-  'If a needed tool is not visible in your current tool list (the host may truncate it to a subset), read the catence://tools resource to discover all available tools before concluding a capability is absent.',
+  'If a needed tool is not visible in your current tool list (the host may truncate it to a subset), read the catence://tools resource or call discover_tools to inventory every available tool before concluding a capability is absent.',
+  'To find a next or upcoming race: list dates with aggregate_data on the events dataset (group or filter by occurred_on), identify the event name via search_context or its payload, then call resolve_event_course(eventId) to resolve the courseId and whether that course geometry is synced.',
+  'For a course elevation/height profile or GPX track: call resolve_event_course(eventId) first (it reports the courseId, synced geometry, and geometry sample count), then read the course_geometry dataset with read_series / aggregate_data / query_read_only_data for per-point altitude_m, lat, lon, and distance_m. Never claim a profile is absent before resolve_event_course returns.',
+  'Never treat a tool error or empty result as a dead end: switch strategy or re-read the routing guidance before re-running the same query.',
   'For swim analysis: use find_activities (sports: ["lap_swimming"] or sport: "lap_swimming") to list pool sessions. Use get_swim_laps for per-length data (pace from duration_s/pool_length_m, SPL from stroke_count, SWOLF from duration_s+stroke_count). Use swim_progress_report for session-level SWOLF, fastest-100, and stroke cadence. Per-length SWOLF is derived when the provider does not supply it. Per-length distance is typically null in Garmin FIT; use pool_length_m for pace calculations.',
 ].join(' ');
 
@@ -191,15 +194,27 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
 
   // Discoverability: record every registered tool so the catence://tools resource can
   // enumerate all tools even when the host harness truncates the visible tool list.
-  const TOOL_INDEX: Array<{ name: string; title: string; description: string }> = [];
+  const TOOL_INDEX: Array<{ name: string; title: string; description: string; keywords: string[] }> = [];
   function registerTool(
     name: string,
-    config: { title?: string; description?: string; inputSchema?: unknown },
+    config: { title?: string; description?: string; keywords?: string[]; inputSchema?: unknown },
     callback: (...args: any[]) => any,
   ): void {
-    TOOL_INDEX.push({ name, title: config.title ?? name, description: config.description ?? '' });
+    TOOL_INDEX.push({ name, title: config.title ?? name, description: config.description ?? '', keywords: config.keywords ?? [] });
     server.registerTool(name, config as never, callback as never);
   }
+  // Keyword-rich routing map surfacing the recommended tool chain per question
+  // domain. Surfaced in catence://tools so a host can navigate without knowing
+  // every tool name up front.
+  const TOOL_ROUTING = [
+    { question: 'next race / upcoming event', steps: ['aggregate_data (events, by occurred_on)', 'search_context', 'resolve_event_course'] },
+    { question: 'course elevation / height profile / GPX track', steps: ['resolve_event_course', 'read_series / aggregate_data (course_geometry)'] },
+    { question: 'swim per-length analysis (pace / SPL / SWOLF)', steps: ['find_activities', 'get_swim_laps', 'swim_progress_report'] },
+    { question: 'segments / climbs / KOM / PR', steps: ['get_activity_segments', 'hydrate_strava_segment_history'] },
+    { question: 'race readiness / fitness targets', steps: ['readiness_baseline', 'analyze_series', 'aggregate_data'] },
+    { question: 'recovery / daily or weekly load', steps: ['review_daily_recovery_load', 'review_weekly_training', 'wellness_baselines'] },
+    { question: 'cycling FTP / VO₂max / power curve', steps: ['get_ftp_history', 'get_vo2max_history', 'power_coverage_report', 'power_curve_trend'] },
+  ];
   const promptAthleteSchema: Record<string, z.ZodType> = catalogPaths ? { athleteId: athleteIdSchema } : {};
 
   if (catalogPaths) {
@@ -526,6 +541,7 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
   registerTool('resolve_event_course', {
     title: 'Resolve a race event course and its synced geometry',
     description: 'Given a Garmin/Intervals eventId, return the courseId it references and whether that course geometry has been synced. When geometry is absent, the result carries an explicit caveat so a prior course profile is never reused. Optionally pass pastActivityId to diff the event course against that activity\'s course.',
+    keywords: ['course', 'race course', 'event course', 'elevation profile', 'height profile', 'GPX track', 'course geometry', 'gradient', 'climb', 'GPS track'],
     inputSchema: { eventId: z.string().min(1), pastActivityId: z.string().min(1).optional() },
   }, tool('resolve_event_course', async (input) => useRepository(activePaths(), async (repository) => {
     const events = new EventsService(repository);
@@ -547,6 +563,7 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
   registerTool('find_activities', {
     title: 'Find activities and likely races',
     description: 'Find canonical activities by sport, distance, name, and date. Results are paginated and transparently flag likely-race signals without claiming provider-confirmed race metadata. Read-only.',
+    keywords: ['race', 'races', 'next race', 'events', 'upcoming event', 'activity list', 'swim sessions', 'pool sessions', 'laps', 'recent runs'],
     inputSchema: {
       sport: z.string().min(1).optional(),
       sports: z.array(z.string().min(1)).min(1).max(12).optional(),
@@ -560,18 +577,21 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
   registerTool('get_swim_laps', {
     title: 'Read explicit swim lengths and grouped sets',
     description: 'Return source-aware swim lengths when a provider actually supplied them, plus Garmin detected and Intervals.icu auto-detected sets. A missing length list is reported as unavailable; laps are never reconstructed from samples.',
+    keywords: ['swim', 'swimming', 'per-length', 'pace', 'SPL', 'SWOLF', 'pool', 'lengths', 'laps', 'cadence'],
     inputSchema: { activityId: z.string().min(1), provider: z.enum(['garmin', 'intervals']).optional() },
   }, tool('get_swim_laps', async (input) => useRepository(activePaths(), (repository) => new SwimmingService(repository).swimLaps(input))));
 
   registerTool('swim_progress_report', {
     title: 'Build a source-aware swim progress report',
     description: 'Compare Garmin swimming summaries and data completeness over a date range, optionally within one pool length. It does not derive pace trends from moving time divided by distance.',
+    keywords: ['swim', 'swimming', 'progress', 'SWOLF', 'fastest 100', 'cadence', 'pool length', 'swim trends'],
     inputSchema: { startDate: z.string().date().optional(), endDate: z.string().date().optional(), poolLengthM: z.number().positive().max(200).optional() },
   }, tool('swim_progress_report', async (input) => useRepository(activePaths(), (repository) => new SwimmingService(repository).swimProgressReport(input))));
 
   registerTool('get_activity_segments', {
     title: 'Hydrate and read an activity’s Strava segments',
     description: 'For a selected activity’s segments, climbs, KOM/PRs, or per-segment analysis: automatically hydrate the matching Strava activity before returning its persisted segment efforts. Use this before saying segment data is unavailable.',
+    keywords: ['segments', 'climbs', 'KOM', 'PR', 'grade by segment', 'Strava segments', 'segment efforts', 'per-segment analysis'],
     inputSchema: { activityId: z.string().min(1), refresh: z.boolean().optional(), limit: z.number().int().min(1).max(500).optional() },
   }, tool('get_activity_segments', async (input) => {
     const hydration = await hydrateActivity(activePaths(), input.activityId, input.refresh ?? false);
@@ -619,6 +639,7 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
 
   registerTool('search_context', {
     title: 'Search generated context', description: 'Search compact generated activity, plan, nutrition, and message context. Results identify authoritative follow-up tools rather than making numerical claims.',
+    keywords: ['event name', 'race name', 'course', 'elevation', 'GPX', 'activity summary', 'plan', 'nutrition', 'find the event'],
     inputSchema: { query: z.string().min(2).max(500), filters: z.array(z.object({ column: z.enum(['provider', 'entity_type', 'occurred_on']), op: z.enum(['eq', 'in', 'between']), value: z.unknown() })).max(20).optional(), limit: z.number().int().min(1).max(50).optional() },
   }, tool('search_context', async (input) => useRepository(activePaths(), (repository) => searchContext(repository, input))));
 
@@ -707,6 +728,20 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     return { data, coverage: await useRepository(activePaths(), (repository) => repository.coverage()), provenance: { provider: 'strava', operation: 'segment_effort_history', archivedBeforeNormalization: true }, caveats: ['Only the authenticated athlete’s historic segment efforts are requested.'] };
   }));
 
+  // Registered last so every tool above is present in the tool index before its
+  // one-line catalog is baked into this tool's description. Survives host tool
+  // truncation because tool descriptions are always visible to the model.
+  registerTool('discover_tools', {
+    title: 'Discover all Catence tools and routing',
+    description: [
+      'Inventory the full Catence tool surface even when the host truncates its visible tool list. Query by question: next race/upcoming event (aggregate_data on events, search_context, resolve_event_course), course elevation/height profile/GPX (resolve_event_course then read_series or aggregate_data on course_geometry), swim per-length pace/SPL/SWOLF (find_activities, get_swim_laps, swim_progress_report), segments/climbs/KOM/PR (get_activity_segments), race readiness (readiness_baseline), recovery (review_daily_recovery_load, review_weekly_training), cycling FTP/VO₂max/power (get_ftp_history, get_vo2max_history, power_coverage_report, power_curve_trend).',
+      ...TOOL_INDEX.map((entry) => `${entry.name} — ${entry.title}`),
+    ].join('\n'),
+  }, tool('discover_tools', async () => ({
+    data: { count: TOOL_INDEX.length, routing: TOOL_ROUTING, tools: TOOL_INDEX.map((entry) => ({ name: entry.name, purpose: entry.title, keywords: entry.keywords })) },
+    provenance: { catalog: 'Catence tool index' }, query: {}, caveats: ['Use this to map a question to its named tool before falling back to SQL.'],
+  })));
+
   if (catalogPaths) {
     server.registerResource('athletes', 'catence://athletes', { title: 'Configured athlete roster', mimeType: 'application/json' }, async (uri) => {
       try { const catalog = await loadCatalog(catalogPaths); return resource(uri, { defaultAthleteId: catalog.defaultAthleteId, athletes: catalog.athletes }); } catch (error) { return resource(uri, { error: errorResult(error).content[0].text }); }
@@ -731,7 +766,8 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     return resource(uri, {
       count: TOOL_INDEX.length,
       note: 'If a needed tool is not visible in your current tool list (the host may truncate it), use this index to discover all available tools before concluding a capability is absent. SQL-only tables training_metric_observations and source_entities are reachable via query_read_only_data / describe_data.',
-      tools: TOOL_INDEX.map((tool) => ({ name: tool.name, purpose: tool.title, description: tool.description })),
+      routing: TOOL_ROUTING,
+      tools: TOOL_INDEX.map((tool) => ({ name: tool.name, purpose: tool.title, description: tool.description, keywords: tool.keywords })),
     });
   });
 

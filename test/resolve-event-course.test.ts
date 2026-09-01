@@ -108,4 +108,28 @@ describe('resolve_event_course (A4)', () => {
       await server.close();
     }
   });
+
+  it('exposes course_geometry as a queryable catalog dataset for elevation profiles', async () => {
+    const setup = await temporaryDatabase();
+    await seedEvent(setup.database, true, true); // course entity with points -> importGarminCourse
+    const server = createCatenceMcpServer(setup.paths);
+    const client = new Client({ name: 'resolve-event-course-test', version: '0.2.0' });
+    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    try {
+      const data = await client.callTool({ name: 'describe_data', arguments: {} });
+      const payload = JSON.parse((data.content as Array<{ text: string }>)[0]!.text) as { data: { datasets: Array<{ name: string; columns: Array<{ name: string }> }> } };
+      const course = payload.data.datasets.find((dataset) => dataset.name === 'course_geometry');
+      expect(course).toBeDefined();
+      expect(course?.columns.map((column) => column.name)).toEqual(expect.arrayContaining(['course_id', 'lat', 'lon', 'altitude_m', 'distance_m', 'seq']));
+      const aggregate = await client.callTool({ name: 'aggregate_data', arguments: { dataset: 'course_geometry', metrics: [{ column: 'altitude_m', operation: 'mean', as: 'mean_alt' }, { column: 'altitude_m', operation: 'min', as: 'min_alt' }, { column: 'altitude_m', operation: 'max', as: 'max_alt' }], dimensions: ['course_id'] } });
+      expect(aggregate.isError).toBeFalsy();
+      const aggregatePayload = JSON.parse((aggregate.content as Array<{ text: string }>)[0]!.text) as { data: Array<{ course_id: string; mean_alt: number; min_alt: number; max_alt: number }> };
+      expect(aggregatePayload.data).toEqual([expect.objectContaining({ course_id: COURSE_ID, min_alt: 540, max_alt: 560 })]);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
 });

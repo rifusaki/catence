@@ -199,6 +199,7 @@ def test_respond_passes_mcp_instructions_and_saved_call_context_to_the_model(mon
     system_messages = [message["content"] for message in captured["messages"] if message["role"] == "system"]
     assert any("get_activity_segments" in message for message in system_messages)
     assert any("prior-call" in message and "strava:19656841525" in message for message in system_messages)
+    assert any("course_geometry" in message and "resolve_event_course" in message for message in system_messages)
     assert any(
         tool["function"]["name"] == "recall_saved_tool_result"
         for tool in captured["tools"]
