@@ -144,6 +144,62 @@ def test_respond_never_sends_reasoning_effort_for_disabled_models(monkeypatch):
     assert "allowed_openai_params" not in captured
 
 
+@pytest.mark.parametrize("base_env", ["OPENCODE_GO_API_BASE", "OPENCODE_GO_MESSAGES_API_BASE"])
+def test_respond_sends_opencode_go_headers_for_go_profiles(monkeypatch, base_env):
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", FakeSession)
+    captured = {}
+
+    async def complete(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=[]))])
+
+    asyncio.run(
+        agent.respond(
+            profile=ProviderProfile(
+                id="opencode-go",
+                label="OpenCode Go",
+                model="openai/deepseek-v4-flash",
+                api_key_env="OPENCODE_GO_API_KEY",
+                api_base_env=base_env,
+            ),
+            model_id="default",
+            reasoning_effort=None,
+            history=[{"role": "user", "content": "How am I recovering?"}],
+            mcp_url="http://example.test/mcp",
+            thread_id="thread-abc",
+            complete=complete,
+        )
+    )
+
+    assert captured["extra_headers"]["x-opencode-session"] == "thread-abc"
+    assert captured["extra_headers"]["x-opencode-client"] == "catence-console"
+
+
+def test_respond_omits_opencode_go_headers_for_other_profiles(monkeypatch):
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", FakeSession)
+    captured = {}
+
+    async def complete(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=[]))])
+
+    asyncio.run(
+        agent.respond(
+            profile=ProviderProfile(id="openai", label="OpenAI", model="openai/o4-mini"),
+            model_id="default",
+            reasoning_effort=None,
+            history=[{"role": "user", "content": "How am I recovering?"}],
+            mcp_url="http://example.test/mcp",
+            thread_id="thread-abc",
+            complete=complete,
+        )
+    )
+
+    assert "extra_headers" not in captured
+
+
 def test_tool_result_limit_marks_truncated_evidence():
     payload = agent._tool_result_payload({"content": "x" * 100}, maximum_characters=20)
     assert payload["truncated"] is True

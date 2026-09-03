@@ -4,7 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from catence_console.config import ConsoleConfigurationError, load_console_configuration, write_provider_setup
+from catence_console.config import (
+    ConsoleConfigurationError,
+    ProviderProfile,
+    load_console_configuration,
+    write_provider_setup,
+)
 from catence_console.app import _chat_settings, _configured_preferences, _limit_setting, _normalized_preferences, _session_settings
 from catence_console.persistence import SavedConsolePreferences
 
@@ -63,6 +68,29 @@ def test_rejects_unknown_profile_fields_so_secrets_cannot_be_ignored(tmp_path):
 
     with pytest.raises(ConsoleConfigurationError, match="unsupported fields"):
         load_console_configuration(tmp_path)
+
+
+def test_is_opencode_go_detects_profiles_wired_to_the_go_environment():
+    assert ProviderProfile(
+        id="opencode-go",
+        label="OpenCode Go",
+        model="openai/deepseek-v4-flash",
+        api_key_env="OPENCODE_GO_API_KEY",
+        api_base_env="OPENCODE_GO_API_BASE",
+    ).is_opencode_go
+    assert ProviderProfile(
+        id="opencode-go-messages",
+        label="OpenCode Go (Anthropic)",
+        model="anthropic/minimax-m2.5",
+        api_key_env="OPENCODE_GO_API_KEY",
+        api_base_env="OPENCODE_GO_MESSAGES_API_BASE",
+    ).is_opencode_go
+    assert not ProviderProfile(
+        id="openai",
+        label="OpenAI",
+        model="openai/o4-mini",
+        api_key_env="OPENAI_API_KEY",
+    ).is_opencode_go
 
 
 def test_loads_multiple_models_and_a_default_reasoning_effort(tmp_path):

@@ -94,6 +94,21 @@ class ProviderProfile:
             if name is not None
         )
 
+    @property
+    def is_opencode_go(self) -> bool:
+        """True when the profile talks to OpenCode Go's ``/zen/go`` endpoints.
+
+        OpenCode Go routes chat, responses, and messages models from the same
+        host, so every profile wired to the Go environment variables must also
+        send the OpenCode session/client headers OpenCode uses for prompt
+        caching and traffic identification.
+        """
+
+        return self.api_key_env == "OPENCODE_GO_API_KEY" and self.api_base_env in {
+            "OPENCODE_GO_API_BASE",
+            "OPENCODE_GO_MESSAGES_API_BASE",
+        }
+
     def model_option(self, model_id: str | None = None) -> ModelOption:
         """Resolve a configured deployment, preserving legacy single-model profiles."""
 

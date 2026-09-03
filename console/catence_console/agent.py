@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any
+from uuid import uuid4
 
 import chainlit as cl
 from litellm import acompletion
@@ -62,6 +63,12 @@ or re-read the routing above — do not retry the same query with variations."""
 _RECALL_SAVED_TOOL_RESULT = "recall_saved_tool_result"
 _TOOL_HISTORY_LIMIT = 24
 _TOOL_ARGUMENT_PREVIEW_CHARACTERS = 1_600
+
+# OpenCode Go reads these headers to optimize prompt caching (the session id
+# must stay stable per conversation) and to identify the calling client.
+_OPENCODE_GO_SESSION_HEADER = "x-opencode-session"
+_OPENCODE_GO_CLIENT_HEADER = "x-opencode-client"
+_OPENCODE_GO_CLIENT_ID = "catence-console"
 
 def _as_json(value: Any) -> Any:
     if hasattr(value, "model_dump"):
@@ -391,6 +398,11 @@ async def respond(
 
                 start_generation_sidecar(thread_id)
                 tool_calls_total = 0
+                # OpenCode Go uses this header for prompt-cache optimization, so
+                # the value must stay stable across every request of one
+                # conversation. The Chainlit thread id is that identity; the
+                # UUID fallback only covers callers without a thread.
+                opencode_session_id = thread_id or uuid4().hex
 
                 for _ in range(tool_round_limit):
                     options: dict[str, Any] = {
@@ -399,6 +411,11 @@ async def respond(
                         "tools": tools,
                         "tool_choice": "auto",
                     }
+                    if profile.is_opencode_go:
+                        options["extra_headers"] = {
+                            _OPENCODE_GO_SESSION_HEADER: opencode_session_id,
+                            _OPENCODE_GO_CLIENT_HEADER: _OPENCODE_GO_CLIENT_ID,
+                        }
                     if effective_reasoning_effort:
                         options["reasoning_effort"] = effective_reasoning_effort
                         options["allowed_openai_params"] = ["reasoning_effort"]
