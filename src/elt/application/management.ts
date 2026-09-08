@@ -21,7 +21,7 @@ import { completeStravaAuthorization, disconnectStrava, getStravaAuthorizationUr
 import { setManualActivityLink, unlinkActivitySource } from '../normalization/activities/linking.js';
 import { importSourceEntity } from '../normalization/normalizers.js';
 import { CatenceDatabase, openReadOnlyRepository, ReadOnlyDatabaseError } from '../storage/database.js';
-import { mergeProgress, ProgressPump, readRunningProgress, removeProgressSidecar } from '../storage/progress-sidecar.js';
+import { mergeProgress, ProgressPump, readRunningProgress, removeProgressSidecar, writeProgressSidecar, PROGRESS_KEEPALIVE_MS } from '../storage/progress-sidecar.js';
 import { withDataWriteLock } from '../storage/write-lock.js';
 
 type SyncProviderChoice = 'intervals' | 'garmin';
@@ -460,8 +460,40 @@ export async function syncData(paths: CatencePaths, provider: ProviderChoice, ex
     for (const source of providers) runs.push(await syncProvider(database, paths, source, { explicitFrom, toDate, advanceCursor, refreshActivities, backfill }, log));
     const executedRuns = runs.filter((run) => !run.skipped);
     if (executedRuns.length > 0) {
-      const index = await buildRetrievalIndex(database);
-      log.info('Rebuilt retrieval index after sync', { documents: index.documents, mode: index.mode, watermark: index.watermark });
+      // The per-provider pumps already stopped (sidecars removed, runs marked
+      // completed), but buildRetrievalIndex still holds the single-writer DB
+      // lock, so /dashboard reads as unavailable. Hold a non-terminal sidecar
+      // for the last executed run so /sync/status keeps reporting running and
+      // the Status Sync button stays disabled through local post-processing.
+      const last = [...executedRuns].reverse().find((run) => run.runId);
+      let indexingKeepalive: NodeJS.Timeout | null = null;
+      const holdIndexingProgress = (): Promise<void> =>
+        last?.runId
+          ? writeProgressSidecar(paths, last.runId, {
+              ...baseProgress(last.runId, last.provider, 'importing'),
+              currentStep: 'building retrieval index',
+              percentComplete: 99,
+            }).catch((error: unknown) => {
+              log.debug('Indexing progress sidecar write failed', {
+                runId: last.runId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            })
+          : Promise.resolve();
+      if (last?.runId) {
+        await holdIndexingProgress();
+        indexingKeepalive = setInterval(() => {
+          void holdIndexingProgress();
+        }, PROGRESS_KEEPALIVE_MS);
+        indexingKeepalive.unref?.();
+      }
+      try {
+        const index = await buildRetrievalIndex(database);
+        log.info('Rebuilt retrieval index after sync', { documents: index.documents, mode: index.mode, watermark: index.watermark });
+      } finally {
+        if (indexingKeepalive) clearInterval(indexingKeepalive);
+        if (last?.runId) await removeProgressSidecar(paths, last.runId).catch(() => undefined);
+      }
     }
     return { runIds: runs.flatMap((run) => run.runId ? [run.runId] : []), runs, timedOutRuns: timedOutRuns.runIds };
   } finally {
