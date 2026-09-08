@@ -143,12 +143,42 @@ export class ProgressPump {
   private lastHeartbeatAt = 0;
   private interval: ReturnType<typeof setInterval> | null = null;
   private stageOverride: SyncStage | null = null;
+  /**
+   * Serializes heartbeat writes in call order. publish() used to fire its
+   * database and sidecar writes without awaiting them, so a throttled write
+   * could win the sidecar rename race against a later publishFinal() and
+   * leave a stale non-terminal stage behind.
+   */
+  private writeTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly runId: string,
     private readonly provider: string,
     private readonly options: ProgressPumpOptions,
   ) {}
+
+  private enqueueHeartbeat(state: SyncProgressState): Promise<void> {
+    const run = this.writeTail.then(() => this.writeHeartbeat(state));
+    // A write failure is already logged inside writeHeartbeat; never let it
+    // break the chain (or surface as an unhandled rejection) for later beats.
+    this.writeTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async writeHeartbeat(state: SyncProgressState): Promise<void> {
+    const { database, paths, log } = this.options;
+    await Promise.all([
+      database.heartbeatRun(this.runId, state).catch((error: unknown) => {
+        log.debug('Progress heartbeat failed', { runId: this.runId, error: error instanceof Error ? error.message : String(error) });
+      }),
+      writeProgressSidecar(paths, this.runId, state).catch((error: unknown) => {
+        log.debug('Progress sidecar write failed', { runId: this.runId, error: error instanceof Error ? error.message : String(error) });
+      }),
+    ]);
+  }
 
   start(): void {
     if (this.interval) return;
@@ -170,13 +200,7 @@ export class ProgressPump {
     }
     this.lastHeartbeatAt = now;
     this.lastProgress = state;
-    const { database, paths, log } = this.options;
-    void database.heartbeatRun(this.runId, state).catch((error: unknown) => {
-      log.debug('Progress heartbeat failed', { runId: this.runId, error: error instanceof Error ? error.message : String(error) });
-    });
-    void writeProgressSidecar(paths, this.runId, state).catch((error: unknown) => {
-      log.debug('Progress sidecar write failed', { runId: this.runId, error: error instanceof Error ? error.message : String(error) });
-    });
+    void this.enqueueHeartbeat(state).catch(() => undefined);
   }
 
   /** Force subsequent keep-alive heartbeats to report the given stage. */
@@ -197,15 +221,11 @@ export class ProgressPump {
   async publishFinal(state: SyncProgressState): Promise<void> {
     this.lastHeartbeatAt = Date.now();
     this.lastProgress = state;
-    const { database, paths, log } = this.options;
-    // Both terminal writes complete before the caller removes the sidecar, so
-    // a finished run can never resurrect its own progress file after cleanup.
-    await database.heartbeatRun(this.runId, state).catch((error: unknown) => {
-      log.debug('Progress heartbeat failed', { runId: this.runId, error: error instanceof Error ? error.message : String(error) });
-    });
-    await writeProgressSidecar(paths, this.runId, state).catch((error: unknown) => {
-      log.debug('Progress sidecar write failed', { runId: this.runId, error: error instanceof Error ? error.message : String(error) });
-    });
+    // Awaiting the chained write guarantees every earlier heartbeat (in
+    // particular a throttled publish still in flight) lands first, so the
+    // terminal stage is always the last one persisted before the caller
+    // removes the sidecar.
+    await this.enqueueHeartbeat(state);
   }
 
   stop(): void {

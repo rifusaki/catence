@@ -354,7 +354,7 @@ describe('ProgressPump', () => {
       await database.beginRun('garmin', '2025-07-30');
       const pump = new ProgressPump(runId, 'garmin', { database, paths, log: noopLogger });
       pump.publish(sampleState(runId));
-      pump.publishFinal(sampleState(runId, { stage: 'completed' }));
+      await pump.publishFinal(sampleState(runId, { stage: 'completed' }));
       await vi.advanceTimersByTimeAsync(0);
 
       const state = await readSidecar(paths, runId);
