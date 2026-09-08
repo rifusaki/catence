@@ -55,6 +55,7 @@
     "test:watch": "vitest",
     "catence-data": "tsx src/interfaces/cli/main.ts",
     "mcp": "tsx src/interfaces/mcp/main.ts",
+    "dev": "node scripts/dev.mjs",
     "console": "uv run --project console catence-console serve",
     "console:doctor": "uv run --project console catence-console doctor",
     "discover:opencode-go": "node scripts/discover-opencode-go.mjs",

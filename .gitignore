@@ -9,6 +9,8 @@ coverage/
 .venv/
 console/.venv/
 console/.chainlit/
+console/catence_console/.chainlit/
+console/catence_console/chainlit.md
 .uv-cache/
 .cache/
 .npm-cache/
