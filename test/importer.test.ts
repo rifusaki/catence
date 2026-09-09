@@ -329,6 +329,40 @@ describe('normalization importer', () => {
     }
   });
 
+  it('projects Garmin weigh-ins to weight_kg, latest per day, grams to kg', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('garmin', '2025-01-05');
+    try {
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'body_composition', remoteId: 'weigh_ins:2025-01-01', parentRemoteId: null,
+        occurredOn: null, sourceUpdatedAt: null, rawObjectHash: 'weight-raw', extension: {},
+        payload: {
+          dailyWeightSummaries: [
+            {
+              summaryDate: '2025-01-05',
+              allWeightMetrics: [
+                { timestampGMT: 1_735_970_400_000, weight: 75400, bmi: 22.1, bodyFat: 15 },
+                { timestampGMT: 1_735_999_200_000, weight: 75100, bmi: 22.0, bodyFat: 14.9 },
+              ],
+            },
+            { summaryDate: '2025-01-06', allWeightMetrics: [{ timestampGMT: 1_736_085_600_000, weight: 74900 }] },
+          ],
+        },
+      });
+      const rows = await database.rows<{ metric_date: string; value_number: number; unit: string }>(
+        "SELECT CAST(metric_date AS VARCHAR) AS metric_date, value_number, unit FROM daily_metrics WHERE metric_name = 'weight_kg' ORDER BY metric_date",
+      );
+      expect(rows).toEqual([
+        { metric_date: '2025-01-05', value_number: 75.1, unit: 'kg' },
+        { metric_date: '2025-01-06', value_number: 74.9, unit: 'kg' },
+      ]);
+      const health = await database.rows<{ weight_kg: number }>('SELECT weight_kg FROM daily_health WHERE metric_date = DATE \'2025-01-05\'');
+      expect(health).toEqual([{ weight_kg: 75.1 }]);
+    } finally {
+      await database.close();
+    }
+  });
+
   it('records extraction errors without blocking independent records', async () => {
     const { database } = await temporaryDatabase();
     const runId = await database.beginRun('intervals', '2025-07-29');

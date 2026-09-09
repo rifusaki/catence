@@ -292,6 +292,7 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
     await importGarminFitSwimLengths(database, entity.parentRemoteId, payload, rawHash);
   }
   if (entity.entityType === 'wellness' || entity.entityType === 'daily_health') await importDailyMetrics(database, entity.provider, entity.remoteId, entity.occurredOn, payload, rawHash);
+  if (entity.provider === 'garmin' && entity.entityType === 'body_composition') await importGarminWeight(database, entity.occurredOn, payload, rawHash);
   if (entity.entityType === 'nutrition_day' || entity.entityType === 'nutrition_log') await importNutrition(database, entity.provider, entity.occurredOn, entity.remoteId, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'training_metric') await importGarminCyclingFtp(database, entity.remoteId, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'lactate_threshold') await importGarminLactateThreshold(database, entity.remoteId, payload, rawHash);
@@ -1060,6 +1061,61 @@ async function importDailyMetrics(database: CatenceDatabase, provider: Provider,
     await upsertDailyMetric(database, provider, metricDate, metric.name, value, null, metric.unit, rawHash);
   }
   if (provider === 'garmin') await importGarminDailyDetails(database, remoteId, metricDate, payload, rawHash);
+}
+
+/**
+ * Weight-only projection for Garmin weigh-ins. The range endpoint returns
+ * `{dailyWeightSummaries: [{summaryDate, allWeightMetrics: [{weight, ...}]}]}`
+ * with weight in grams, while dayview returns `{dateWeightList: [...]}`.
+ * The worker stages a whole range window as one `body_composition` entity,
+ * so dates are derived per entry here. Multiple weigh-ins on one day resolve
+ * to the latest timestamp. Body-composition fields (fat, muscle, ...) are
+ * deliberately ignored.
+ */
+function weightKgFromValue(value: number | null): number | null {
+  if (value === null) return null;
+  return value > 1000 ? value / 1000 : value;
+}
+
+function weightEntryDate(entry: JsonObject, fallbackDay: string | null): string | null {
+  // Prefer the parent summaryDate (Garmin's local day) over the entry's UTC
+  // timestampGMT, which can fall on a different UTC date.
+  return fallbackDay
+    ?? datePart(firstString(entry, ['summaryDate', 'calendarDate', 'date']))
+    ?? datePart(timestamp(entry.timestampGMT));
+}
+
+function collectGarminWeightEntries(payload: JsonObject, fallbackDay: string | null): Array<{ date: string; kg: number; ts: number }> {
+  const entries: Array<{ date: string; kg: number; ts: number }> = [];
+  const pushEntry = (entry: JsonObject, fallback: string | null) => {
+    const kg = weightKgFromValue(firstNumber(entry, ['weight', 'weightValue', 'weightInKg']));
+    if (kg === null) return;
+    const day = weightEntryDate(entry, fallback ?? fallbackDay);
+    if (!day) return;
+    const ts = typeof entry.timestampGMT === 'number' && Number.isFinite(entry.timestampGMT) ? entry.timestampGMT : 0;
+    entries.push({ date: day, kg, ts });
+  };
+  for (const summary of objectArray(payload.dailyWeightSummaries)) {
+    const day = datePart(firstString(summary, ['summaryDate', 'calendarDate', 'date'])) ?? fallbackDay;
+    for (const metric of objectArray(summary.allWeightMetrics)) pushEntry(metric, day);
+  }
+  for (const key of ['dateWeightList', 'allWeightMetrics'] as const) {
+    for (const entry of objectArray(payload[key])) pushEntry(entry, fallbackDay);
+  }
+  if (firstNumber(payload, ['weight', 'weightValue', 'weightInKg']) !== null) pushEntry(payload, fallbackDay);
+  return entries;
+}
+
+async function importGarminWeight(database: CatenceDatabase, date: string | null, payload: JsonObject, rawHash: string | null): Promise<void> {
+  const fallbackDay = datePart(date);
+  const latestByDay = new Map<string, { kg: number; ts: number }>();
+  for (const entry of collectGarminWeightEntries(payload, fallbackDay)) {
+    const current = latestByDay.get(entry.date);
+    if (!current || entry.ts >= current.ts) latestByDay.set(entry.date, { kg: entry.kg, ts: entry.ts });
+  }
+  for (const [metricDate, { kg }] of latestByDay) {
+    await upsertDailyMetric(database, 'garmin', metricDate, 'weight_kg', kg, null, 'kg', rawHash);
+  }
 }
 
 async function importNutrition(database: CatenceDatabase, provider: Provider, date: string | null, remoteId: string, payload: JsonObject, rawHash: string | null): Promise<void> {
