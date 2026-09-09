@@ -129,6 +129,10 @@ async def dashboard_proxy(request: Request) -> Response:
 async def athletes_proxy(request: Request) -> Response:
     return await _proxy_mcp_get(request, "/api/v1/athletes")
 
+
+async def health_proxy(request: Request) -> Response:
+    return await _proxy_mcp_get(request, "/api/v1/health")
+
 @chainlit_server.middleware("http")
 async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Response:
     """Handle these paths before Chainlit's catch-all SPA route."""
@@ -137,6 +141,8 @@ async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Res
         return await dashboard_proxy(request)
     if request.method == "GET" and request.url.path == "/api/v1/athletes":
         return await athletes_proxy(request)
+    if request.method == "GET" and request.url.path == "/api/v1/health":
+        return await health_proxy(request)
     if request.url.path == "/api/v1/models":
         if request.method == "GET":
             return await models_overview(request)
