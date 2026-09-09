@@ -63,6 +63,7 @@ export {
   linkActivity,
   rebuildRetrievalIndex,
   reimportNutrition,
+  reimportWeight,
   resolveExtractionErrors,
   retryDataSync,
   syncData,

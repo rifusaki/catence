@@ -741,6 +741,37 @@ export async function reimportNutrition(paths: CatencePaths): Promise<Record<str
   }
 }
 
+/**
+ * Re-run normalization over already-captured Garmin weigh-in entities without
+ * contacting any provider. Stores synced before beta.5 staged weigh_ins
+ * payloads but never projected them to daily_metrics, so this backfills
+ * weight_kg from stored payloads. Idempotent upserts make it safe to re-run.
+ */
+export async function reimportWeight(paths: CatencePaths): Promise<Record<string, unknown>> {
+  if (!existsSync(paths.database)) throw new Error('No Catence database exists yet. Complete a sync before re-importing weight.');
+  const database = await CatenceDatabase.open(paths);
+  try {
+    const rows = await database.rows<ReimportRow>(
+      `SELECT provider, entity_type, remote_id, parent_remote_id, occurred_on, source_updated_at, raw_object_hash,
+              cast(payload_json AS VARCHAR) AS payload_json, cast(extension_json AS VARCHAR) AS extension_json
+       FROM source_entities
+       WHERE provider = 'garmin' AND entity_type = 'body_composition'
+       ORDER BY occurred_on, remote_id`,
+    );
+    for (const row of rows) {
+      await importSourceEntity(database, {
+        kind: 'source_entity', schemaVersion: 1, provider: row.provider as Provider, entityType: row.entity_type,
+        remoteId: row.remote_id, parentRemoteId: row.parent_remote_id, occurredOn: row.occurred_on, sourceUpdatedAt: row.source_updated_at,
+        rawObjectHash: row.raw_object_hash, payload: parseJsonObject(row.payload_json), extension: parseJsonObject(row.extension_json),
+      });
+    }
+    const weights = (await database.rows<{ count: number | bigint }>(`SELECT count(*) AS count FROM daily_metrics WHERE metric_name = 'weight_kg'`))[0]?.count ?? 0;
+    return { reimportedEntities: rows.length, weightObservations: Number(weights) };
+  } finally {
+    await database.close();
+  }
+}
+
 function parseJsonObject(value: string | null): Record<string, unknown> {
   if (!value) return {};
   try { return JSON.parse(value) as Record<string, unknown>; } catch { return {}; }

@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { reimportWeight } from '../src/elt/application/management.js';
+import { CatenceDatabase } from '../src/elt/storage/database.js';
 import { importRecord } from '../src/elt/ingestion/importer.js';
 import { temporaryDatabase } from './helpers.js';
 
@@ -360,6 +362,34 @@ describe('normalization importer', () => {
       expect(health).toEqual([{ weight_kg: 75.1 }]);
     } finally {
       await database.close();
+    }
+  });
+
+  it('reimports Garmin weight from staged pre-beta.5 entities without providers', async () => {
+    const { paths, database } = await temporaryDatabase();
+    const runId = await database.beginRun('garmin', '2025-01-05');
+    await importRecord(database, runId, {
+      kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'body_composition', remoteId: 'weigh_ins:2025-01-01', parentRemoteId: null,
+      occurredOn: null, sourceUpdatedAt: null, rawObjectHash: 'weight-raw', extension: {},
+      payload: {
+        dailyWeightSummaries: [
+          { summaryDate: '2025-01-05', allWeightMetrics: [{ timestampGMT: 1_735_970_400_000, weight: 75400 }] },
+        ],
+      },
+    });
+    // Simulate a pre-beta.5 store: staged payload present, projection missing.
+    await database.run(`DELETE FROM daily_metrics WHERE metric_name = 'weight_kg'`);
+    await database.close();
+    const result = await reimportWeight(paths);
+    expect(result).toMatchObject({ reimportedEntities: 1 });
+    const reopened = await CatenceDatabase.open(paths);
+    try {
+      const rows = await reopened.rows<{ metric_date: string; value_number: number }>(
+        "SELECT CAST(metric_date AS VARCHAR) AS metric_date, value_number FROM daily_metrics WHERE metric_name = 'weight_kg'",
+      );
+      expect(rows).toEqual([{ metric_date: '2025-01-05', value_number: 75.4 }]);
+    } finally {
+      await reopened.close();
     }
   });
 

@@ -25,6 +25,7 @@ import {
   readInstalledConsoleVersion,
   rebuildRetrievalIndex,
   reimportNutrition,
+  reimportWeight,
   resolveExtractionErrors,
   resolveAthlete,
   resolveCatalogPaths,
@@ -286,6 +287,10 @@ program.command('build-retrieval-index').description('Build derived local retrie
 program.command('reimport-nutrition').description('Re-run normalization over captured nutrition entities without contacting providers.').action(async () => {
   const { paths } = await currentAthlete();
   process.stdout.write(`${JSON.stringify(await reimportNutrition(paths), null, 2)}\n`);
+});
+program.command('reimport-weight').description('Backfill weight_kg from captured Garmin weigh-in entities without contacting providers.').action(async () => {
+  const { paths } = await currentAthlete();
+  process.stdout.write(`${JSON.stringify(await reimportWeight(paths), null, 2)}\n`);
 });
 program
   .command('import')
