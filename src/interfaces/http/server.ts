@@ -3,19 +3,27 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import path from 'node:path';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
+  AthleteFileConflictError,
+  AthleteFileTooLargeError,
+  AthleteFileValidationError,
   catenceRuntimeHealth,
   DashboardSnapshotService,
   DetachedSyncBusyError,
   type DetachedSyncSpawner,
   DETACHED_SYNC_PROVIDERS,
   jsonSafe,
+  listAthleteFileRevisions,
   loadCatalog,
   mergeOpenCodeGoConsoleProfiles,
   openReadOnlyRepository,
+  readAthleteFile,
+  readAthleteFileRevision,
   resolveAthlete,
   resolveCatalogPaths,
   startDetachedSync,
   syncProgress,
+  updateAthleteFile,
+  type AthleteFileOperation,
   type CatalogPaths,
   type CatencePaths,
 } from '../../runtime/index.js';
@@ -50,8 +58,8 @@ function addCorsHeaders(request: IncomingMessage, response: ServerResponse, allo
   if (!allowedOrigins.includes(origin)) return false;
   response.setHeader('access-control-allow-origin', origin);
   response.setHeader('vary', 'Origin');
-  response.setHeader('access-control-allow-methods', 'GET, POST, DELETE, OPTIONS');
-  response.setHeader('access-control-allow-headers', 'content-type, mcp-session-id');
+  response.setHeader('access-control-allow-methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  response.setHeader('access-control-allow-headers', 'content-type, if-match, mcp-session-id');
   return true;
 }
 
@@ -145,6 +153,38 @@ function parseSyncBody(body: unknown): SyncRequestBody {
     if (raw[flag] !== undefined && typeof raw[flag] !== 'boolean') throw new Error(`${flag} must be a boolean.`);
   }
   return raw as SyncRequestBody;
+}
+
+type AthleteFileBody = {
+  operation: AthleteFileOperation;
+  section?: string;
+  content: string;
+  hasExpectedHash: boolean;
+  expectedHash: string | null;
+};
+
+function parseAthleteFileBody(body: unknown): AthleteFileBody {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new Error('Request body must be a JSON object.');
+  const raw = body as Record<string, unknown>;
+  for (const key of Object.keys(raw)) {
+    if (!['operation', 'section', 'content', 'expectedHash'].includes(key)) throw new Error(`Unknown athlete-file field: ${key}.`);
+  }
+  if (typeof raw.content !== 'string') throw new Error('content must be a string.');
+  const operation = raw.operation ?? 'replace';
+  if (operation !== 'replace' && operation !== 'append' && operation !== 'replace_section') {
+    throw new Error('operation must be replace, append, or replace_section.');
+  }
+  if (raw.section !== undefined && typeof raw.section !== 'string') throw new Error('section must be a string.');
+  if (raw.expectedHash !== undefined && raw.expectedHash !== null && typeof raw.expectedHash !== 'string') {
+    throw new Error('expectedHash must be a string or null.');
+  }
+  return {
+    operation,
+    section: raw.section as string | undefined,
+    content: raw.content,
+    hasExpectedHash: Object.prototype.hasOwnProperty.call(raw, 'expectedHash'),
+    expectedHash: (raw.expectedHash ?? null) as string | null,
+  };
 }
 
 async function resolveSyncPaths(catalogPaths: CatalogPaths | null, staticPaths: CatencePaths | null, body: SyncRequestBody): Promise<CatencePaths> {
@@ -302,6 +342,70 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           json(response, 200, await dashboardSnapshot(await dashboardPaths(catalogPaths, staticPaths, url), url));
         } catch (error) {
           json(response, 400, { error: { code: 'dashboard_unavailable', message: error instanceof Error ? error.message : String(error) } });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/athlete-file' && request.method === 'GET') {
+        try {
+          const url = new URL(request.url ?? '/', 'http://localhost');
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          const revisionId = url.searchParams.get('revision');
+          if (revisionId) {
+            let content: string | null;
+            try {
+              content = await readAthleteFileRevision(paths, revisionId);
+            } catch (error) {
+              if (!(error instanceof AthleteFileValidationError)) throw error;
+              content = null;
+            }
+            if (content === null) {
+              json(response, 404, { error: { code: 'athlete_file_revision_not_found', message: 'No athlete-file revision matches this identifier.' } });
+              return;
+            }
+            json(response, 200, { revisionId, content });
+            return;
+          }
+          const snapshot = await readAthleteFile(paths);
+          json(response, 200, { ...snapshot, revisions: await listAthleteFileRevisions(paths) });
+        } catch (error) {
+          json(response, 400, { error: { code: 'athlete_file_unavailable', message: error instanceof Error ? error.message : String(error) } });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/athlete-file' && request.method === 'PUT') {
+        try {
+          const url = new URL(request.url ?? '/', 'http://localhost');
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          const parsed = parseAthleteFileBody(await readJsonBody(request));
+          const header = request.headers['if-match'];
+          const headerHash = typeof header === 'string' && header.trim() ? header.trim() : undefined;
+          if (!headerHash && !parsed.hasExpectedHash) {
+            throw new AthleteFileValidationError('expectedHash is required: send the If-Match header or the expectedHash body field (null to create the file).');
+          }
+          const snapshot = await updateAthleteFile(paths, {
+            operation: parsed.operation,
+            section: parsed.section,
+            content: parsed.content,
+            expectedHash: headerHash ?? parsed.expectedHash,
+          });
+          json(response, 200, snapshot);
+        } catch (error) {
+          if (error instanceof AthleteFileConflictError) {
+            json(response, 409, {
+              error: {
+                code: 'athlete_file_conflict',
+                message: error.message,
+                currentHash: error.currentHash,
+                currentContent: error.currentContent,
+              },
+            });
+          } else if (error instanceof AthleteFileTooLargeError || error instanceof AthleteFileValidationError) {
+            json(response, 400, { error: { code: 'invalid_request', message: error.message } });
+          } else {
+            json(response, 400, { error: { code: 'athlete_file_write_failed', message: error instanceof Error ? error.message : String(error) } });
+          }
         }
         return;
       }

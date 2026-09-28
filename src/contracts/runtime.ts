@@ -8,4 +8,8 @@ export type CatencePaths = {
   config: string;
   secrets: string;
   lock: string;
+  /** Athlete-authored markdown document shared by the athlete and the agent. */
+  athleteFile: string;
+  /** Rolling snapshots of prior athlete-file content. Created on first write. */
+  athleteFileHistory: string;
 };

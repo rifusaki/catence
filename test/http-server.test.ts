@@ -5,7 +5,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { afterEach, describe, expect, it } from 'vitest';
 import { CATENCE_PROTOCOL_VERSION, CATENCE_RUNTIME_VERSION } from '../src/contracts/release.js';
 import { createCatenceHttpServer } from '../src/interfaces/http/server.js';
-import { startDetachedSync, type DetachedSyncHandle, type DetachedSyncRequest } from '../src/runtime/index.js';
+import { startDetachedSync, ATHLETE_FILE_TEMPLATE, type DetachedSyncHandle, type DetachedSyncRequest } from '../src/runtime/index.js';
 import { temporaryDatabase } from './helpers.js';
 
 const servers: Array<ReturnType<typeof createCatenceHttpServer>> = [];
@@ -301,5 +301,107 @@ describe('Catence Streamable HTTP server', () => {
     expect(discoveryCalls).toBe(1);
     // Single-store deployments merge into the store's own config.
     expect(requestedConfigPaths[0]).toBe(paths.config);
+  });
+
+  it('reads and writes the athlete file through the API', async () => {
+    const { paths, database } = await temporaryDatabase();
+    await database.close();
+    const server = createCatenceHttpServer({ paths });
+    servers.push(server);
+    const origin = await listen(server);
+
+    const absent = await fetch(`${origin}/api/v1/athlete-file`);
+    expect(absent.status).toBe(200);
+    await expect(absent.json()).resolves.toEqual({
+      exists: false,
+      content: ATHLETE_FILE_TEMPLATE,
+      hash: null,
+      updatedAt: null,
+      revisions: [],
+    });
+
+    const created = await fetch(`${origin}/api/v1/athlete-file`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ content: '# Athlete file\n\n## Goals\n\n- Sub-40 10K\n', expectedHash: null }),
+    });
+    expect(created.status).toBe(200);
+    const createdPayload = await created.json();
+    expect(createdPayload.exists).toBe(true);
+    expect(createdPayload.hash).toEqual(expect.any(String));
+    expect(createdPayload.updatedAt).toEqual(expect.any(String));
+    expect(createdPayload.content).toBe('# Athlete file\n\n## Goals\n\n- Sub-40 10K\n');
+
+    // If-Match carries the compare-and-swap hash for the append.
+    const appended = await fetch(`${origin}/api/v1/athlete-file`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', 'if-match': createdPayload.hash },
+      body: JSON.stringify({ operation: 'append', content: '## Notes\n\n- Prefers morning sessions' }),
+    });
+    expect(appended.status).toBe(200);
+    const appendedPayload = await appended.json();
+    expect(appendedPayload.content).toContain('Prefers morning sessions');
+    expect(appendedPayload.hash).not.toBe(createdPayload.hash);
+
+    const reRead = await fetch(`${origin}/api/v1/athlete-file`);
+    await expect(reRead.json()).resolves.toMatchObject({
+      exists: true,
+      hash: appendedPayload.hash,
+      revisions: [{ hash: createdPayload.hash.slice(0, 8) }],
+    });
+
+    const listed = await (await fetch(`${origin}/api/v1/athlete-file`)).json();
+    const revision = await fetch(`${origin}/api/v1/athlete-file?revision=${encodeURIComponent(listed.revisions[0].revisionId)}`);
+    expect(revision.status).toBe(200);
+    await expect(revision.json()).resolves.toEqual({
+      revisionId: listed.revisions[0].revisionId,
+      content: '# Athlete file\n\n## Goals\n\n- Sub-40 10K\n',
+    });
+
+    const unknownRevision = await fetch(`${origin}/api/v1/athlete-file?revision=123-deadbeef`);
+    expect(unknownRevision.status).toBe(404);
+    await expect(unknownRevision.json()).resolves.toMatchObject({ error: { code: 'athlete_file_revision_not_found' } });
+  });
+
+  it('rejects athlete-file writes without a fresh hash', async () => {
+    const { paths, database } = await temporaryDatabase();
+    await database.close();
+    const server = createCatenceHttpServer({ paths });
+    servers.push(server);
+    const origin = await listen(server);
+
+    const missing = await fetch(`${origin}/api/v1/athlete-file`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ content: '# Athlete file\n' }),
+    });
+    expect(missing.status).toBe(400);
+    await expect(missing.json()).resolves.toMatchObject({ error: { code: 'invalid_request' } });
+
+    const created = await fetch(`${origin}/api/v1/athlete-file`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ content: '# Athlete file\n\n## Goals\n\n- Sub-40 10K\n', expectedHash: null }),
+    });
+    expect(created.status).toBe(200);
+    const createdPayload = await created.json();
+
+    const stale = await fetch(`${origin}/api/v1/athlete-file`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', 'if-match': 'deadbeef' },
+      body: JSON.stringify({ content: '# Athlete file\n\nclobber\n' }),
+    });
+    expect(stale.status).toBe(409);
+    await expect(stale.json()).resolves.toMatchObject({
+      error: {
+        code: 'athlete_file_conflict',
+        currentHash: createdPayload.hash,
+        currentContent: createdPayload.content,
+      },
+    });
+
+    // The conflict left the stored file byte-for-byte untouched.
+    const reRead = await fetch(`${origin}/api/v1/athlete-file`);
+    await expect(reRead.json()).resolves.toMatchObject({ hash: createdPayload.hash, content: createdPayload.content });
   });
 });

@@ -19,6 +19,8 @@ export function resolvePaths(root = process.env.CATENCE_DATA_DIR ?? '.catence'):
     config: path.join(absoluteRoot, 'config.json'),
     secrets: path.join(absoluteRoot, 'secrets'),
     lock: path.join(absoluteRoot, '.catence-write.lock'),
+    athleteFile: path.join(absoluteRoot, 'athlete.md'),
+    athleteFileHistory: path.join(absoluteRoot, 'athlete-revisions'),
   };
 }
 

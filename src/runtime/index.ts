@@ -38,6 +38,19 @@ export {
 export type { Athlete, CatalogPaths, CatenceCatalog } from '../core/runtime/catalog.js';
 export { athleteProviderEnvironment, providerSecretPath, readAthleteSecrets, setAthleteSecret } from '../core/runtime/secrets.js';
 export type { AthleteSecrets, SecretProvider } from '../core/runtime/secrets.js';
+export {
+  ATHLETE_FILE_MAX_CHARACTERS,
+  ATHLETE_FILE_TEMPLATE,
+  AthleteFileConflictError,
+  AthleteFileTooLargeError,
+  AthleteFileValidationError,
+  hashAthleteFileContent,
+  listAthleteFileRevisions,
+  readAthleteFile,
+  readAthleteFileRevision,
+  updateAthleteFile,
+} from '../core/runtime/athlete-file.js';
+export type { AthleteFileOperation, AthleteFileRevision, AthleteFileSnapshot, AthleteFileUpdate } from '../core/runtime/athlete-file.js';
 export { SlidingWindowLimiter } from '../core/runtime/limiter.js';
 export { DashboardSnapshotService } from '../core/dashboard/snapshot.js';
 export { searchContext } from '../core/retrieval/index.js';
