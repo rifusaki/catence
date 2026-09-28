@@ -985,5 +985,50 @@ const activityDecouplingFactsMigration: Migration = {
   `,
 };
 
-export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration, syncRunProgressMigration, canonicalTrainingDerivedAvgPowerMigration, courseGeometryMigration, activityDecouplingFactsMigration];
+const runDynamicsFactsMigration: Migration = {
+  version: 18,
+  name: 'run_dynamics_facts',
+  sql: `
+    -- A5 (persistence): make provider-supplied running dynamics queryable
+    -- historically instead of only inside one activity's raw metrics_json.
+    -- Values are provider-normalized running form metrics; a null column means
+    -- the provider did not report that metric for the activity. Only activities
+    -- with at least one reported value get a row. Single activities carry the
+    -- fields flat; multisport legs carry them nested under summaryDTO, and the
+    -- normalizer searches both shapes. Rows are written by the activity
+    -- normalizer on import (matching activity_decoupling, with no SQL backfill),
+    -- so previously imported activities gain rows when their source entity is
+    -- refreshed or re-imported; the upsert is idempotent.
+    CREATE TABLE IF NOT EXISTS run_dynamics_facts (
+      provider VARCHAR NOT NULL,
+      activity_source_id VARCHAR NOT NULL,
+      sport VARCHAR,
+      started_at_utc TIMESTAMPTZ,
+      vertical_oscillation_cm DOUBLE,
+      ground_contact_time_ms DOUBLE,
+      flight_time_ms DOUBLE,
+      stride_length_cm DOUBLE,
+      vertical_ratio_pct DOUBLE,
+      cadence_spm DOUBLE,
+      source_type VARCHAR NOT NULL,
+      caveats_json JSON,
+      raw_object_hash VARCHAR,
+      PRIMARY KEY (provider, activity_source_id)
+    );
+
+    -- Join view so callers can filter or group by logical activity without
+    -- hand-joining activity_sources/activities. Every facts row is current by
+    -- construction (the primary key is the source row), so no ranking filter is
+    -- applied and provider rows are never hidden.
+    CREATE OR REPLACE VIEW run_dynamics AS
+    SELECT facts.*, source.activity_id, source.remote_activity_id, activity.name
+    FROM run_dynamics_facts AS facts
+    JOIN activity_sources AS source USING (activity_source_id)
+    JOIN activities AS activity USING (activity_id);
+
+    UPDATE retrieval_index_state SET status = 'stale' WHERE index_name = 'context';
+  `,
+};
+
+export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration, syncRunProgressMigration, canonicalTrainingDerivedAvgPowerMigration, courseGeometryMigration, activityDecouplingFactsMigration, runDynamicsFactsMigration];
 export type { Migration };

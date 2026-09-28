@@ -176,12 +176,39 @@ export class ReadOnlyRepository {
   }
 
   async coverage(): Promise<Record<string, unknown>> {
+    // One UNION keeps the per-relation min/max/count in a single metadata
+    // query. Every cataloged dataset with a usable date axis gets a row;
+    // segments and course_geometry are dictionaries without a data date, so
+    // they report a count and null dates rather than inventing a timeline from
+    // ingestion timestamps.
     const rows = await this.rows(`
       SELECT 'activities' AS dataset, min(cast(started_at_utc AS DATE)) AS start_date, max(cast(started_at_utc AS DATE)) AS end_date, count(*)::INTEGER AS row_count FROM activities
+      UNION ALL SELECT 'canonical_activities', min(cast(started_at_utc AS DATE)), max(cast(started_at_utc AS DATE)), count(*)::INTEGER FROM canonical_activity_training
+      UNION ALL SELECT 'canonical_activity_facts', min(cast(started_at_utc AS DATE)), max(cast(started_at_utc AS DATE)), count(*)::INTEGER FROM canonical_activity_facts
+      UNION ALL SELECT 'activity_summaries', min(cast(started_at_utc AS DATE)), max(cast(started_at_utc AS DATE)), count(*)::INTEGER FROM activity_summary_facts
+      UNION ALL SELECT 'activity_intervals', min(cast(started_at_utc AS DATE)), max(cast(started_at_utc AS DATE)), count(*)::INTEGER FROM activity_interval_facts
+      UNION ALL SELECT 'swim_lengths', min(cast(started_at_utc AS DATE)), max(cast(started_at_utc AS DATE)), count(*)::INTEGER FROM swim_length_facts
+      UNION ALL SELECT 'swim_sets', min(cast(started_at_utc AS DATE)), max(cast(started_at_utc AS DATE)), count(*)::INTEGER FROM swim_set_facts
+      UNION ALL SELECT 'activity_quality_flags', min(cast(started_at_utc AS DATE)), max(cast(started_at_utc AS DATE)), count(*)::INTEGER FROM activity_quality_flag_facts
+      UNION ALL SELECT 'power_bests', min(cast(started_at_utc AS DATE)), max(cast(started_at_utc AS DATE)), count(*)::INTEGER FROM power_best_facts
+      UNION ALL SELECT 'activity_decoupling', min(cast(started_at_utc AS DATE)), max(cast(started_at_utc AS DATE)), count(*)::INTEGER FROM activity_decoupling_facts
+      UNION ALL SELECT 'run_dynamics', min(cast(started_at_utc AS DATE)), max(cast(started_at_utc AS DATE)), count(*)::INTEGER FROM run_dynamics_facts
       UNION ALL SELECT 'daily_metrics', min(metric_date), max(metric_date), count(*)::INTEGER FROM daily_metrics
+      UNION ALL SELECT 'daily_health', min(metric_date), max(metric_date), count(*)::INTEGER FROM daily_health
       UNION ALL SELECT 'training_metric_observations', min(cast(observed_at AS DATE)), max(cast(observed_at AS DATE)), count(*)::INTEGER FROM training_metric_observations
+      UNION ALL SELECT 'wellness_samples', min(cast(observed_at AS DATE)), max(cast(observed_at AS DATE)), count(*)::INTEGER FROM wellness_samples
+      UNION ALL SELECT 'health_sessions', min(occurred_on), max(occurred_on), count(*)::INTEGER FROM health_sessions
       UNION ALL SELECT 'nutrition_days', min(nutrition_date), max(nutrition_date), count(*)::INTEGER FROM nutrition_days
+      UNION ALL SELECT 'nutrition_items', min(nutrition_date), max(nutrition_date), count(*)::INTEGER FROM nutrition_items
+      UNION ALL SELECT 'events', min(occurred_on), max(occurred_on), count(*)::INTEGER FROM events
+      UNION ALL SELECT 'workouts', min(occurred_on), max(occurred_on), count(*)::INTEGER FROM workouts
+      UNION ALL SELECT 'training_plans', min(occurred_on), max(occurred_on), count(*)::INTEGER FROM training_plans
+      UNION ALL SELECT 'messages', min(occurred_on), max(occurred_on), count(*)::INTEGER FROM messages
       UNION ALL SELECT 'source_entities', min(occurred_on), max(occurred_on), count(*)::INTEGER FROM source_entities
+      UNION ALL SELECT 'activity_segments', min(cast(started_at AS DATE)), max(cast(started_at AS DATE)), count(*)::INTEGER FROM activity_segments
+      UNION ALL SELECT 'segment_effort_history', min(cast(started_at AS DATE)), max(cast(started_at AS DATE)), count(*)::INTEGER FROM segment_effort_history
+      UNION ALL SELECT 'segments', CAST(NULL AS DATE), CAST(NULL AS DATE), count(*)::INTEGER FROM strava_segments
+      UNION ALL SELECT 'course_geometry', CAST(NULL AS DATE), CAST(NULL AS DATE), count(*)::INTEGER FROM course_geometry
     `);
     return { coverage: rows, providers: await this.rows(`SELECT provider, count(*)::INTEGER AS activity_sources FROM activity_sources GROUP BY provider ORDER BY provider`) };
   }
@@ -195,10 +222,12 @@ export class ReadOnlyRepository {
     return { activity: activity[0], sources, summaries, intervals };
   }
 
-  async summary(startDate: string, endDate: string): Promise<Record<string, unknown>> {
+  async summary(startDate: string, endDate: string, detail: 'summary' | 'columns' = 'summary'): Promise<Record<string, unknown>> {
     const training = await this.rows(`SELECT cast(started_at_utc AS DATE) AS date, count(*)::INTEGER AS activities, sum(distance_m) AS distance_m, sum(moving_s) AS moving_s, sum(training_load) AS training_load FROM canonical_activity_training WHERE cast(started_at_utc AS DATE) BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) GROUP BY 1 ORDER BY 1`, { startDate, endDate });
     const health = await this.rows(`SELECT * FROM daily_health WHERE metric_date BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) ORDER BY metric_date, provider`, { startDate, endDate });
-    const nutrition = await this.rows(`SELECT * FROM nutrition_days WHERE nutrition_date BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) ORDER BY nutrition_date, provider`, { startDate, endDate });
+    const nutrition = detail === 'columns'
+      ? await this.rows(`SELECT nutrition_date, provider, energy_kcal, carbohydrates_g, protein_g, fat_g, hydration_ml FROM nutrition_days WHERE nutrition_date BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE) ORDER BY nutrition_date, provider`, { startDate, endDate })
+      : await this.rows(`SELECT count(*)::INTEGER AS days_logged, min(nutrition_date) AS first_date, max(nutrition_date) AS last_date, sum(energy_kcal) AS energy_kcal, sum(carbohydrates_g) AS carbohydrates_g, sum(protein_g) AS protein_g, sum(fat_g) AS fat_g, sum(hydration_ml) AS hydration_ml FROM nutrition_days WHERE nutrition_date BETWEEN cast($startDate AS DATE) AND cast($endDate AS DATE)`, { startDate, endDate });
     return { training, health, nutrition };
   }
 

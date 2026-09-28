@@ -278,6 +278,7 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
   if (entity.entityType === 'activity') {
     await importActivity(database, entity.provider, entity.remoteId, payload, rawHash);
     await importActivityDecoupling(database, entity.provider, entity.remoteId, payload, rawHash);
+    await importActivityRunDynamics(database, entity.provider, entity.remoteId, payload, rawHash);
     if (entity.provider === 'intervals') await importIntervalsAutoSwimSets(database, entity.remoteId, payload, rawHash);
     if (entity.provider === 'garmin') {
       await importGarminCyclingFtpFromActivity(database, entity.remoteId, payload, rawHash);
@@ -598,6 +599,73 @@ async function importActivityDecoupling(database: CatenceDatabase, provider: Pro
       { provider, activitySourceId, sport: fields.sport, startedAtUtc: fields.startAtUtc, metric: spec.metric, value, unit: spec.unit, caveats: json({}), rawHash },
     );
   }
+}
+
+/** Containers searched for provider-supplied run dynamics: the payload itself,
+ * the multisport summary object, common nested analysis/metrics objects, and
+ * the stored metrics_json. Single-activity Garmin payloads carry flat keys;
+ * multisport legs carry the same fields under summaryDTO. */
+function runDynamicsContainers(payload: JsonObject): JsonObject[] {
+  const containers: JsonObject[] = [payload];
+  for (const key of ['summaryDTO', 'analysis', 'data', 'metrics', 'icuAnalysis', 'summaries']) {
+    const nested = payload[key];
+    if (nested !== null && typeof nested === 'object' && !Array.isArray(nested)) containers.push(nested as JsonObject);
+  }
+  const metricsJson = payload.metrics_json;
+  if (metricsJson !== undefined && metricsJson !== null) containers.push(objectFromJson(metricsJson));
+  return containers;
+}
+
+const RUN_DYNAMICS_METRICS = [
+  { column: 'vertical_oscillation_cm', keys: ['avgVerticalOscillation', 'verticalOscillation'] },
+  { column: 'ground_contact_time_ms', keys: ['avgGctTime', 'groundContactTime', 'avgGroundContactTime'] },
+  { column: 'flight_time_ms', keys: ['avgFlightTime', 'flightTime'] },
+  { column: 'stride_length_cm', keys: ['avgStrideLength', 'strideLength'] },
+  { column: 'vertical_ratio_pct', keys: ['avgVerticalRatio', 'verticalRatio'] },
+  { column: 'cadence_spm', keys: ['averageRunningCadenceInStepsPerMinute', 'avgRunCadence', 'averageCadence'] },
+] as const satisfies ReadonlyArray<{ column: string; keys: readonly string[] }>;
+
+type RunDynamicsColumn = (typeof RUN_DYNAMICS_METRICS)[number]['column'];
+type RunDynamicsValues = Record<RunDynamicsColumn, number | null>;
+
+function firstReportedNumber(containers: JsonObject[], keys: readonly string[]): number | null {
+  for (const container of containers) {
+    const found = firstNumber(container, keys);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+/** A5 (persistence): persist provider-supplied running form metrics (vertical
+ * oscillation, ground contact time, flight time, stride length, vertical ratio,
+ * running cadence) so they are queryable across activities instead of only
+ * inside one activity's raw metrics_json. A row is stored only when the payload
+ * reported at least one dynamics value; null columns in a stored row mean the
+ * provider did not report that metric. */
+async function importActivityRunDynamics(database: CatenceDatabase, provider: Provider, remoteId: string, payload: JsonObject, rawHash: string | null): Promise<void> {
+  const containers = runDynamicsContainers(payload);
+  const reported = RUN_DYNAMICS_METRICS.map((spec) => firstReportedNumber(containers, spec.keys));
+  if (reported.every((value) => value === null)) return;
+  const values = Object.fromEntries(RUN_DYNAMICS_METRICS.map((spec, index) => [spec.column, reported[index]])) as RunDynamicsValues;
+  const fields = activityFields(provider, payload);
+  await database.run(
+    `INSERT INTO run_dynamics_facts
+      (provider, activity_source_id, sport, started_at_utc, vertical_oscillation_cm, ground_contact_time_ms, flight_time_ms, stride_length_cm, vertical_ratio_pct, cadence_spm, source_type, caveats_json, raw_object_hash)
+     VALUES ($provider, $activitySourceId, $sport, try_cast($startedAtUtc AS TIMESTAMPTZ), $verticalOscillation, $groundContactTime, $flightTime, $strideLength, $verticalRatio, $cadence, 'provider', $caveats, $rawHash)
+     ON CONFLICT (provider, activity_source_id) DO UPDATE SET
+       sport = excluded.sport, started_at_utc = excluded.started_at_utc,
+       vertical_oscillation_cm = excluded.vertical_oscillation_cm, ground_contact_time_ms = excluded.ground_contact_time_ms,
+       flight_time_ms = excluded.flight_time_ms, stride_length_cm = excluded.stride_length_cm,
+       vertical_ratio_pct = excluded.vertical_ratio_pct, cadence_spm = excluded.cadence_spm,
+       source_type = excluded.source_type, caveats_json = excluded.caveats_json, raw_object_hash = excluded.raw_object_hash`,
+    {
+      provider, activitySourceId: providerActivityId(provider, remoteId), sport: fields.sport, startedAtUtc: fields.startAtUtc,
+      verticalOscillation: values.vertical_oscillation_cm, groundContactTime: values.ground_contact_time_ms,
+      flightTime: values.flight_time_ms, strideLength: values.stride_length_cm,
+      verticalRatio: values.vertical_ratio_pct, cadence: values.cadence_spm,
+      caveats: json({}), rawHash,
+    },
+  );
 }
 
 /** Pull a course's ordered geometry samples, tolerating the several shapes a
