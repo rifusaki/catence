@@ -8,6 +8,7 @@ import signal
 import sys
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 from .progress import ProgressReporter
 from .staging import StagingWriter
@@ -40,7 +41,31 @@ def parse_args() -> argparse.Namespace:
         type=date.fromisoformat,
         help="Fetch calendar events from this date instead of the default short lookback.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=5,
+        help="Maximum in-flight Garmin requests (1 disables request parallelization).",
+    )
+    args = parser.parse_args()
+    if args.concurrency < 1:
+        parser.error("--concurrency must be at least 1")
+    return args
+
+
+def _print_run_summary(run_id: str, worker: GarminStagingWorker, reporter: ProgressReporter) -> None:
+    """Emit one stderr record with per-stage timings and capture counts.
+
+    The management layer surfaces stderr in the sync log, so quiet-day runs
+    carry their own performance profile without an extra instrumentation pass.
+    """
+    record: dict[str, Any] = {
+        "kind": "stage_timings",
+        "runId": run_id,
+        "timings": {name: round(seconds, 2) for name, seconds in reporter.stage_summary().items()},
+    }
+    record.update(worker.capture_summary())
+    print(json.dumps(record, separators=(",", ":")), file=sys.stderr, flush=True)
 
 
 def main() -> None:
@@ -65,7 +90,7 @@ def main() -> None:
         loaded = json.loads(args.known_activities.read_text(encoding="utf-8"))
         if isinstance(loaded, dict):
             known_hashes = {str(key): str(value) for key, value in loaded.items()}
-    worker = GarminStagingWorker(client, writer, args.data_dir, known_hashes, progress=reporter)
+    worker = GarminStagingWorker(client, writer, args.data_dir, known_hashes, progress=reporter, concurrency=args.concurrency)
     interrupt_signal: int | None = None
 
     def _request_interrupt(signum: int, _frame: object) -> None:
@@ -89,7 +114,10 @@ def main() -> None:
     except WorkerInterrupted:
         reporter.finish("interrupted")
         raise SystemExit(130 if interrupt_signal == signal.SIGINT else 143)
-    reporter.finish("completed")
+    else:
+        reporter.finish("completed")
+    finally:
+        _print_run_summary(args.run_id, worker, reporter)
 
 
 if __name__ == "__main__":

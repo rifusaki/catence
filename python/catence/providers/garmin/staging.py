@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from . import STAGING_SCHEMA_VERSION
 from .contracts import validate_record
@@ -28,12 +30,15 @@ class StagingWriter:
     def __post_init__(self) -> None:
         self.output.parent.mkdir(parents=True, exist_ok=True)
         self.output.touch(exist_ok=True)
+        self._lock = threading.Lock()
 
     def emit(self, record: dict[str, Any]) -> None:
         record["schemaVersion"] = STAGING_SCHEMA_VERSION
-        with self.output.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(validate_record(record), separators=(",", ":"), default=str))
-            file.write("\n")
+        line = json.dumps(validate_record(record), separators=(",", ":"), default=str) + "\n"
+        # Sync runs fan capture out across threads; serialize whole lines so the
+        # JSONL never interleaves, even though each write still opens the file.
+        with self._lock, self.output.open("a", encoding="utf-8") as file:
+            file.write(line)
 
     def manifest(self, run_id: str, from_date: str) -> None:
         self.emit({
@@ -54,7 +59,9 @@ class StagingWriter:
         destination = self.data_dir / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
-            temporary = destination.with_suffix(f".{extension}.tmp")
+            # Unique same-directory temp name: concurrent writers can race on
+            # the same content hash, and a shared temp path would clobber.
+            temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{uuid4().hex}.tmp")
             temporary.write_bytes(contents)
             os.replace(temporary, destination)
         self.emit({

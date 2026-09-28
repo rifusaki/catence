@@ -240,7 +240,20 @@ function runGarminWorker(
       }
       log.info(`[garmin] ${line}`);
     });
-    buffer(child.stderr, (line) => log.error(`[garmin] ${line}`));
+    buffer(child.stderr, (line) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        log.error(`[garmin] ${line}`);
+        return;
+      }
+      if (typeof parsed === 'object' && parsed !== null && (parsed as { kind?: unknown }).kind === 'stage_timings') {
+        log.info('Garmin staging worker stage timings', parsed as Record<string, unknown>);
+        return;
+      }
+      log.error(`[garmin] ${line}`);
+    });
     child.on('error', (error) => {
       if (killTimer) clearTimeout(killTimer);
       resolve({ code: 1, signal: null });
@@ -341,7 +354,9 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       // streams even when the list-summary hash is unchanged.
       await writeFile(knownActivities, JSON.stringify(options.refreshActivities ? {} : await database.knownActivitySummaryHashes('garmin')));
       extractionStarted = true;
-      const arguments_ = ['run', 'python', '-m', 'python.catence.providers.garmin.cli', '--from', fromDate, '--to', options.toDate, '--data-dir', paths.root, '--output', output, '--run-id', runId, '--known-activities', knownActivities];
+      const requestedConcurrency = Number.parseInt(process.env.CATENCE_GARMIN_CONCURRENCY ?? '5', 10);
+      const workerConcurrency = Number.isFinite(requestedConcurrency) && requestedConcurrency > 0 ? Math.trunc(requestedConcurrency) : 5;
+      const arguments_ = ['run', 'python', '-m', 'python.catence.providers.garmin.cli', '--from', fromDate, '--to', options.toDate, '--data-dir', paths.root, '--output', output, '--run-id', runId, '--known-activities', knownActivities, '--concurrency', String(workerConcurrency)];
       if (dailyWindow) arguments_.push('--daily-from', dailyWindow.fromDate, '--daily-to', dailyWindow.toDate);
       else arguments_.push('--skip-daily');
       if (activityWindow) arguments_.push('--activity-from', activityWindow.fromDate, '--activity-to', activityWindow.toDate);
@@ -365,6 +380,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       if (needsEventBackfill && earliestActivity && earliestActivity < eventsShortFrom) {
         arguments_.push('--events-from', earliestActivity);
       }
+      const workerStartedAt = Date.now();
       let interruptChild: (() => void) | null = null;
       await runWithInterruptGuard(runId, database, () => interruptChild?.(), guard, async () => {
         const outcome = await runGarminWorker(
@@ -382,13 +398,20 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
           throw new Error(`Garmin staging worker exited with code ${outcome.code}${outcome.signal ? ` (${outcome.signal})` : ''}.`);
         }
       });
+      log.info('Garmin staging worker finished', { runId, durationMs: Date.now() - workerStartedAt, concurrency: workerConcurrency });
       if (!guard.interrupted) {
         if (!existsSync(output)) throw new Error('Garmin staging worker completed without writing a JSONL manifest.');
+        let phaseStartedAt = Date.now();
         await importJsonl(database, runId, output, log);
+        log.info('Garmin staging import finished', { runId, durationMs: Date.now() - phaseStartedAt });
+        phaseStartedAt = Date.now();
         await reconcileGarminCalendarEntities(database, output);
+        log.info('Garmin calendar reconciliation finished', { runId, durationMs: Date.now() - phaseStartedAt });
         if (provider === 'garmin') {
           try {
+            phaseStartedAt = Date.now();
             await backfillGarminSwimLengths(database, paths, runId, log);
+            log.info('Garmin swim-length backfill finished', { runId, durationMs: Date.now() - phaseStartedAt });
           } catch (error) {
             log.warn('Garmin swim-length backfill after sync failed', {
               runId,
@@ -488,8 +511,9 @@ export async function syncData(paths: CatencePaths, provider: ProviderChoice, ex
         indexingKeepalive.unref?.();
       }
       try {
+        const indexStartedAt = Date.now();
         const index = await buildRetrievalIndex(database);
-        log.info('Rebuilt retrieval index after sync', { documents: index.documents, mode: index.mode, watermark: index.watermark });
+        log.info('Rebuilt retrieval index after sync', { documents: index.documents, mode: index.mode, watermark: index.watermark, durationMs: Date.now() - indexStartedAt });
       } finally {
         if (indexingKeepalive) clearInterval(indexingKeepalive);
         if (last?.runId) await removeProgressSidecar(paths, last.runId).catch(() => undefined);

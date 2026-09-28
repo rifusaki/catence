@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from concurrent import futures
 from datetime import date, timedelta
 from pathlib import Path
 import hashlib
 import json
+import random
+import threading
+import time
 from typing import Any, Callable, Mapping
 
 from .progress import ProgressReporter
@@ -121,6 +125,11 @@ SCHEDULED_WORKOUTS_MONTHS_AHEAD = 12
 # window predates this span).
 EVENTS_PAST_DAYS = 30
 
+# Garmin answers data-fetch bursts with HTTP 429. Back off cooperatively: a
+# rate-limit hit parks every in-flight request until a jittered deadline, and
+# the same call is retried on an escalating schedule before it fails.
+RATE_LIMIT_BACKOFF_SECONDS = (5.0, 15.0, 45.0)
+
 
 def shift_month(base: date, offset: int) -> date:
     """Return the first day of the month `offset` months from `base`'s month."""
@@ -150,13 +159,28 @@ def payload_date(payload: Mapping[str, Any]) -> str | None:
 class GarminStagingWorker:
     """Extract Garmin data through the explicit read-only registry into JSONL/Parquet staging."""
 
-    def __init__(self, api: Any, writer: StagingWriter, data_dir: Path, known_activity_hashes: Mapping[str, str] | None = None, progress: ProgressReporter | None = None) -> None:
+    def __init__(
+        self,
+        api: Any,
+        writer: StagingWriter,
+        data_dir: Path,
+        known_activity_hashes: Mapping[str, str] | None = None,
+        progress: ProgressReporter | None = None,
+        concurrency: int = 1,
+    ) -> None:
         self.api = api
         self.writer = writer
         self.data_dir = data_dir
         self.known_activity_hashes = dict(known_activity_hashes or {})
         self.progress = progress
+        self.concurrency = max(1, concurrency)
         self._interrupted = False
+        self._executor: futures.ThreadPoolExecutor | None = None
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limit_until = 0.0
+        self._counts_lock = threading.Lock()
+        self._capture_counts: dict[str, int] = {}
+        self._capture_errors: dict[str, int] = {}
 
     def request_interrupt(self) -> None:
         """Ask the worker to stop at the next safe boundary."""
@@ -167,6 +191,105 @@ class GarminStagingWorker:
             if self.progress is not None:
                 self.progress.finish("interrupted")
             raise WorkerInterrupted("Sync run interrupted between extraction steps")
+
+    def _wait_for_rate_limit(self) -> None:
+        """Block until any shared 429 cooldown expires, staying interrupt-aware."""
+        while True:
+            with self._rate_limit_lock:
+                remaining = self._rate_limit_until - time.monotonic()
+            if remaining <= 0:
+                return
+            if self._interrupted:
+                self._check_interrupted()
+            time.sleep(min(0.25, remaining))
+
+    @staticmethod
+    def _is_rate_limit(error: Exception) -> bool:
+        if "TooManyRequests" in type(error).__name__:
+            return True
+        if getattr(error, "status_code", None) == 429:
+            return True
+        try:
+            from garminconnect import GarminConnectTooManyRequestsError
+        except Exception:  # garminconnect is optional in lightweight test contexts.
+            return False
+        return isinstance(error, GarminConnectTooManyRequestsError)
+
+    def _request(self, action: Callable[[], Any]) -> Any:
+        """Run one Garmin API call with cooperative 429 handling."""
+        attempt = 0
+        while True:
+            self._wait_for_rate_limit()
+            try:
+                return action()
+            except Exception as error:
+                if not self._is_rate_limit(error) or attempt >= len(RATE_LIMIT_BACKOFF_SECONDS):
+                    raise
+                delay = RATE_LIMIT_BACKOFF_SECONDS[attempt] * random.uniform(0.5, 1.5)
+                with self._rate_limit_lock:
+                    self._rate_limit_until = max(self._rate_limit_until, time.monotonic() + delay)
+                attempt += 1
+
+    def _note_capture(self, endpoint: str, failed: bool) -> None:
+        with self._counts_lock:
+            target = self._capture_errors if failed else self._capture_counts
+            target[endpoint] = target.get(endpoint, 0) + 1
+
+    def capture_summary(self) -> dict[str, dict[str, int]]:
+        """Per-endpoint capture counts for the CLI's stage-timing summary."""
+        with self._counts_lock:
+            return {"captures": dict(self._capture_counts), "captureErrors": dict(self._capture_errors)}
+
+    def _ensure_executor(self) -> futures.ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = futures.ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="garmin-sync")
+        return self._executor
+
+    def close(self) -> None:
+        """Release the request pool once a sync run ends."""
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _map(self, items: list[Any], worker: Callable[[Any], None], on_done: Callable[[], None] | None = None) -> None:
+        """Run `worker` over `items`, bounded-parallel when configured.
+
+        The serial path (the default) preserves the original in-order request
+        flow exactly; concurrency > 1 keeps at most `concurrency` calls in
+        flight and reacts as soon as the first one completes.
+        """
+        if self.concurrency <= 1:
+            for item in items:
+                self._check_interrupted()
+                worker(item)
+                if on_done is not None:
+                    on_done()
+            return
+        executor = self._ensure_executor()
+        pending: set[futures.Future[None]] = set()
+        iterator = iter(items)
+        try:
+            while True:
+                while len(pending) < self.concurrency:
+                    try:
+                        item = next(iterator)
+                    except StopIteration:
+                        break
+                    pending.add(executor.submit(worker, item))
+                if not pending:
+                    return
+                done, _ = futures.wait(pending, timeout=0.5, return_when=futures.FIRST_COMPLETED)
+                for future in done:
+                    pending.discard(future)
+                    future.result()
+                    if on_done is not None:
+                        on_done()
+                if self._interrupted:
+                    raise WorkerInterrupted("Sync run interrupted between extraction steps")
+        except BaseException:
+            for future in pending:
+                future.cancel()
+            raise
 
     def sync(
         self,
@@ -180,46 +303,53 @@ class GarminStagingWorker:
         events_from: str | None = None,
     ) -> None:
         assert_read_only_registry()
-        end = to_date or date.today()
-        daily_end = daily_to_date or end
-        activity_end = activity_to_date or end
-        if include_non_historical:
-            self._check_interrupted()
-            self._singletons()
-        if daily_from_date and daily_from_date <= daily_end:
-            self._check_interrupted()
-            self._daily(daily_from_date, daily_end)
-            self._check_interrupted()
-            self._range(daily_from_date, daily_end)
-            self._check_interrupted()
-            self._cycling_ftp_history(daily_from_date, daily_end)
-            self._check_interrupted()
-            self._max_metrics_history(daily_from_date, daily_end)
-            self._check_interrupted()
-            self._hrv_history(daily_from_date, daily_end)
-            self._check_interrupted()
-            self._score_history(daily_from_date, daily_end)
-        # Lactate-threshold history uses the widest requested window so a
-        # single sync can catch stores up that were created before per-day
-        # LT capture existed; runs even when the daily window is skipped.
-        lt_windows = [window for window in (daily_from_date, lactate_threshold_history_from) if window is not None]
-        lt_start = min(lt_windows) if lt_windows else None
-        if lt_start is not None and lt_start <= daily_end:
-            self._check_interrupted()
-            self._lactate_threshold_history(lt_start, daily_end)
-        if activity_from_date and activity_from_date <= activity_end:
-            self._check_interrupted()
-            self._activities(activity_from_date, activity_end)
-        if include_non_historical:
-            self._check_interrupted()
-            self._collections(events_from=events_from)
+        try:
+            end = to_date or date.today()
+            daily_end = daily_to_date or end
+            activity_end = activity_to_date or end
+            if include_non_historical:
+                self._check_interrupted()
+                self._singletons()
+            if daily_from_date and daily_from_date <= daily_end:
+                self._check_interrupted()
+                self._daily(daily_from_date, daily_end)
+                self._check_interrupted()
+                self._range(daily_from_date, daily_end)
+                self._check_interrupted()
+                self._cycling_ftp_history(daily_from_date, daily_end)
+                self._check_interrupted()
+                self._max_metrics_history(daily_from_date, daily_end)
+                self._check_interrupted()
+                self._hrv_history(daily_from_date, daily_end)
+                self._check_interrupted()
+                self._score_history(daily_from_date, daily_end)
+            # Lactate-threshold history uses the widest requested window so a
+            # single sync can catch stores up that were created before per-day
+            # LT capture existed; runs even when the daily window is skipped.
+            lt_windows = [window for window in (daily_from_date, lactate_threshold_history_from) if window is not None]
+            lt_start = min(lt_windows) if lt_windows else None
+            if lt_start is not None and lt_start <= daily_end:
+                self._check_interrupted()
+                self._lactate_threshold_history(lt_start, daily_end)
+            if activity_from_date and activity_from_date <= activity_end:
+                self._check_interrupted()
+                self._activities(activity_from_date, activity_end)
+            if include_non_historical:
+                self._check_interrupted()
+                self._collections(events_from=events_from)
+        finally:
+            self.close()
 
     def _capture(self, endpoint: str, action: Callable[[], Any], remote_id_value: str | None = None, scope: dict[str, Any] | None = None) -> tuple[Any | None, str | None]:
         try:
-            payload = action()
+            payload = self._request(action)
             raw_hash = self.writer.archive_json(endpoint, remote_id_value, payload, scope)
+            self._note_capture(endpoint, False)
             return payload, raw_hash
+        except WorkerInterrupted:
+            raise
         except Exception as error:  # Provider availability is intentionally isolated per operation.
+            self._note_capture(endpoint, True)
             self.writer.error(endpoint, str(error), remote_id_value)
             return None, None
 
@@ -266,15 +396,23 @@ class GarminStagingWorker:
         if self.progress is not None:
             self.progress.set_stage("singletons")
             self.progress.advance(total=len(calls))
-        for index, (endpoint, (method, entity_type)) in enumerate(calls.items(), start=1):
-            self._check_interrupted()
+        completed = 0
+
+        def done() -> None:
+            nonlocal completed
+            completed += 1
+            if self.progress is not None:
+                self.progress.advance(completed=completed)
+
+        def fetch(item: tuple[str, tuple[str, str]]) -> None:
+            endpoint, (method, entity_type) = item
             if self.progress is not None:
                 self.progress.advance(step=endpoint)
             payload, raw_hash = self._capture(endpoint, lambda method=method: getattr(self.api, method)())
             if payload is not None:
                 self._entity(endpoint, entity_type, payload, raw_hash)
-            if self.progress is not None:
-                self.progress.advance(completed=index)
+
+        self._map(list(calls.items()), fetch, done)
 
     def _daily(self, from_date: date, to_date: date) -> None:
         calls = {
@@ -292,27 +430,33 @@ class GarminStagingWorker:
             "nutrition_food_log": ("get_nutrition_daily_food_log", "nutrition_log"), "nutrition_meals": ("get_nutrition_daily_meals", "nutrition_log"),
             "nutrition_settings": ("get_nutrition_daily_settings", "nutrition_setting"),
         }
-        total_days = (to_date - from_date).days + 1
+        tasks: list[tuple[str, str, str, str]] = []
+        current = from_date
+        while current <= to_date:
+            day = current.isoformat()
+            for endpoint, (method, entity_type) in calls.items():
+                tasks.append((day, endpoint, method, entity_type))
+            current += timedelta(days=1)
         if self.progress is not None:
             self.progress.set_stage("daily")
-            self.progress.advance(total=total_days)
-        current = from_date
-        completed_days = 0
-        while current <= to_date:
-            self._check_interrupted()
-            day = current.isoformat()
+            self.progress.advance(total=len(tasks))
+        completed = 0
+
+        def done() -> None:
+            nonlocal completed
+            completed += 1
             if self.progress is not None:
-                self.progress.advance(step=day)
-            for endpoint, (method, entity_type) in calls.items():
-                if self.progress is not None:
-                    self.progress.advance(step=f"{day} {endpoint}")
-                payload, raw_hash = self._capture(endpoint, lambda method=method, day=day: getattr(self.api, method)(day), day, {"date": day})
-                if payload is not None:
-                    self._entity(endpoint, entity_type, payload, raw_hash, day)
-            completed_days += 1
+                self.progress.advance(completed=completed)
+
+        def fetch(task: tuple[str, str, str, str]) -> None:
+            day, endpoint, method, entity_type = task
             if self.progress is not None:
-                self.progress.advance(completed=completed_days)
-            current += timedelta(days=1)
+                self.progress.advance(step=f"{day} {endpoint}")
+            payload, raw_hash = self._capture(endpoint, lambda method=method, day=day: getattr(self.api, method)(day), day, {"date": day})
+            if payload is not None:
+                self._entity(endpoint, entity_type, payload, raw_hash, day)
+
+        self._map(tasks, fetch, done)
 
     def _range(self, from_date: date, to_date: date) -> None:
         calls = {
@@ -322,8 +466,8 @@ class GarminStagingWorker:
         }
         if self.progress is not None:
             self.progress.set_stage("range")
-            self.progress.advance(total=len(calls))
-        for index, (endpoint, (method, entity_type)) in enumerate(calls.items(), start=1):
+        tasks: list[tuple[str, str, str, str, str]] = []
+        for endpoint, (method, entity_type) in calls.items():
             # Garmin rejects broad body-battery and menstrual-calendar ranges.
             # Keep every request inside the provider's 92-day limit.
             window_start = from_date
@@ -331,34 +475,54 @@ class GarminStagingWorker:
             # ranges. Keep it deliberately small; the captures are
             # content-addressed so overlapping retry windows are harmless.
             window_days = 7 if endpoint == "body_battery" else (90 if endpoint == "menstrual_calendar" else (to_date - from_date).days + 1)
+            while window_start <= to_date:
+                window_end = min(to_date, window_start + timedelta(days=window_days - 1))
+                tasks.append((endpoint, method, entity_type, window_start.isoformat(), window_end.isoformat()))
+                window_start = window_end + timedelta(days=1)
+        if self.progress is not None:
+            self.progress.advance(total=len(tasks))
+        completed = 0
+
+        def done() -> None:
+            nonlocal completed
+            completed += 1
+            if self.progress is not None:
+                self.progress.advance(completed=completed)
+
+        def fetch(task: tuple[str, str, str, str, str]) -> None:
+            endpoint, method, entity_type, start, end = task
             if self.progress is not None:
                 self.progress.advance(step=endpoint)
-            while window_start <= to_date:
-                self._check_interrupted()
-                window_end = min(to_date, window_start + timedelta(days=window_days - 1))
-                start, end = window_start.isoformat(), window_end.isoformat()
-                payload, raw_hash = self._capture(endpoint, lambda method=method, start=start, end=end: getattr(self.api, method)(start, end), None, {"from": start, "to": end})
-                if payload is not None:
-                    self._entity(endpoint, entity_type, payload, raw_hash, fallback_scope=start)
-                window_start = window_end + timedelta(days=1)
-            if self.progress is not None:
-                self.progress.advance(completed=index)
+            payload, raw_hash = self._capture(endpoint, lambda method=method, start=start, end=end: getattr(self.api, method)(start, end), None, {"from": start, "to": end})
+            if payload is not None:
+                self._entity(endpoint, entity_type, payload, raw_hash, fallback_scope=start)
+
+        self._map(tasks, fetch, done)
 
     def _cycling_ftp_history(self, from_date: date, to_date: date) -> None:
         """Stage daily cycling FTP setting history from Garmin's range endpoint."""
         endpoint = "functional_threshold_power_range"
+        windows: list[tuple[str, str]] = []
         window_start = from_date
-        total_windows = (to_date - from_date).days // 89 + 1
-        if self.progress is not None:
-            self.progress.set_stage("ftp_history")
-            self.progress.advance(total=total_windows)
-        completed_windows = 0
         while window_start <= to_date:
-            self._check_interrupted()
             # This private Connect endpoint is not documented with a maximum
             # range. Keep requests aligned with other conservative range calls.
             window_end = min(to_date, window_start + timedelta(days=89))
-            start, end = window_start.isoformat(), window_end.isoformat()
+            windows.append((window_start.isoformat(), window_end.isoformat()))
+            window_start = window_end + timedelta(days=1)
+        if self.progress is not None:
+            self.progress.set_stage("ftp_history")
+            self.progress.advance(total=len(windows))
+        completed = 0
+
+        def done() -> None:
+            nonlocal completed
+            completed += 1
+            if self.progress is not None:
+                self.progress.advance(completed=completed)
+
+        def fetch(window: tuple[str, str]) -> None:
+            start, end = window
             if self.progress is not None:
                 self.progress.advance(step=start)
             payload, raw_hash = self._capture(
@@ -389,24 +553,31 @@ class GarminStagingWorker:
                         raw_hash,
                         occurred_on=occurred_on,
                     )
-            completed_windows += 1
-            if self.progress is not None:
-                self.progress.advance(completed=completed_windows)
-            window_start = window_end + timedelta(days=1)
+
+        self._map(windows, fetch, done)
 
     def _lactate_threshold_history(self, from_date: date, to_date: date) -> None:
         """Stage daily running lactate-threshold history from Garmin's range endpoints."""
+        windows: list[tuple[str, str]] = []
         window_start = from_date
-        total_windows = (to_date - from_date).days // 365 + 1
-        if self.progress is not None:
-            self.progress.set_stage("lt_history")
-            self.progress.advance(total=total_windows)
-        completed_windows = 0
         while window_start <= to_date:
-            self._check_interrupted()
             # Garmin rejects range windows longer than 366 days.
             window_end = min(to_date, window_start + timedelta(days=365))
-            start, end = window_start.isoformat(), window_end.isoformat()
+            windows.append((window_start.isoformat(), window_end.isoformat()))
+            window_start = window_end + timedelta(days=1)
+        if self.progress is not None:
+            self.progress.set_stage("lt_history")
+            self.progress.advance(total=len(windows))
+        completed = 0
+
+        def done() -> None:
+            nonlocal completed
+            completed += 1
+            if self.progress is not None:
+                self.progress.advance(completed=completed)
+
+        def fetch(window: tuple[str, str]) -> None:
+            start, end = window
             if self.progress is not None:
                 self.progress.advance(step=start)
             payload, raw_hash = self._capture(
@@ -424,23 +595,31 @@ class GarminStagingWorker:
                         raw_hash,
                         occurred_on=item_day,
                     )
-            completed_windows += 1
-            if self.progress is not None:
-                self.progress.advance(completed=completed_windows)
-            window_start = window_end + timedelta(days=1)
+
+        self._map(windows, fetch, done)
 
     def _max_metrics_history(self, from_date: date, to_date: date) -> None:
         """Stage range max-metric responses by their actual calendar date."""
+        windows: list[tuple[str, str]] = []
         window_start = from_date
-        total_windows = (to_date - from_date).days // 89 + 1
+        while window_start <= to_date:
+            window_end = min(to_date, window_start + timedelta(days=89))
+            windows.append((window_start.isoformat(), window_end.isoformat()))
+            window_start = window_end + timedelta(days=1)
         if self.progress is not None:
             self.progress.set_stage("max_metrics")
-            self.progress.advance(total=total_windows)
-        completed_windows = 0
-        while window_start <= to_date:
-            self._check_interrupted()
-            window_end = min(to_date, window_start + timedelta(days=89))
-            start, end = window_start.isoformat(), window_end.isoformat()
+            self.progress.advance(total=len(windows))
+        completed = 0
+        observed_by_window: list[set[str]] = [set() for _ in windows]
+
+        def done() -> None:
+            nonlocal completed
+            completed += 1
+            if self.progress is not None:
+                self.progress.advance(completed=completed)
+
+        def fetch_range(task: tuple[int, tuple[str, str]]) -> None:
+            index, (start, end) = task
             if self.progress is not None:
                 self.progress.advance(step=start)
             payload, raw_hash = self._capture(
@@ -449,44 +628,64 @@ class GarminStagingWorker:
                 None,
                 {"from": start, "to": end},
             )
-            observed: set[str] = set()
             if payload is not None:
                 for item in as_items(payload):
                     item_day = payload_date(item)
                     if item_day:
-                        observed.add(item_day)
+                        observed_by_window[index].add(item_day)
                         self.writer.source_entity("max_metric", f"max_metrics:{item_day}", item, raw_hash, occurred_on=item_day)
-            current = window_start
+
+        self._map(list(enumerate(windows)), fetch_range, done)
+
+        # Days the provider omitted from a range response are retried one by
+        # one; a missing range day is authoritative for that window only.
+        fallback_days: list[str] = []
+        for (start, end), observed in zip(windows, observed_by_window):
+            current = date.fromisoformat(start)
+            window_end = date.fromisoformat(end)
             while current <= window_end:
                 day = current.isoformat()
                 if day not in observed:
-                    fallback, fallback_hash = self._capture(
-                        "max_metrics",
-                        lambda day=day: self.api.get_max_metrics(day),
-                        day,
-                        {"date": day, "fallback": "range-missing"},
-                    )
-                    if fallback is not None:
-                        for item in as_items(fallback):
-                            self.writer.source_entity("max_metric", f"max_metrics:{day}", item, fallback_hash, occurred_on=day)
+                    fallback_days.append(day)
                 current += timedelta(days=1)
-            completed_windows += 1
-            if self.progress is not None:
-                self.progress.advance(completed=completed_windows)
-            window_start = window_end + timedelta(days=1)
+        if self.progress is not None:
+            self.progress.advance(total=len(windows) + len(fallback_days))
+
+        def fetch_fallback(day: str) -> None:
+            fallback, fallback_hash = self._capture(
+                "max_metrics",
+                lambda day=day: self.api.get_max_metrics(day),
+                day,
+                {"date": day, "fallback": "range-missing"},
+            )
+            if fallback is not None:
+                for item in as_items(fallback):
+                    self.writer.source_entity("max_metric", f"max_metrics:{day}", item, fallback_hash, occurred_on=day)
+
+        self._map(fallback_days, fetch_fallback, done)
 
     def _hrv_history(self, from_date: date, to_date: date) -> None:
         """Stage the PR-402 HRV range API, retaining daily fallback coverage."""
+        windows: list[tuple[str, str]] = []
         window_start = from_date
-        total_windows = (to_date - from_date).days // 89 + 1
+        while window_start <= to_date:
+            window_end = min(to_date, window_start + timedelta(days=89))
+            windows.append((window_start.isoformat(), window_end.isoformat()))
+            window_start = window_end + timedelta(days=1)
         if self.progress is not None:
             self.progress.set_stage("hrv_history")
-            self.progress.advance(total=total_windows)
-        completed_windows = 0
-        while window_start <= to_date:
-            self._check_interrupted()
-            window_end = min(to_date, window_start + timedelta(days=89))
-            start, end = window_start.isoformat(), window_end.isoformat()
+            self.progress.advance(total=len(windows))
+        completed = 0
+        observed_by_window: list[set[str]] = [set() for _ in windows]
+
+        def done() -> None:
+            nonlocal completed
+            completed += 1
+            if self.progress is not None:
+                self.progress.advance(completed=completed)
+
+        def fetch_range(task: tuple[int, tuple[str, str]]) -> None:
+            index, (start, end) = task
             if self.progress is not None:
                 self.progress.advance(step=start)
             payload, raw_hash = self._capture(
@@ -495,65 +694,85 @@ class GarminStagingWorker:
                 None,
                 {"from": start, "to": end},
             )
-            observed: set[str] = set()
             if payload is not None:
                 for item in as_items(payload):
                     item_day = payload_date(item)
                     if item_day:
-                        observed.add(item_day)
+                        observed_by_window[index].add(item_day)
                         self.writer.source_entity("daily_health", f"hrv:{item_day}", item, raw_hash, occurred_on=item_day)
-            current = window_start
+
+        self._map(list(enumerate(windows)), fetch_range, done)
+
+        fallback_days: list[str] = []
+        for (start, end), observed in zip(windows, observed_by_window):
+            current = date.fromisoformat(start)
+            window_end = date.fromisoformat(end)
             while current <= window_end:
                 day = current.isoformat()
                 if day not in observed:
-                    fallback, fallback_hash = self._capture("hrv", lambda day=day: self.api.get_hrv_data(day), day, {"date": day, "fallback": "range-missing"})
-                    if fallback is not None:
-                        self.writer.source_entity("daily_health", f"hrv:{day}", as_dict(fallback), fallback_hash, occurred_on=day)
+                    fallback_days.append(day)
                 current += timedelta(days=1)
-            completed_windows += 1
-            if self.progress is not None:
-                self.progress.advance(completed=completed_windows)
-            window_start = window_end + timedelta(days=1)
+        if self.progress is not None:
+            self.progress.advance(total=len(windows) + len(fallback_days))
+
+        def fetch_fallback(day: str) -> None:
+            fallback, fallback_hash = self._capture("hrv", lambda day=day: self.api.get_hrv_data(day), day, {"date": day, "fallback": "range-missing"})
+            if fallback is not None:
+                self.writer.source_entity("daily_health", f"hrv:{day}", as_dict(fallback), fallback_hash, occurred_on=day)
+
+        self._map(fallback_days, fetch_fallback, done)
 
     def _score_history(self, from_date: date, to_date: date) -> None:
         """Stage daily-capable endurance-adjacent metrics from range endpoints."""
+        windows: list[tuple[str, str]] = []
         window_start = from_date
-        total_windows = (to_date - from_date).days // 89 + 1
+        while window_start <= to_date:
+            window_end = min(to_date, window_start + timedelta(days=89))
+            windows.append((window_start.isoformat(), window_end.isoformat()))
+            window_start = window_end + timedelta(days=1)
+        tasks = [(endpoint, start, end) for start, end in windows for endpoint in ("hill_score", "running_tolerance")]
         if self.progress is not None:
             self.progress.set_stage("scores")
-            self.progress.advance(total=total_windows)
-        completed_windows = 0
-        while window_start <= to_date:
-            self._check_interrupted()
-            window_end = min(to_date, window_start + timedelta(days=89))
-            start, end = window_start.isoformat(), window_end.isoformat()
+            self.progress.advance(total=len(tasks))
+        completed = 0
+
+        def done() -> None:
+            nonlocal completed
+            completed += 1
+            if self.progress is not None:
+                self.progress.advance(completed=completed)
+
+        def fetch(task: tuple[str, str, str]) -> None:
+            endpoint, start, end = task
             if self.progress is not None:
                 self.progress.advance(step=start)
-            for endpoint, method, entity_type in (
-                ("hill_score", lambda: self.api.get_hill_score(start, end), "hill_score"),
-                ("running_tolerance", lambda: self.api.get_running_tolerance(start, end, aggregation="daily"), "running_tolerance"),
-            ):
-                payload, raw_hash = self._capture(endpoint, method, None, {"from": start, "to": end, "aggregation": "daily"})
-                if payload is not None:
-                    for index, item in enumerate(as_items(payload)):
-                        item_day = payload_date(item)
-                        if item_day:
-                            self.writer.source_entity(entity_type, f"{endpoint}:{item_day}:{index}", item, raw_hash, occurred_on=item_day)
-            completed_windows += 1
-            if self.progress is not None:
-                self.progress.advance(completed=completed_windows)
-            window_start = window_end + timedelta(days=1)
+            if endpoint == "hill_score":
+                method = lambda start=start, end=end: self.api.get_hill_score(start, end)
+                entity_type = "hill_score"
+            else:
+                method = lambda start=start, end=end: self.api.get_running_tolerance(start, end, aggregation="daily")
+                entity_type = "running_tolerance"
+            payload, raw_hash = self._capture(endpoint, method, None, {"from": start, "to": end, "aggregation": "daily"})
+            if payload is not None:
+                for index, item in enumerate(as_items(payload)):
+                    item_day = payload_date(item)
+                    if item_day:
+                        self.writer.source_entity(entity_type, f"{endpoint}:{item_day}:{index}", item, raw_hash, occurred_on=item_day)
+
+        self._map(tasks, fetch, done)
 
         # Garmin limits daily race-prediction windows to one year.
+        race_windows: list[tuple[str, str]] = []
         window_start = from_date
-        total_windows = (to_date - from_date).days // 365 + 1
-        if self.progress is not None:
-            self.progress.advance(total=total_windows)
-        completed_windows = 0
         while window_start <= to_date:
-            self._check_interrupted()
             window_end = min(to_date, window_start + timedelta(days=365))
-            start, end = window_start.isoformat(), window_end.isoformat()
+            race_windows.append((window_start.isoformat(), window_end.isoformat()))
+            window_start = window_end + timedelta(days=1)
+        if self.progress is not None:
+            self.progress.advance(total=len(tasks) + len(race_windows))
+
+        def fetch_race(window: tuple[str, str]) -> None:
+            start, end = window
             if self.progress is not None:
                 self.progress.advance(step=start)
             payload, raw_hash = self._capture("race_predictions", lambda start=start, end=end: self.api.get_race_predictions(start, end, "daily"), None, {"from": start, "to": end, "aggregation": "daily"})
@@ -561,10 +780,8 @@ class GarminStagingWorker:
                 for index, item in enumerate(as_items(payload)):
                     item_day = payload_date(item) or start
                     self.writer.source_entity("race_prediction", f"race_prediction:{item_day}:{index}", item, raw_hash, occurred_on=item_day)
-            completed_windows += 1
-            if self.progress is not None:
-                self.progress.advance(completed=completed_windows)
-            window_start = window_end + timedelta(days=1)
+
+        self._map(race_windows, fetch_race, done)
 
     def _activities(self, from_date: date, to_date: date) -> None:
         start, end = from_date.isoformat(), to_date.isoformat()
@@ -577,8 +794,15 @@ class GarminStagingWorker:
         summaries = as_items(payload)
         if self.progress is not None:
             self.progress.advance(total=len(summaries))
-        for index, summary in enumerate(summaries, start=1):
-            self._check_interrupted()
+        completed = 0
+
+        def done() -> None:
+            nonlocal completed
+            completed += 1
+            if self.progress is not None:
+                self.progress.advance(completed=completed)
+
+        def fetch(summary: dict[str, Any]) -> None:
             activity_id = remote_id(summary, "unknown")
             if self.progress is not None:
                 self.progress.advance(step=activity_id)
@@ -587,8 +811,8 @@ class GarminStagingWorker:
             if details_fetched:
                 self._activity_details(activity_id, summary)
             self.writer.activity_sync_state(activity_id, summary_hash, details_fetched)
-            if self.progress is not None:
-                self.progress.advance(completed=index)
+
+        self._map(summaries, fetch, done)
 
     def _multisport_children(self, parent_activity_id: str, activity: dict[str, Any]) -> None:
         if not activity.get("isMultiSportParent"):
@@ -669,27 +893,25 @@ class GarminStagingWorker:
     def _activity_files(self, activity_id: str, summary: dict[str, Any], activity: dict[str, Any] | None, details: dict[str, Any] | None) -> None:
         try:
             from garminconnect import Garmin
-            formats = {
-                "activity_original": Garmin.ActivityDownloadFormat.ORIGINAL,
-                "activity_tcx": Garmin.ActivityDownloadFormat.TCX,
-                "activity_gpx": Garmin.ActivityDownloadFormat.GPX,
-                "activity_kml": Garmin.ActivityDownloadFormat.KML,
-                "activity_csv": Garmin.ActivityDownloadFormat.CSV,
-            }
+            original_format = Garmin.ActivityDownloadFormat.ORIGINAL
         except ImportError as error:
             self.writer.error("activity_files", str(error), activity_id, False)
             return
         original_path: Path | None = None
         original_hash: str | None = None
-        for endpoint, format_value in formats.items():
-            try:
-                contents = self.api.download_activity(activity_id, format_value)
-                digest = self.writer.archive_bytes(endpoint, activity_id, contents, "zip" if endpoint == "activity_original" else endpoint.rsplit("_", 1)[1])
-                if endpoint == "activity_original":
-                    original_path = self.data_dir / "raw" / "garmin" / endpoint / activity_id / f"{digest}.zip"
-                    original_hash = digest
-            except Exception as error:
-                self.writer.error(endpoint, str(error), activity_id)
+        # Only the ORIGINAL archive (.FIT inside a zip) is retained: streams and
+        # swim lengths come from it, and the TCX/GPX/KML/CSV renderings add four
+        # requests per changed activity without feeding any importer path.
+        try:
+            contents = self._request(lambda: self.api.download_activity(activity_id, original_format))
+            original_hash = self.writer.archive_bytes("activity_original", activity_id, contents, "zip")
+            original_path = self.data_dir / "raw" / "garmin" / "activity_original" / activity_id / f"{original_hash}.zip"
+            self._note_capture("activity_original", False)
+        except WorkerInterrupted:
+            raise
+        except Exception as error:
+            self._note_capture("activity_original", True)
+            self.writer.error("activity_original", str(error), activity_id)
         samples = activity_details_to_samples(f"garmin:{activity_id}", details or {})
         if not samples and original_path and original_path.exists():
             samples = fit_archive_to_samples(f"garmin:{activity_id}", original_path)
@@ -725,22 +947,6 @@ class GarminStagingWorker:
                         occurred_on=start_date[:10],
                     )
 
-    def _fetch_garmin_events(self, start_date: str) -> None:
-        """Fetch calendar events from start_date, following pagination."""
-        page = 1
-        while True:
-            payload, raw_hash = self._capture(
-                "garmin_events",
-                lambda page=page: self.api.get_events(start_date, limit=100, page=page),
-                scope={"startDate": start_date, "page": page},
-            )
-            items = payload if isinstance(payload, list) else []
-            if items:
-                self._entity("garmin_events", "event", items, raw_hash)
-            if len(items) < 100:
-                return
-            page += 1
-
     def _collections(self, events_from: str | None = None) -> None:
         today = date.today()
         calls = {
@@ -752,23 +958,30 @@ class GarminStagingWorker:
         if self.progress is not None:
             self.progress.set_stage("collections")
             self.progress.advance(total=len(calls) + len(months) + 1)
-        for index, (endpoint, (method, arguments, entity_type)) in enumerate(calls.items(), start=1):
-            self._check_interrupted()
+        completed = 0
+
+        def done() -> None:
+            nonlocal completed
+            completed += 1
+            if self.progress is not None:
+                self.progress.advance(completed=completed)
+
+        def fetch_call(item: tuple[str, tuple[str, tuple[Any, ...], str]]) -> None:
+            endpoint, (method, arguments, entity_type) = item
             if self.progress is not None:
                 self.progress.advance(step=endpoint)
             payload, raw_hash = self._capture(endpoint, lambda method=method, arguments=arguments: getattr(self.api, method)(*arguments))
             if payload is not None:
                 self._entity(endpoint, entity_type, payload, raw_hash)
-            if self.progress is not None:
-                self.progress.advance(completed=index)
+
+        self._map(list(calls.items()), fetch_call, done)
         # Scheduled workouts span past-to-future months so upcoming sessions
         # surface ahead of time and recently completed ones stay associatable
         # with their finished activities. The calendar service answers each
         # month with a grid wrapper whose items live under `calendarItems`;
         # empty months must stage nothing, and real items stage one row each
         # with their own calendar date.
-        for month_index, month in enumerate(months, start=1):
-            self._check_interrupted()
+        def fetch_month(month: date) -> None:
             payload, raw_hash = self._capture(
                 "scheduled_workouts",
                 lambda month=month: self.api.get_scheduled_workouts(month.year, month.month),
@@ -782,17 +995,18 @@ class GarminStagingWorker:
                 items = [item for item in items if isinstance(item, Mapping) and item.get("itemType") == "workout"]
             if items:
                 self._entity("scheduled_workouts", "scheduled_workout", items, raw_hash)
-            if self.progress is not None:
-                self.progress.advance(completed=len(calls) + month_index)
+
+        self._map(months, fetch_month, done)
         # Joined events (races etc.) look back only far enough to associate
         # finished activities; the parent widens start_date into a one-time
         # coverage backfill when the store predates this span.
-        self._check_interrupted()
         if self.progress is not None:
             self.progress.advance(step="garmin_events")
-        self._fetch_garmin_events(events_start)
-        if self.progress is not None:
-            self.progress.advance(completed=len(calls) + len(months) + 1)
+
+        def fetch_events(_: str) -> None:
+            self._fetch_garmin_events(events_start)
+
+        self._map([events_start], fetch_events, done)
 
     def stage_course(self, course_id: str) -> None:
         """Fetch one Garmin course by id and stage it as a source entity.

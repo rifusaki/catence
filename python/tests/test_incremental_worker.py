@@ -1,7 +1,9 @@
 import hashlib
 import json
+import threading
 from datetime import date
 
+from python.catence.providers.garmin import worker as worker_module
 from python.catence.providers.garmin.worker import GarminStagingWorker, shift_month
 
 
@@ -344,3 +346,84 @@ def test_event_course_auto_discovery_skips_already_archived_courses(tmp_path):
     worker._fetch_garmin_events("2026-08-01")
 
     assert api.course_calls == []
+
+
+def test_daily_stage_parallelizes_captures_and_stages_each_entity(tmp_path):
+    class ParallelApi:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.lock = threading.Lock()
+
+        def __getattr__(self, name: str):
+            def call(day: str):
+                with self.lock:
+                    self.calls.append((name, day))
+                return {"value": day}
+
+            return call
+
+    writer = Writer()
+    api = ParallelApi()
+    worker = GarminStagingWorker(api, writer, tmp_path, concurrency=4)
+
+    worker._daily(date(2026, 9, 1), date(2026, 9, 2))
+
+    assert len(api.calls) == 46
+    assert len(writer.entities) == 46
+    assert {day for _, day in api.calls} == {"2026-09-01", "2026-09-02"}
+    summary = worker.capture_summary()
+    assert summary["captures"]["sleep"] == 2
+    assert summary["captureErrors"] == {}
+
+
+def test_rate_limit_backoff_retries_the_same_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(worker_module, "RATE_LIMIT_BACKOFF_SECONDS", (0.01, 0.02))
+
+    class GarminConnectTooManyRequestsError(Exception):
+        pass
+
+    class FlakyApi:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def get_stats(self, _day: str):
+            self.attempts += 1
+            if self.attempts < 3:
+                raise GarminConnectTooManyRequestsError("rate limited")
+            return {"ok": True}
+
+    writer = Writer()
+    api = FlakyApi()
+    worker = GarminStagingWorker(api, writer, tmp_path)
+
+    payload, _ = worker._capture("stats", lambda: api.get_stats("2026-09-01"))
+
+    assert payload == {"ok": True}
+    assert api.attempts == 3
+    assert worker.capture_summary()["captures"]["stats"] == 1
+
+
+def test_exhausted_rate_limit_retries_become_extraction_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(worker_module, "RATE_LIMIT_BACKOFF_SECONDS", (0.01,))
+
+    class GarminConnectTooManyRequestsError(Exception):
+        pass
+
+    class LimitedApi:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def get_stats(self, _day: str):
+            self.attempts += 1
+            raise GarminConnectTooManyRequestsError("rate limited")
+
+    writer = Writer()
+    api = LimitedApi()
+    worker = GarminStagingWorker(api, writer, tmp_path)
+
+    payload, raw_hash = worker._capture("stats", lambda: api.get_stats("2026-09-01"))
+
+    assert payload is None
+    assert raw_hash is None
+    assert api.attempts == 2  # original attempt plus one retry
+    assert worker.capture_summary()["captureErrors"]["stats"] == 1
