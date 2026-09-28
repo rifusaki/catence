@@ -2,7 +2,8 @@
 
 Catence Console is a password-protected local web chat that starts a matching
 Catence runtime on loopback. It uses Chainlit password login and fails closed
-unless all three authentication variables are supplied.
+unless `CHAINLIT_AUTH_SECRET` and at least one login source — a stored Console
+account or the environment account pair — are configured.
 
 This guide covers the **local** path: the npm package plus the Python Console
 on your machine. The Docker path (one container built from the public
@@ -27,6 +28,7 @@ model.
 | Provider credentials | per-athlete secret file, mode 0600 | `catence-data secret set` |
 | API keys | process environment only | shell exports |
 | Chat history + preferences | data home | `console/chat-history.sqlite3` |
+| Console logins + athlete grants | data home (mode 0600, bcrypt hashes) | `console/accounts.json` |
 
 Credentials never land in `config.json`; profiles reference environment
 variable *names* (`apiKeyEnv`, `apiBaseEnv`, `apiVersionEnv`). See
@@ -95,15 +97,28 @@ To add OpenCode Go models, run the
 
 ```sh
 export OPENAI_API_KEY='…'                        # or ANTHROPIC_API_KEY / OPENCODE_GO_API_KEY …
-export CATENCE_CONSOLE_USERNAME='coach'
-export CATENCE_CONSOLE_PASSWORD_HASH="$(catence-console auth hash-password)"
 export CHAINLIT_AUTH_SECRET="$(openssl rand -hex 32)"
 ```
 
-The Console fails closed unless `CATENCE_CONSOLE_USERNAME`,
-`CATENCE_CONSOLE_PASSWORD_HASH` (a bcrypt hash), and `CHAINLIT_AUTH_SECRET`
-are all set. There is one shared account; the username/password pair grants a
-single `console-owner` role.
+`CHAINLIT_AUTH_SECRET` is always required: it signs Chainlit sessions. On top
+of it, the Console needs at least one login source:
+
+- **Stored accounts** (the multi-user path). Each account carries a role and
+  an athlete grant list and lives in `<home>/console/accounts.json`. Create
+  the first one with the users CLI, which prompts for the password twice:
+
+  ```sh
+  catence-console users add coach --admin
+  ```
+
+- **The environment break-glass account**: set both
+  `CATENCE_CONSOLE_USERNAME` and `CATENCE_CONSOLE_PASSWORD_HASH` (the bcrypt
+  hash printed by `catence-console auth hash-password`). The pair is never
+  persisted and always acts as an admin — the way back in when the accounts
+  file is lost.
+
+Roles, grants, and the rest of the CLI are described under
+[Console accounts](#console-accounts).
 
 ## 7. Start the Console
 
@@ -143,6 +158,68 @@ origin, shows live progress while the run is active, and displays the last
 completed sync afterwards. Each manual sync also refreshes OpenCode Go model
 profiles first; a discovery failure never blocks the data sync.
 
+## Console accounts
+
+Console accounts are Catence's multi-user login model, enforced entirely by
+the Console: sign-in, the athlete roster, dashboard and athlete-file requests,
+and the athlete scoping of every chat turn are all checked server-side against
+the account's role and athlete grants. The MCP server itself is untouched — it
+has no authentication and trusts the `athleteId` each call names (see
+[local-mcp.md](local-mcp.md#streamable-http-server)); accounts only gate what
+goes through the Console.
+
+| Role | Athlete access |
+| --- | --- |
+| `admin` | Every athlete in the catalog (`athletes: "all"`) |
+| `member` | Only the explicitly granted athletes; zero grants allowed |
+
+Accounts live in `<home>/console/accounts.json` (mode 0600, bcrypt hashes
+only), where `<home>` is `$CATENCE_HOME` or `~/.catence`. The Console re-reads
+the file on every login, so new accounts, password resets, and grant changes
+apply without a restart.
+
+### Manage accounts with the users CLI
+
+```sh
+catence-console users add coach --admin                    # admin: all athletes
+catence-console users add martina --athlete martina        # member with one grant
+catence-console users add sam                              # member, zero grants
+catence-console users list
+catence-console users passwd martina
+catence-console users set-role sam member
+catence-console users grant sam martina
+catence-console users revoke sam martina
+catence-console users remove sam
+```
+
+- `add <username> (--admin | --athlete <id> [--athlete <id> …])` — members
+  default to zero grants; `--admin` cannot be combined with `--athlete` and
+  always stores access to every athlete.
+- `add` and `passwd` prompt for the password twice (never echoed). For
+  automation, `--password-env VAR` reads the password from environment
+  variable `VAR` instead, so it never appears in the command line or shell
+  history.
+- `grant`/`revoke` change a member's athlete list; revoking the last grant
+  leaves a zero-grant member. `set-role` promotes or demotes: promoting to
+  `admin` coerces the grants to `"all"`, demoting to `member` keeps them.
+- `add`/`grant`/`revoke` validate athlete ids against `catalog.json` when it
+  exists, and `--home <dir>` points any subcommand at a non-default catalog.
+
+A member with zero grants can sign in and browse the Console, but there is no
+athlete to scope a chat to: the Athlete selector is disabled with *"You don't
+have access to any athlete yet. Ask an administrator to grant you access."*
+and every chat turn is answered with the same notice. A member that requests
+an athlete outside their grants receives `403 athlete_forbidden`; the Console
+never forwards the request to the runtime.
+
+### The environment break-glass account
+
+`CATENCE_CONSOLE_USERNAME` and `CATENCE_CONSOLE_PASSWORD_HASH` must be set
+together. When they are, the pair always acts as an `admin` and is never
+written to `accounts.json`: unsetting the two variables revokes it. Use it as
+the recovery path when the accounts file is lost or a lockout leaves nobody
+who can grant access — not as the everyday login.
+
 ## Console serve options
 
 `catence-console serve` accepts:
@@ -167,12 +244,18 @@ chat starts.
 
 ## How multi-athlete works in the Console
 
-The Console shares the same per-athlete stores as MCP, but scoping is
-**server-owned, not model-owned**:
+The Console shares the same per-athlete stores as MCP. Access is layered:
+per-account grants at the login, then server-owned scoping per chat.
 
+- **Per-account grants.** Each stored account is an `admin` (every athlete) or
+  a `member` with an explicit grant list (see
+  [Console accounts](#console-accounts)). The **Athlete** selector and the
+  proxied roster are narrowed to the account's grants; requests that name an
+  ungranted athlete are refused with `403 athlete_forbidden` before they reach
+  the runtime, and a zero-grant member sees no athletes at all.
 - The settings panel has an **Athlete** selector built from
   `GET /api/v1/athletes` on the runtime. The default is the catalog's
-  `defaultAthleteId`.
+  `defaultAthleteId` (for a member, the first granted athlete).
 - On every personal-data tool call, the Console **forces** the selected
   athleteId onto the arguments — the model cannot name or switch athletes, and
   a chat's system message states: *"This Console chat is scoped to athleteId X.
@@ -261,3 +344,7 @@ uv tool install --upgrade catence-console
 - **Runtime not reachable** — `catence-console doctor --home "$HOME/.catence"
   --mcp-url http://127.0.0.1:8787/mcp` checks the handshake; confirm the
   runtime is running on that port and the protocol versions agree.
+- **Locked out of the Console** — sign in with the environment break-glass
+  account (`CATENCE_CONSOLE_USERNAME`/`CATENCE_CONSOLE_PASSWORD_HASH`) and
+  restore access with `catence-console users` (reset a password, re-grant
+  athletes, or add a new admin).

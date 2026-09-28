@@ -21,10 +21,11 @@
 #
 # The script writes the complete scaffold (Dockerfile, docker-compose.yml, and a
 # .env with placeholders), seeds a starter Console configuration into the data
-# volume, and builds the image without needing any secrets. Add the Console
-# password hash and one model-provider key to .env afterwards, then run
-# `docker compose up -d` or re-run this script. Pass --generate-secrets to be
-# prompted for the password and have the hash written for you.
+# volume, and builds the image without needing any secrets. Configure a Console
+# login afterwards: either the environment account pair in .env (username plus
+# a bcrypt hash; see --generate-secrets and hash-password.sh) or stored Console
+# accounts created with the generated users.sh helper. Then add one
+# model-provider key and run `docker compose up -d` or re-run this script.
 
 set -euo pipefail
 
@@ -176,6 +177,10 @@ if [ -f "$DEPLOY_DIR/.env" ]; then
   [ -n "${MCP_BIND:-}" ]            || MCP_BIND="$(dotenv_get CATENCE_MCP_BIND "$DEPLOY_DIR/.env")"
 fi
 
+# The environment break-glass account is a pair: remember the username as
+# supplied (before the `coach` default) so the login gate below can tell
+# "no environment pair configured" apart from a half-configured pair.
+PROVIDED_USERNAME="$USERNAME"
 USERNAME="${USERNAME:-coach}"
 
 # ---------------------------------------------------------------------------
@@ -394,10 +399,17 @@ EOF
 
 write_env() {
   umask 077
+  # A username without a password hash is a broken environment pair, so write
+  # a username only when a hash accompanies it; an empty pair leaves the login
+  # to stored Console accounts.
+  local env_username="$PROVIDED_USERNAME"
+  if [ -n "$PASSWORD_HASH" ]; then
+    env_username="$USERNAME"
+  fi
   cat > "$DEPLOY_DIR/.env" <<EOF
 # Catence Console deployment environment (managed by deploy-console.sh)
 # Versions are always resolved fresh from npm/PyPI; not pinned here.
-CATENCE_CONSOLE_USERNAME=${USERNAME}
+CATENCE_CONSOLE_USERNAME=${env_username}
 CATENCE_CONSOLE_PASSWORD_HASH=${PASSWORD_HASH}
 CHAINLIT_AUTH_SECRET=${AUTH_SECRET}
 CATENCE_MCP_BIND=${MCP_BIND}
@@ -545,12 +557,27 @@ EOF
   chmod +x "$DEPLOY_DIR/sync.sh"
 }
 
+write_users_helper() {
+  cat > "$DEPLOY_DIR/users.sh" <<'EOF'
+#!/bin/sh
+# Manage Console logins and per-account athlete access in the running container
+# (add | list | remove | passwd | set-role | grant | revoke). Passwords are
+# prompted for on the terminal; the accounts store lives on the data volume.
+set -eu
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" exec console \
+  /opt/catence-console/bin/catence-console users "$@"
+EOF
+  chmod +x "$DEPLOY_DIR/users.sh"
+}
+
 write_dockerfile
 write_compose
 write_env
 write_hash_helper
 write_doctor_helper
 write_sync_helper
+write_users_helper
 
 # ---------------------------------------------------------------------------
 # Dry run stops after writing the scaffold
@@ -606,23 +633,52 @@ if [ -z "$PASSWORD_HASH" ] && [ "$GENERATE_SECRETS" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Start only once the required login variables are all present
+# Start only once the Console can authenticate someone: CHAINLIT_AUTH_SECRET
+# is always required, then either the environment break-glass pair must be
+# complete or the data volume must already hold a stored accounts file.
 # ---------------------------------------------------------------------------
-missing=""
-[ -n "$USERNAME" ]      || missing="$missing CATENCE_CONSOLE_USERNAME"
-[ -n "$PASSWORD_HASH" ] || missing="$missing CATENCE_CONSOLE_PASSWORD_HASH"
-[ -n "$AUTH_SECRET" ]   || missing="$missing CHAINLIT_AUTH_SECRET"
+if [ -z "$AUTH_SECRET" ]; then
+  die "CHAINLIT_AUTH_SECRET is required; set it in $DEPLOY_DIR/.env and re-run this script."
+fi
 
-if [ -n "$missing" ]; then
+if [ -n "$PROVIDED_USERNAME" ] && [ -z "$PASSWORD_HASH" ]; then
+  die "CATENCE_CONSOLE_USERNAME is set without CATENCE_CONSOLE_PASSWORD_HASH. Set both for the environment break-glass account (generate the hash with $DEPLOY_DIR/hash-password.sh), or clear both and create a stored account with '$DEPLOY_DIR/users.sh add <username>'."
+fi
+
+# Does the data volume already hold a stored Console accounts file? A bind
+# mount maps to a host path; a named volume is probed through a throwaway
+# container, so re-runs work the same way.
+console_accounts_exist() {
+  if [ -n "$DATA_HOME" ]; then
+    if [ -f "$DATA_HOME/console/accounts.json" ]; then
+      return 0
+    fi
+    return 1
+  fi
+  if $COMPOSE -f "$DEPLOY_DIR/docker-compose.yml" --env-file "$DEPLOY_DIR/.env" run --rm \
+    --entrypoint sh console -c 'test -f /data/console/accounts.json' >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+if [ -z "$PASSWORD_HASH" ] && ! console_accounts_exist; then
   info ""
   info "Scaffolding is ready in $DEPLOY_DIR/ (project $PROJECT, image $IMAGE_NAME)."
-  info "Fill in the missing values in $DEPLOY_DIR/.env:$missing"
-  info "and a model-provider key (OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENCODE_GO_API_KEY), then start it."
+  info "The Console needs a login before it can start. Set up either one:"
   info ""
-  info "Generate the bcrypt hash for CATENCE_CONSOLE_PASSWORD_HASH with:"
-  info "  $DEPLOY_DIR/hash-password.sh"
-  info "  (or re-run this script with --generate-secrets to fill it interactively)"
-  info "  fallback: docker run --rm -it --entrypoint /opt/catence-console/bin/catence-console $IMAGE_NAME auth hash-password"
+  info "  1. Environment break-glass account (both values in $DEPLOY_DIR/.env):"
+  info "       CATENCE_CONSOLE_USERNAME=coach      # or any login name"
+  info "       CATENCE_CONSOLE_PASSWORD_HASH=...   # generate it with $DEPLOY_DIR/hash-password.sh"
+  info "     (or re-run this script with --generate-secrets to fill it interactively)"
+  info "     fallback: docker run --rm -it --entrypoint /opt/catence-console/bin/catence-console $IMAGE_NAME auth hash-password"
+  info ""
+  info "  2. Stored Console account (create the first one now; prompts for a password):"
+  info "       $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env run --rm \\"
+  info "         --entrypoint /opt/catence-console/bin/catence-console console users add coach --admin"
+  info "     (later accounts: $DEPLOY_DIR/users.sh add <username> [--admin|--athlete <id> ...])"
+  info ""
+  info "Also set a model-provider key (OPENAI_API_KEY, ANTHROPIC_API_KEY, or OPENCODE_GO_API_KEY) in .env."
   info ""
   info "Then start the stack:"
   info "  $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env up -d"
@@ -642,7 +698,11 @@ info "  version:  npm $NPM_VERSION / console $CONSOLE_VERSION"
 info "  image:    $IMAGE_NAME"
 info "  project:  $PROJECT"
 info "  data:     $([ -n "$DATA_HOME" ] && printf '%s' "$DATA_HOME" || printf 'named volume %s' "$DATA_VOLUME")"
-info "  console:  http://${BIND}:${PORT}  (login: $USERNAME)"
+if [ -n "$PASSWORD_HASH" ]; then
+  info "  console:  http://${BIND}:${PORT}  (login: $USERNAME)"
+else
+  info "  console:  http://${BIND}:${PORT}  (stored Console accounts; list them with $DEPLOY_DIR/users.sh)"
+fi
 if [ "${MCP_BIND}" != "127.0.0.1" ]; then
   info "  mcp:      http://${MCP_BIND}:${MCP_PORT}/mcp  (exposed on ${MCP_BIND})"
 else
@@ -666,6 +726,10 @@ info "    (or, with --home, edit <home>/config.json on the host; model keys stay
   info "    $DEPLOY_DIR/sync.sh --athlete alex progress --watch"
   info "    $DEPLOY_DIR/sync.sh --athlete alex status"
   info "    $DEPLOY_DIR/sync.sh athletes"
+info "  Manage Console logins and athlete access:"
+info "    $DEPLOY_DIR/users.sh list"
+info "    $DEPLOY_DIR/users.sh add martina --athlete martina   (prompts for a password)"
+info "    $DEPLOY_DIR/users.sh add coach --admin"
 info "  Discover OpenCode Go models into the config:"
 info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env run --rm --entrypoint node console /usr/local/lib/node_modules/catence/scripts/discover-opencode-go.mjs --write /data/config.json"
 info "  Check status / logs:"

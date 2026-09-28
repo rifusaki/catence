@@ -81,14 +81,17 @@ catence
 ```
 
 An agent first calls `list_athletes`, then includes `athleteId` with every
-data tool. This is intentional: a shared agent may access the stores you
-configured, but no tool implicitly aggregates or crosses between athletes.
+data tool. Tools act only on the named athlete store and never merge athletes
+implicitly; the MCP server does not authenticate callers — it trusts the
+`athleteId` each call names.
 
 ## Multi-athlete catalog
 
-Catence is designed to serve **several isolated athlete stores** from one
-shared server. Each store has its own DuckDB, raw data, and tokens, so
-athletes never leak into each other.
+Catence serves several athlete stores from one server. Each store has its own
+DuckDB, raw data, and tokens; a call acts on the single store it names and
+never merges athletes implicitly. That is a tool contract, not an access
+boundary: the MCP server does not authenticate callers and trusts the
+`athleteId` they pass — see [MCP clients and HTTP](#streamable-http-server).
 
 ### MCP behavior
 

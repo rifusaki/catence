@@ -26,6 +26,7 @@ explained in the [beta release notes](../../README.md#beta-releases).
 | Provider credentials | per-athlete secret file, mode 0600 | `catence-data secret set` |
 | API keys | process environment only | `.env` |
 | Chat history + preferences | data home | `console/chat-history.sqlite3` |
+| Console logins + athlete grants | data home (mode 0600, bcrypt hashes) | `console/accounts.json` |
 
 Credentials never land in `config.json`; profiles reference environment
 variable *names* (`apiKeyEnv`, `apiBaseEnv`, `apiVersionEnv`). See
@@ -69,10 +70,16 @@ Script options (run `./deploy-console.sh --help` for the full list):
 
 ## 2. Fill in `catence-deploy/.env`
 
+The Console always needs `CHAINLIT_AUTH_SECRET`, plus at least one login
+source: the **environment break-glass account**
+(`CATENCE_CONSOLE_USERNAME` + `CATENCE_CONSOLE_PASSWORD_HASH`, set together or
+not at all) or a **stored Console account** in the data volume (see
+[Console accounts](#console-accounts)). Add one model-provider key either way.
+
 ```sh
-CATENCE_CONSOLE_USERNAME=coach
-CATENCE_CONSOLE_PASSWORD_HASH='…'      # generate: ./catence-deploy/hash-password.sh
 CHAINLIT_AUTH_SECRET='…'               # generate: openssl rand -hex 32
+CATENCE_CONSOLE_USERNAME=coach         # environment break-glass account …
+CATENCE_CONSOLE_PASSWORD_HASH='…'      # generate: ./catence-deploy/hash-password.sh
 OPENAI_API_KEY='…'                     # or ANTHROPIC_API_KEY / OPENCODE_GO_API_KEY …
 OPENAI_API_BASE=''                     # only for OpenAI-compatible endpoints
 OPENCODE_GO_API_KEY='…'                # the OpenCode Go base URLs are pre-filled below
@@ -80,9 +87,14 @@ OPENCODE_GO_API_BASE='https://opencode.ai/zen/go/v1'
 OPENCODE_GO_MESSAGES_API_BASE='https://opencode.ai/zen/go'
 ```
 
-Generate the Console login hash with the scaffold helper (it prompts on the
-terminal, never echoes, and uses the compose project so it works whatever image
-tag the script built):
+Leave the username/hash pair empty to log in with stored accounts instead: the
+script accepts an existing `console/accounts.json` in the data volume and
+starts without the pair. Set both or neither — a lone username without a hash
+fails the deploy with a clear error.
+
+Generate the hash for the environment pair with the scaffold helper (it
+prompts on the terminal, never echoes, and uses the compose project so it works
+whatever image tag the script built):
 
 ```sh
 ./catence-deploy/hash-password.sh
@@ -101,6 +113,66 @@ Then start the stack (or re-run the script, which re-reads the saved `.env`):
 ```sh
 docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env up -d
 ```
+
+### Console accounts
+
+Stored accounts are the multi-user path: each account has a role and an
+athlete grant list, and the Console enforces both server-side on logins,
+roster/dashboard requests, and agent turns. Accounts live in
+`console/accounts.json` in the data volume (mode 0600, bcrypt hashes only).
+
+Manage them with the `users` command inside the container — via the generated
+helper:
+
+```sh
+./catence-deploy/users.sh add martina --athlete martina   # member: one granted athlete
+./catence-deploy/users.sh add coach --admin               # admin: every athlete
+./catence-deploy/users.sh list
+./catence-deploy/users.sh grant martina sam
+./catence-deploy/users.sh revoke martina sam
+./catence-deploy/users.sh passwd martina
+./catence-deploy/users.sh set-role martina admin
+./catence-deploy/users.sh remove martina
+```
+
+`users.sh` uses `docker compose exec`, so the stack must be running. The long
+forms are:
+
+```sh
+# Interactive: prompts for the password twice
+docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env exec console \
+  /opt/catence-console/bin/catence-console users add martina --athlete martina
+
+# Non-interactive: read the password from an environment variable
+docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env run --rm -T \
+  -e CATENCE_CONSOLE_NEW_PASSWORD='…' \
+  --entrypoint /opt/catence-console/bin/catence-console console \
+  users add martina --athlete martina --password-env CATENCE_CONSOLE_NEW_PASSWORD
+```
+
+Before the first start there is no running container **and** no login yet —
+the Console refuses to start without one — so create the first account with
+the one-off form (it prompts for the password):
+
+```sh
+docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env run --rm \
+  --entrypoint /opt/catence-console/bin/catence-console console users add coach --admin
+```
+
+Roles: `admin` sees every athlete; `member` sees only explicitly granted
+athletes. A member with zero grants can sign in and browse, but has no athlete
+to scope a chat to. The environment pair is a never-persisted break-glass
+admin: it keeps working when the accounts file is lost or the last admin is
+locked out, and unsetting the two variables revokes it.
+
+Accounts gate the Console only. The MCP server keeps its own contract — no
+authentication, the caller's `athleteId` is trusted — so port 8787 still needs
+loopback or network-layer restriction (see
+[Connecting to the Docker-based MCP from outside](#connecting-to-the-docker-based-mcp-from-outside)).
+
+The accounts file is the only copy of your stored logins: keep it in backups
+of the data volume (or bind-mounted home), along with `config.json` and the
+athlete stores.
 
 ## 3. Initialize an athlete store
 
@@ -184,8 +256,9 @@ export OPENCODE_GO_API_KEY='…'                      # any non-empty value pass
 ## 7. Access the Console
 
 Open `http://127.0.0.1:8000` (or the `--bind:--port` you configured) and log in
-with `CATENCE_CONSOLE_USERNAME` and the password whose hash is in
-`CATENCE_CONSOLE_PASSWORD_HASH`.
+with a stored Console account (see [Console accounts](#console-accounts)) or
+with the environment break-glass pair (`CATENCE_CONSOLE_USERNAME` and the
+password whose hash is in `CATENCE_CONSOLE_PASSWORD_HASH`).
 
 ## 8. Verify with doctor
 
@@ -472,11 +545,17 @@ docker run --rm -it -v catence-data:/data --entrypoint catence-data catence-cons
 
 Use the same `--entrypoint catence-data` pattern for `secret set` and `sync`.
 
+Console logins work the same way: keep the environment pair together (or
+neither variable), or seed a stored account into the volume with the `users`
+command (see [Console accounts](#console-accounts)).
+
 ## Updating
 
 Docker deployments: re-run `deploy-console.sh beta` (or `stable`); it
 re-resolves the newest versions from the registries and rebuilds. The data
-volume and your `config.json` are preserved.
+volume is preserved, so your `config.json`, the stored Console accounts
+(`console/accounts.json`), chat history, and the athlete stores all survive
+the rebuild.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/rifusaki/catence/beta/scripts/deploy-console.sh | bash -s beta

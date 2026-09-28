@@ -12,7 +12,7 @@ As a context, I'm both an endurance athlete and a data junkie. I already got a c
 
 - Garmin, Intervals.icu, and Strava ingestion with source-aware normalization.
 - Read-only MCP tools, plus explicitly named, lock-guarded write tools for Strava hydration and detached syncs.
-- One shared Catence agent can serve several isolated athlete stores. Every personal-data MCP call names an `athleteId`; Catence never silently combines athletes.
+- One Catence MCP server serves several athlete stores side by side. Every personal-data MCP call names an `athleteId`; tools act only on that store and never merge athletes implicitly. The MCP server does not authenticate callers — it trusts the `athleteId` each call names.
 - A password-protected Chainlit Console with an authenticated dashboard, a data-sync button with live progress, and in-app model management.
 - A generated demo catalog for safe evaluation in Glama, desktop MCP clients, or local development.
 
@@ -57,7 +57,7 @@ Start the stdio MCP server:
 catence
 ```
 
-An agent first calls `list_athletes`, then includes `athleteId` with every data tool. This is intentional: a shared agent may access the stores you configured, but no tool implicitly aggregates or crosses between athletes.
+An agent first calls `list_athletes`, then includes `athleteId` with every data tool. Tools act only on the named athlete store and never merge athletes implicitly. The MCP server does not authenticate callers — it trusts the `athleteId` each call names — so keep it on loopback or restrict it at the network layer (see [MCP clients and HTTP](#mcp-clients-and-http)).
 
 ### Add another athlete
 
