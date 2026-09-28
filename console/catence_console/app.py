@@ -8,8 +8,10 @@ import asyncio
 import json
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
+from urllib.parse import parse_qsl, urlencode
 
 import chainlit as cl
 from chainlit.auth.cookie import get_token_from_cookies
@@ -20,6 +22,20 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
 from catence_console import auth as _auth  # Registers Chainlit's password callback.
+from catence_console.accounts import (
+    ALL_ATHLETES,
+    AccountExistsError,
+    AccountNotFoundError,
+    AccountValidationError,
+    AccountsStoreError,
+    ConsoleAccount,
+    account_can_access,
+    add_account,
+    env_account,
+    load_accounts,
+    remove_account,
+    update_account,
+)
 from catence_console.agent import describe_model_failure, respond
 from catence_console.config import (
     DEFAULT_TOOL_RESULT_CHARACTER_LIMIT,
@@ -61,6 +77,8 @@ def _mcp_http_url(path: str) -> str:
 
 NOTICE_METADATA = {"catenceNotice": True}
 
+NO_ATHLETE_ACCESS_NOTICE = "You don't have access to any athlete yet. Ask an administrator to grant you access."
+
 
 def _notice(content: str) -> cl.Message:
     """A Console-generated message that must never enter the model prompt."""
@@ -89,25 +107,126 @@ def _model_history() -> list[dict[str, Any]]:
     return messages
 
 
-def _authenticated(request: Request) -> bool:
+def resolve_account(identifier: str) -> ConsoleAccount | None:
+    """The Console account behind a session identifier, if any.
+
+    Stored accounts win, then the environment break-glass admin, then the
+    ``CHAINLIT_LOCAL_USER`` development identity (an implicit admin so local
+    development needs no accounts.json). ``None`` means the identifier belongs
+    to no account, and the request must not be trusted.
+    """
+
+    try:
+        stored = load_accounts(_auth.accounts_path())
+    except AccountsStoreError as error:
+        # Mirror login: an unusable store disables store logins only.
+        logger.warning("Ignoring unusable Console accounts store: %s", error)
+        stored = []
+    account = next((account for account in stored if account.username == identifier), None)
+    if account is not None:
+        return account
+    break_glass = env_account()
+    if break_glass is not None and break_glass.username == identifier:
+        return break_glass
+    if identifier and identifier == os.environ.get("CHAINLIT_LOCAL_USER"):
+        return ConsoleAccount(
+            username=identifier,
+            password_hash="",  # The development identity never verifies a password.
+            role="admin",
+            athletes=ALL_ATHLETES,
+            created_at=datetime.now(UTC).isoformat(),
+        )
+    return None
+
+
+def _request_identity(request: Request) -> ConsoleAccount | None:
+    """The account behind the request's session cookie, or None when it does not resolve."""
+
     token = get_token_from_cookies(request.cookies)
     if not token:
-        return False
+        return None
     try:
-        decode_jwt(token)
+        user = decode_jwt(token)
     except Exception:
-        return False
-    return True
+        return None
+    identifier = getattr(user, "identifier", None)
+    if not isinstance(identifier, str) or not identifier:
+        return None
+    return resolve_account(identifier)
 
 
-async def _proxy_mcp_get(request: Request, path: str) -> Response:
+def _authenticated(request: Request) -> bool:
+    return _request_identity(request) is not None
+
+
+def account_sees_all_athletes(account: ConsoleAccount | None) -> bool:
+    """True when the account is not narrowed to an athlete grant list."""
+
+    return account is None or account.role == "admin" or account.athletes == ALL_ATHLETES
+
+
+def athlete_scope(account: ConsoleAccount, requested: str | None) -> tuple[bool, str | None]:
+    """Resolve an athlete-scoped request against the account's grants.
+
+    Returns ``(allowed, athlete_id)``. Admins and members holding ``"all"``
+    pass through unchanged, so the id repeats the request (None lets the
+    runtime apply its own default). A member may only name a granted athlete;
+    an unnamed request falls back to the first grant, and a member holding no
+    grants is refused.
+    """
+
+    if account_sees_all_athletes(account):
+        return True, requested
+    if requested is not None:
+        return (True, requested) if account_can_access(account, requested) else (False, None)
+    granted = account.athletes if isinstance(account.athletes, list) else []
+    if not granted:
+        return False, None
+    return True, granted[0]
+
+
+def filter_roster(payload: dict[str, Any], account: ConsoleAccount | None) -> dict[str, Any]:
+    """Narrow a parsed runtime athlete roster to the account's grants.
+
+    Admins and accounts without a grant list see the payload unchanged. A
+    member only sees granted athletes, the default moves to the first grant,
+    and a member holding no grants gets an empty roster with a blank default.
+    """
+
+    if account_sees_all_athletes(account):
+        return payload
+    granted = account.athletes if isinstance(account.athletes, list) else []
+    athletes = [
+        athlete
+        for athlete in payload.get("athletes", [])
+        if isinstance(athlete, dict) and isinstance(athlete.get("id"), str) and athlete["id"] in granted
+    ]
+    visible_ids = [athlete["id"] for athlete in athletes]
+    default_athlete_id = payload.get("defaultAthleteId")
+    if default_athlete_id not in visible_ids:
+        default_athlete_id = visible_ids[0] if visible_ids else ""
+    return {**payload, "defaultAthleteId": default_athlete_id, "athletes": athletes}
+
+
+def can_run_agent_turn(athlete_id: str | None) -> bool:
+    """True when a Console chat is scoped to an athlete and may call the model.
+
+    A member with no athlete grant can sign in and browse, but an agent turn
+    would have no athlete to scope its Catence tool calls to.
+    """
+
+    return isinstance(athlete_id, str) and bool(athlete_id)
+
+
+async def _proxy_mcp_get(request: Request, path: str, query: str | None = None) -> Response:
     """Expose dashboard data only through Chainlit's authenticated origin."""
 
     if not _authenticated(request):
         return JSONResponse({"error": {"code": "unauthorized", "message": "Console login is required."}}, status_code=401)
     target = _mcp_http_url(path)
-    if request.url.query:
-        target = f"{target}?{request.url.query}"
+    effective_query = request.url.query if query is None else query
+    if effective_query:
+        target = f"{target}?{effective_query}"
 
     def fetch() -> tuple[int, bytes, str]:
         try:
@@ -123,15 +242,96 @@ async def _proxy_mcp_get(request: Request, path: str) -> Response:
 
 
 async def dashboard_proxy(request: Request) -> Response:
-    return await _proxy_mcp_get(request, "/api/v1/dashboard")
+    return await _athlete_scoped_get(request, "/api/v1/dashboard")
 
 
 async def athletes_proxy(request: Request) -> Response:
-    return await _proxy_mcp_get(request, "/api/v1/athletes")
+    """Expose the athlete roster narrowed to the session account's grants."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    response = await _proxy_mcp_get(request, "/api/v1/athletes")
+    if account_sees_all_athletes(account) or response.status_code != 200:
+        return response
+    payload = _parsed_json_object(response.body)
+    if not _valid_roster(payload):
+        return JSONResponse(
+            {"error": {"code": "invalid_roster", "message": "Catence returned an invalid athlete roster."}},
+            status_code=502,
+        )
+    return JSONResponse(filter_roster(payload, account))
 
 
 async def health_proxy(request: Request) -> Response:
     return await _proxy_mcp_get(request, "/api/v1/health")
+
+async def athlete_file_proxy(request: Request) -> Response:
+    """Read or write the athlete file through the runtime's hash-guarded route."""
+
+    if request.method == "PUT":
+        return await _athlete_scoped_put(request, "/api/v1/athlete-file")
+    return await _athlete_scoped_get(request, "/api/v1/athlete-file")
+
+
+def _parsed_json_object(body: bytes) -> dict[str, Any] | None:
+    """Decode a JSON-object response body, or None when it is not one."""
+
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _requested_athlete(request: Request) -> str | None:
+    """The athleteId a request names, treating a blank value as absent."""
+
+    athlete_id = request.query_params.get("athleteId")
+    return athlete_id or None
+
+
+def _query_with_athlete(request: Request, athlete_id: str) -> str:
+    """The request query with athleteId forced to one granted athlete."""
+
+    pairs = [
+        (key, value)
+        for key, value in parse_qsl(request.url.query, keep_blank_values=True)
+        if key != "athleteId"
+    ]
+    pairs.append(("athleteId", athlete_id))
+    return urlencode(pairs)
+
+
+async def _athlete_scoped_get(request: Request, path: str) -> Response:
+    """Proxy a GET route after enforcing the session account's athlete grant."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    requested = _requested_athlete(request)
+    allowed, athlete_id = athlete_scope(account, requested)
+    if not allowed:
+        return _athlete_forbidden()
+    if athlete_id is not None and athlete_id != requested:
+        return await _proxy_mcp_get(request, path, query=_query_with_athlete(request, athlete_id))
+    return await _proxy_mcp_get(request, path)
+
+
+async def _athlete_scoped_put(request: Request, path: str) -> Response:
+    """Proxy a PUT route after enforcing the session account's athlete grant."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    requested = _requested_athlete(request)
+    allowed, athlete_id = athlete_scope(account, requested)
+    if not allowed:
+        return _athlete_forbidden()
+    if athlete_id is not None and athlete_id != requested:
+        return await _proxy_mcp_put(request, path, query=_query_with_athlete(request, athlete_id))
+    return await _proxy_mcp_put(request, path)
+
 
 @chainlit_server.middleware("http")
 async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Response:
@@ -153,15 +353,53 @@ async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Res
         action = request.url.path.rsplit("/", 1)[-1]
         if action in {"toggle", "add", "update", "remove", "default", "hide"}:
             return await mutate_models(request, action)
+    if request.method == "GET" and request.url.path == "/api/v1/whoami":
+        return await whoami(request)
+    if request.url.path == "/api/v1/accounts":
+        if request.method == "GET":
+            return await accounts_overview(request)
+        return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use GET for /api/v1/accounts."}}, status_code=405)
+    if request.method == "POST" and request.url.path.startswith("/api/v1/accounts/"):
+        action = request.url.path.rsplit("/", 1)[-1]
+        if action in {"add", "update", "remove", "passwd"}:
+            return await mutate_accounts(request, action)
     if request.method == "POST" and request.url.path == "/api/v1/sync":
         return await sync_trigger_proxy(request)
     if request.method == "GET" and request.url.path == "/api/v1/sync/status":
         return await sync_status_proxy(request)
+    if request.url.path == "/api/v1/athlete-file":
+        if request.method in {"GET", "PUT"}:
+            return await athlete_file_proxy(request)
+        return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use GET or PUT for /api/v1/athlete-file."}}, status_code=405)
     return await call_next(request)
 
 
 def _unauthorized() -> JSONResponse:
     return JSONResponse({"error": {"code": "unauthorized", "message": "Console login is required."}}, status_code=401)
+
+
+def _athlete_forbidden() -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": {
+                "code": "athlete_forbidden",
+                "message": "Your Console account does not have access to this athlete.",
+            }
+        },
+        status_code=403,
+    )
+
+
+def _admin_required() -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": {
+                "code": "admin_required",
+                "message": "Your Console account must be an admin to manage Console accounts.",
+            }
+        },
+        status_code=403,
+    )
 
 
 def _models_error(error: Exception, code: str) -> JSONResponse:
@@ -416,11 +654,218 @@ async def mutate_models(request: Request, action: str) -> Response:
         return _models_error(error, "invalid_request")
 
 
-async def _proxy_mcp_post(request: Request, path: str) -> Response:
+class _AccountApiError(Exception):
+    """A Console accounts API failure carrying the error code and status one response needs."""
+
+    def __init__(self, code: str, status_code: int, message: str):
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+
+
+def _accounts_error(code: str, message: str, status_code: int) -> JSONResponse:
+    return JSONResponse({"error": {"code": code, "message": message}}, status_code=status_code)
+
+
+def _account_not_found(username: str) -> _AccountApiError:
+    return _AccountApiError("account_not_found", 404, f"Console account {username!r} was not found.")
+
+
+def _account_payload(account: ConsoleAccount) -> dict[str, Any]:
+    """The public JSON view of a Console account; never the password hash or store path."""
+
+    return {
+        "username": account.username,
+        "role": account.role,
+        "athletes": account.athletes,
+        "createdAt": account.created_at,
+    }
+
+
+def _required_account_username(body: dict[str, Any]) -> str:
+    username = body.get("username")
+    if not isinstance(username, str) or not username:
+        raise AccountValidationError("username is required.")
+    return username
+
+
+def _add_console_account(path: Path, body: dict[str, Any]) -> dict[str, Any]:
+    """Add one account from an admin request; the hash never enters the response."""
+
+    username = _required_account_username(body)
+    password = body.get("password")
+    if not isinstance(password, str):
+        raise AccountValidationError("Console password must be a string.")
+    try:
+        created = add_account(
+            path,
+            username=username,
+            password=password,
+            role=body.get("role"),
+            athletes=body.get("athletes"),
+        )
+    except AccountExistsError as error:
+        raise _AccountApiError("account_exists", 409, f"Console account {username!r} already exists.") from error
+    return _account_payload(created)
+
+
+def _update_console_account(path: Path, body: dict[str, Any]) -> dict[str, Any]:
+    """Apply role and athlete-grant changes; omitted fields keep their current values."""
+
+    username = _required_account_username(body)
+    role = body.get("role")
+    if role is not None and not isinstance(role, str):
+        raise AccountValidationError("role must be a string.")
+    athletes = body.get("athletes")
+    if athletes is not None and not isinstance(athletes, (str, list)):
+        raise AccountValidationError("athletes must be 'all' or a list of athlete ids.")
+    try:
+        updated = update_account(path, username, role=role, athletes=athletes)
+    except AccountNotFoundError as error:
+        raise _account_not_found(username) from error
+    return _account_payload(updated)
+
+
+def _refuse_removing_the_last_admin(path: Path, username: str) -> None:
+    """Stop a removal that would leave no way to administer the Console.
+
+    The environment break-glass admin always keeps a way in, so the guard only
+    applies while the store is the sole login source.
+    """
+
+    if env_account() is not None:
+        return
+    stored = load_accounts(path)
+    target = next((account for account in stored if account.username == username), None)
+    if target is None or target.role != "admin":
+        return
+    if any(account.role == "admin" and account.username != username for account in stored):
+        return
+    raise _AccountApiError(
+        "last_admin",
+        400,
+        f"Console account {username!r} is the last admin. Configure the environment break-glass admin or promote "
+        "another account before removing it.",
+    )
+
+
+def _remove_console_account(path: Path, body: dict[str, Any]) -> dict[str, bool]:
+    username = _required_account_username(body)
+    _refuse_removing_the_last_admin(path, username)
+    try:
+        remove_account(path, username)
+    except AccountNotFoundError as error:
+        raise _account_not_found(username) from error
+    return {"ok": True}
+
+
+def _change_console_password(path: Path, body: dict[str, Any]) -> dict[str, bool]:
+    username = _required_account_username(body)
+    password = body.get("password")
+    if not isinstance(password, str):
+        raise AccountValidationError("Console password must be a string.")
+    try:
+        update_account(path, username, password=password)
+    except AccountNotFoundError as error:
+        raise _account_not_found(username) from error
+    return {"ok": True}
+
+
+async def whoami(request: Request) -> Response:
+    """The session account's public identity; the fork gates admin UI on ``role``."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    return JSONResponse({"username": account.username, "role": account.role, "athletes": account.athletes})
+
+
+async def accounts_overview(request: Request) -> Response:
+    """List stored Console accounts and the environment break-glass username, for admins only."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required()
+    try:
+        stored = sorted(load_accounts(_auth.accounts_path()), key=lambda stored_account: stored_account.username)
+    except AccountsStoreError as error:
+        logger.exception("Could not list Console accounts: %s", error)
+        return _accounts_error("accounts_store_error", "The Console accounts store is unusable.", 500)
+    break_glass = env_account()
+    return JSONResponse(
+        {
+            "accounts": [_account_payload(stored_account) for stored_account in stored],
+            "breakGlass": None if break_glass is None else {"username": break_glass.username},
+        }
+    )
+
+
+async def mutate_accounts(request: Request, action: str) -> Response:
+    """Manage stored Console accounts; the admin check runs before the body is parsed."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required()
+    try:
+        body = await _json_body(request)
+        path = _auth.accounts_path()
+        if action == "add":
+            return JSONResponse(_add_console_account(path, body))
+        if action == "update":
+            return JSONResponse(_update_console_account(path, body))
+        if action == "remove":
+            return JSONResponse(_remove_console_account(path, body))
+        if action == "passwd":
+            return JSONResponse(_change_console_password(path, body))
+        raise _AccountApiError("invalid_request", 400, f"Unknown account management action: {action}")
+    except _AccountApiError as error:
+        return _accounts_error(error.code, str(error), error.status_code)
+    except (AccountValidationError, ConsoleConfigurationError) as error:
+        return _accounts_error("invalid_request", str(error), 400)
+    except AccountsStoreError as error:
+        logger.exception("Console accounts store failed during %s: %s", action, error)
+        return _accounts_error("accounts_store_error", "The Console accounts store is unusable.", 500)
+
+
+async def _proxy_mcp_put(request: Request, path: str, query: str | None = None) -> Response:
+    """Forward an authenticated PUT body to the runtime's JSON API."""
+
+    if not _authenticated(request):
+        return JSONResponse({"error": {"code": "unauthorized", "message": "Console login is required."}}, status_code=401)
+    target = _mcp_http_url(path)
+    effective_query = request.url.query if query is None else query
+    if effective_query:
+        target = f"{target}?{effective_query}"
+    payload = await request.body()
+    headers = {"content-type": "application/json"}
+    expected_hash = request.headers.get("if-match")
+    if expected_hash:
+        headers["if-match"] = expected_hash
+
+    def fetch() -> tuple[int, bytes, str]:
+        request_ = urllib.request.Request(target, data=payload, method="PUT", headers=headers)
+        try:
+            with urllib.request.urlopen(request_, timeout=15) as upstream:
+                return upstream.status, upstream.read(), upstream.headers.get_content_type()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), error.headers.get_content_type()
+        except urllib.error.URLError as error:
+            return 502, json.dumps({"error": {"code": "mcp_unavailable", "message": str(error)}}).encode("utf-8"), "application/json"
+
+    status, response_body, content_type = await asyncio.to_thread(fetch)
+    return Response(content=response_body, status_code=status, media_type=content_type)
+
+
+async def _proxy_mcp_post(request: Request, path: str, payload: bytes | None = None) -> Response:
     """Forward an authenticated POST body to the runtime's JSON API."""
 
     target = _mcp_http_url(path)
-    payload = await request.body()
+    if payload is None:
+        payload = await request.body()
 
     def fetch() -> tuple[int, bytes, str]:
         request_ = urllib.request.Request(target, data=payload, method="POST", headers={"content-type": "application/json"})
@@ -439,9 +884,25 @@ async def _proxy_mcp_post(request: Request, path: str) -> Response:
 async def sync_trigger_proxy(request: Request) -> Response:
     """Start a detached data sync through the runtime's /api/v1/sync route."""
 
-    if not _authenticated(request):
+    account = _request_identity(request)
+    if account is None:
         return _unauthorized()
-    return await _proxy_mcp_post(request, "/api/v1/sync")
+    # Read the body once so the same bytes (or a rewritten body) reach the runtime.
+    payload = await request.body()
+    body = _parsed_json_object(payload)
+    named = body.get("athleteId") if body is not None else None
+    requested = named if isinstance(named, str) and named else None
+    allowed, athlete_id = athlete_scope(account, requested)
+    if not allowed:
+        return _athlete_forbidden()
+    if athlete_id is not None and athlete_id != requested:
+        if body is None:
+            return JSONResponse(
+                {"error": {"code": "invalid_request", "message": "Request body must be a JSON object."}},
+                status_code=400,
+            )
+        payload = json.dumps({**body, "athleteId": athlete_id}).encode("utf-8")
+    return await _proxy_mcp_post(request, "/api/v1/sync", payload=payload)
 
 
 async def discover_models_proxy(request: Request) -> Response:
@@ -455,27 +916,65 @@ async def discover_models_proxy(request: Request) -> Response:
 async def sync_status_proxy(request: Request) -> Response:
     """Proxy live sync progress and last-completion timestamps from the runtime."""
 
-    return await _proxy_mcp_get(request, "/api/v1/sync/status")
+    return await _athlete_scoped_get(request, "/api/v1/sync/status")
 
 
-def _athlete_roster() -> tuple[str, dict[str, str]]:
-    """Read only IDs and labels; health data remains behind scoped MCP tools."""
+def _session_identity() -> ConsoleAccount | None:
+    """The Console account of the current Chainlit session, if any."""
+
+    user = cl.user_session.get("user")
+    identifier = getattr(user, "identifier", None)
+    if not isinstance(identifier, str) or not identifier:
+        return None
+    return resolve_account(identifier)
+
+
+def _valid_roster(payload: object) -> TypeGuard[dict[str, Any]]:
+    """True when a runtime payload has the athlete-roster shape."""
+
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("defaultAthleteId"), str)
+        and isinstance(payload.get("athletes"), list)
+    )
+
+
+def _roster_payload() -> dict[str, Any]:
+    """Fetch and validate the runtime's athlete roster."""
 
     try:
         with urllib.request.urlopen(_mcp_http_url("/api/v1/athletes"), timeout=3) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
         raise ConsoleConfigurationError(f"Could not load the Catence athlete roster: {error}") from error
-    if not isinstance(payload, dict) or not isinstance(payload.get("defaultAthleteId"), str) or not isinstance(payload.get("athletes"), list):
+    if not _valid_roster(payload):
         raise ConsoleConfigurationError("Catence returned an invalid athlete roster.")
+    if not any(
+        isinstance(athlete, dict) and athlete.get("id") == payload["defaultAthleteId"]
+        for athlete in payload["athletes"]
+    ):
+        raise ConsoleConfigurationError("Catence returned an athlete roster with an invalid default.")
+    return payload
+
+
+def _athlete_roster() -> tuple[str | None, dict[str, str]]:
+    """Read only IDs and labels; health data remains behind scoped MCP tools.
+
+    The roster is narrowed to the session account's grants, so a member with
+    no grants gets empty choices and no default instead of a raised error.
+    """
+
+    payload = filter_roster(_roster_payload(), _session_identity())
     choices: dict[str, str] = {}
     for athlete in payload["athletes"]:
         if isinstance(athlete, dict) and isinstance(athlete.get("id"), str) and isinstance(athlete.get("label"), str):
             choices[athlete["label"]] = athlete["id"]
     default_athlete_id = payload["defaultAthleteId"]
-    if default_athlete_id not in choices.values():
+    if default_athlete_id in choices.values():
+        return default_athlete_id, choices
+    if choices:
         raise ConsoleConfigurationError("Catence returned an athlete roster with an invalid default.")
-    return default_athlete_id, choices
+    return None, {}
 
 
 @cl.data_layer
@@ -569,9 +1068,9 @@ def _choice_available(configuration: ConsoleConfiguration, value: str) -> bool:
 
 def _session_settings(
     configuration: ConsoleConfiguration,
-    default_athlete_id: str,
+    default_athlete_id: str | None,
     athlete_ids: set[str],
-) -> tuple[str, str, str | None, int, int, str]:
+) -> tuple[str, str, str | None, int, int, str | None]:
     """Return the current chat's safe, valid settings.
 
     Startup and resume apply the local user's durable preferences before this
@@ -622,9 +1121,20 @@ def _session_settings(
     return profile.id, model_id, reasoning_effort, tool_rounds, tool_result_characters, athlete_id
 
 
-def _selected_settings() -> tuple[str, str, str | None, int, int, str]:
+def _selected_settings() -> tuple[str, str, str | None, int, int, str | None, str | None]:
+    """The current chat's safe settings plus the selected athlete's label."""
+
     default_athlete_id, athletes = _athlete_roster()
-    return _session_settings(_configuration(), default_athlete_id, set(athletes.values()))
+    (
+        profile_id,
+        model_id,
+        reasoning_effort,
+        tool_rounds,
+        tool_result_characters,
+        athlete_id,
+    ) = _session_settings(_configuration(), default_athlete_id, set(athletes.values()))
+    athlete_label = next((label for label, granted_id in athletes.items() if granted_id == athlete_id), None)
+    return profile_id, model_id, reasoning_effort, tool_rounds, tool_result_characters, athlete_id, athlete_label
 
 
 def _configured_preferences(configuration: ConsoleConfiguration, default_athlete_id: str | None = None) -> SavedConsolePreferences:
@@ -645,7 +1155,7 @@ def _user_identifier() -> str:
 
 
 def _normalized_preferences(
-    configuration: ConsoleConfiguration, preferences: SavedConsolePreferences, default_athlete_id: str, athlete_ids: set[str]
+    configuration: ConsoleConfiguration, preferences: SavedConsolePreferences, default_athlete_id: str | None, athlete_ids: set[str]
 ) -> SavedConsolePreferences:
     default = _configured_preferences(configuration, default_athlete_id)
     try:
@@ -709,9 +1219,9 @@ def _chat_settings(
     reasoning_effort: str | None,
     tool_rounds: int,
     tool_result_characters: int,
-    athlete_id: str,
+    athlete_id: str | None,
     athletes: dict[str, str],
-    default_athlete_id: str,
+    default_athlete_id: str | None,
 ) -> cl.ChatSettings:
     defaults = _configured_preferences(configuration, default_athlete_id)
     try:
@@ -725,10 +1235,17 @@ def _chat_settings(
             Select(
                 id="athleteId",
                 label="Athlete",
-                items=athletes,
+                # Chainlit refuses an empty Select; a disabled placeholder keeps
+                # a member without grants able to browse the Console.
+                items=athletes or {"No athletes available": ""},
                 initial_value=athlete_id,
                 reset_value=defaults.athlete_id,
-                description="Every Catence data tool call in this chat is restricted to this athlete.",
+                disabled=not athletes,
+                description=(
+                    NO_ATHLETE_ACCESS_NOTICE
+                    if not athletes
+                    else "Every Catence data tool call in this chat is restricted to this athlete."
+                ),
             ),
             Select(
                 id="model",
@@ -842,11 +1359,17 @@ async def _initialize_chat(configuration: ConsoleConfiguration) -> None:
     readiness = "ready" if not missing else f"missing environment variables: {', '.join(missing)}"
     selected_model = profile.model_option(model_id)
     selected_effort = None if preferences.reasoning_effort == "default" else preferences.reasoning_effort
+    scoped_athlete_id = preferences.athlete_id or default_athlete_id
+    scope = (
+        f"This chat is scoped to athlete **{scoped_athlete_id}**."
+        if scoped_athlete_id
+        else NO_ATHLETE_ACCESS_NOTICE
+    )
     await _notice(
         content=(
             f"Catence Console is {readiness}. Using **{selected_model.label}** with **{selected_effort or 'provider default'}** thinking, "
             f"up to **{preferences.tool_rounds}** tool rounds and **{preferences.tool_result_characters:,}** evidence characters per result. "
-            f"This chat is scoped to athlete **{preferences.athlete_id or default_athlete_id}**. "
+            f"{scope} "
             "I can use the same local MCP tools as your coding agent. "
             "Try a recovery review, training-load check, or a question about a recent activity."
         )
@@ -944,10 +1467,16 @@ async def update_settings(settings: dict[str, Any]) -> None:
     )
     await settings_widgets.refresh()
     selected_model = profile.model_option(model_id)
+    athlete_summary = (
+        f", and athlete **{preferences.athlete_id}**."
+        if preferences.athlete_id
+        else f". {NO_ATHLETE_ACCESS_NOTICE}"
+    )
     await cl.Message(
         content=(
             f"Settings applied: **{selected_model.label}** with **{preferences.reasoning_effort if preferences.reasoning_effort != 'default' else 'provider default'}** thinking, "
-            f"**{preferences.tool_rounds}** tool rounds, **{preferences.tool_result_characters:,}** evidence characters per result, and athlete **{preferences.athlete_id}**."
+            f"**{preferences.tool_rounds}** tool rounds, **{preferences.tool_result_characters:,}** evidence characters per result"
+            f"{athlete_summary}"
         )
     ).send()
 
@@ -961,6 +1490,7 @@ async def _run_generation(
     tool_round_limit: int,
     tool_result_character_limit: int,
     athlete_id: str | None,
+    athlete_label: str | None,
 ) -> None:
     """Execute one agent turn detached from the websocket session.
 
@@ -981,6 +1511,7 @@ async def _run_generation(
             tool_call_store=tool_call_store(DATA_DIRECTORY),
             thread_id=thread_id,
             athlete_id=athlete_id,
+            athlete_label=athlete_label,
             step_parent_id=message.id,
         )
         await cl.Message(content=answer).send()
@@ -1017,10 +1548,22 @@ async def on_stop() -> None:
 async def on_message(message: cl.Message) -> None:
     try:
         configuration = _configuration()
-        profile_id, model_id, reasoning_effort, tool_round_limit, tool_result_character_limit, athlete_id = _selected_settings()
+        (
+            profile_id,
+            model_id,
+            reasoning_effort,
+            tool_round_limit,
+            tool_result_character_limit,
+            athlete_id,
+            athlete_label,
+        ) = _selected_settings()
         profile = configuration.profile(profile_id)
     except ConsoleConfigurationError as error:
         await _notice(content=f"Console configuration error: {error}").send()
+        return
+
+    if not can_run_agent_turn(athlete_id):
+        await _notice(content=NO_ATHLETE_ACCESS_NOTICE).send()
         return
 
     missing = missing_environment(profile)
@@ -1051,5 +1594,6 @@ async def on_message(message: cl.Message) -> None:
             tool_round_limit,
             tool_result_character_limit,
             athlete_id,
+            athlete_label,
         )
     )

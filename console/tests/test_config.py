@@ -172,7 +172,82 @@ def test_resumed_chat_falls_back_when_its_saved_model_was_removed(tmp_path, monk
     assert athlete_id == "athlete-a"
 
 
-def test_persistent_preferences_are_normalized_and_settings_expose_configured_reset_values(tmp_path):
+def test_normalized_preferences_move_an_out_of_grant_athlete_to_the_default(tmp_path):
+    write_config(tmp_path, {"profiles": {"openai": {"model": "openai/gpt-5-mini"}}})
+    configuration = load_console_configuration(tmp_path)
+    saved = SavedConsolePreferences(
+        model_choice=configuration.default_model_choice(),
+        reasoning_effort="default",
+        tool_rounds=8,
+        tool_result_characters=24_000,
+        athlete_id="someone-else",
+    )
+
+    normalized = _normalized_preferences(configuration, saved, "martina", {"martina"})
+
+    assert normalized.athlete_id == "martina"
+
+
+def test_chat_settings_disable_the_athlete_dropdown_without_grants(tmp_path):
+    write_config(tmp_path, {"profiles": {"openai": {"model": "openai/gpt-5-mini"}}})
+    configuration = load_console_configuration(tmp_path)
+
+    settings = _chat_settings(
+        configuration,
+        model_choice=configuration.default_model_choice(),
+        reasoning_effort=None,
+        tool_rounds=8,
+        tool_result_characters=24_000,
+        athlete_id=None,
+        athletes={},
+        default_athlete_id=None,
+    )
+
+    values = {input["id"]: input for input in settings._inputs_as_dicts()}
+    athlete = values["athleteId"]
+    assert athlete["disabled"] is True
+    assert athlete["items"] == [{"label": "No athletes available", "value": ""}]
+
+
+def test_selected_settings_carry_the_athlete_label(tmp_path, monkeypatch):
+    write_config(tmp_path, {"profiles": {"openai": {"model": "openai/gpt-5-mini"}}})
+    from catence_console import app
+
+    monkeypatch.setattr(app, "DATA_DIRECTORY", tmp_path)
+    monkeypatch.setattr(app, "_athlete_roster", lambda: ("athlete-a", {"Athlete A": "athlete-a"}))
+    monkeypatch.setattr(
+        app.cl.user_session,
+        "get",
+        lambda key: "athlete-a" if key == "catence_athlete_id" else None,
+    )
+
+    profile_id, _, _, _, _, athlete_id, athlete_label = app._selected_settings()
+
+    assert profile_id == "openai"
+    assert (athlete_id, athlete_label) == ("athlete-a", "Athlete A")
+    assert app.can_run_agent_turn(athlete_id) is True
+
+
+def test_selected_settings_expose_no_athlete_without_grants(tmp_path, monkeypatch):
+    write_config(tmp_path, {"profiles": {"openai": {"model": "openai/gpt-5-mini"}}})
+    from catence_console import app
+
+    monkeypatch.setattr(app, "DATA_DIRECTORY", tmp_path)
+    monkeypatch.setattr(app, "_athlete_roster", lambda: (None, {}))
+    monkeypatch.setattr(app.cl.user_session, "get", lambda key: None)
+
+    *_, athlete_id, athlete_label = app._selected_settings()
+
+    assert (athlete_id, athlete_label) == (None, None)
+    assert app.can_run_agent_turn(athlete_id) is False
+
+
+def test_persistent_preferences_are_normalized_and_settings_expose_configured_reset_values(tmp_path, monkeypatch):
+    from catence_console import app
+
+    # Hidden/disabled model state lives under DATA_DIRECTORY; point it at the
+    # test directory so a developer's own Console state cannot change the result.
+    monkeypatch.setattr(app, "DATA_DIRECTORY", tmp_path)
     write_config(
         tmp_path,
         {
