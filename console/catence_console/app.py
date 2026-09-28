@@ -8,6 +8,7 @@ import asyncio
 import json
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeGuard
@@ -46,12 +47,22 @@ from catence_console.config import (
     MIN_TOOL_ROUND_LIMIT,
     ConsoleConfiguration,
     ConsoleConfigurationError,
+    ToolServer,
     load_console_configuration,
     missing_environment,
+    referenced_environment,
     write_provider_setup,
 )
 from catence_console.config_io import read_config_root, write_console_section
 from catence_console.generation_sidecar import finish_generation_sidecar
+from catence_console.tool_server_secrets import (
+    ToolServerSecretValidationError,
+    ToolServerSecretsStoreError,
+    clear_tool_server_secret,
+    default_tool_server_secrets_path,
+    load_tool_server_secrets,
+    set_tool_server_secret,
+)
 from catence_console.persistence import (
     SavedConsolePreferences,
     console_preferences_store,
@@ -363,6 +374,16 @@ async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Res
         action = request.url.path.rsplit("/", 1)[-1]
         if action in {"add", "update", "remove", "passwd"}:
             return await mutate_accounts(request, action)
+    if request.url.path == "/api/v1/tool-servers":
+        if request.method == "GET":
+            return await tool_servers_overview(request)
+        return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use GET for /api/v1/tool-servers."}}, status_code=405)
+    if (
+        request.method == "POST"
+        and request.url.path.startswith("/api/v1/tool-servers/")
+        and request.url.path.endswith("/secrets")
+    ):
+        return await mutate_tool_server_secret(request)
     if request.method == "POST" and request.url.path == "/api/v1/sync":
         return await sync_trigger_proxy(request)
     if request.method == "GET" and request.url.path == "/api/v1/sync/status":
@@ -390,12 +411,12 @@ def _athlete_forbidden() -> JSONResponse:
     )
 
 
-def _admin_required() -> JSONResponse:
+def _admin_required(message: str = "Your Console account must be an admin to manage Console accounts.") -> JSONResponse:
     return JSONResponse(
         {
             "error": {
                 "code": "admin_required",
-                "message": "Your Console account must be an admin to manage Console accounts.",
+                "message": message,
             }
         },
         status_code=403,
@@ -829,6 +850,93 @@ async def mutate_accounts(request: Request, action: str) -> Response:
     except AccountsStoreError as error:
         logger.exception("Console accounts store failed during %s: %s", action, error)
         return _accounts_error("accounts_store_error", "The Console accounts store is unusable.", 500)
+
+
+def _tool_servers_error(code: str, message: str, status_code: int) -> JSONResponse:
+    return JSONResponse({"error": {"code": code, "message": message}}, status_code=status_code)
+
+
+def _tool_servers_payload(configuration: ConsoleConfiguration, secrets: Mapping[str, str]) -> dict[str, Any]:
+    """Public view of extra tool servers; credential values are never returned."""
+
+    servers: list[dict[str, Any]] = []
+    for server in configuration.tool_servers.values():
+        credentials: list[dict[str, Any]] = []
+        for name in referenced_environment(server):
+            if name in secrets:
+                source = "console"
+            elif os.environ.get(name):
+                source = "environment"
+            else:
+                source = None
+            credentials.append({"name": name, "configured": source is not None, "source": source})
+        servers.append({"name": server.name, "label": server.label, "url": server.url, "secrets": credentials})
+    return {"servers": servers}
+
+
+async def tool_servers_overview(request: Request) -> Response:
+    """List configured extra tool servers and credential readiness, for admins only."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to manage tool-server credentials.")
+    try:
+        configuration = load_console_configuration(DATA_DIRECTORY)
+        secrets = load_tool_server_secrets(default_tool_server_secrets_path(DATA_DIRECTORY))
+    except ConsoleConfigurationError as error:
+        return _tool_servers_error("invalid_request", str(error), 400)
+    except ToolServerSecretsStoreError as error:
+        logger.exception("Console tool-server credential store failed: %s", error)
+        return _tool_servers_error(
+            "tool_server_secrets_error", "The Console tool-server credential store is unusable.", 500
+        )
+    return JSONResponse(_tool_servers_payload(configuration, secrets))
+
+
+async def mutate_tool_server_secret(request: Request) -> Response:
+    """Store or clear one credential; the admin check runs before the body is parsed."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to manage tool-server credentials.")
+    name = request.url.path.rsplit("/", 2)[-2]
+    try:
+        body = await _json_body(request)
+        configuration = load_console_configuration(DATA_DIRECTORY)
+        server = configuration.tool_servers.get(name)
+        if server is None:
+            return _tool_servers_error("tool_server_not_found", f"Console tool server {name!r} is not configured.", 404)
+        secret_name = body.get("name")
+        if not isinstance(secret_name, str) or not secret_name:
+            raise ToolServerSecretValidationError("name is required.")
+        if secret_name not in referenced_environment(server):
+            raise ToolServerSecretValidationError(
+                f"Tool server {name!r} does not reference the credential {secret_name!r}."
+            )
+        if "value" not in body:
+            raise ToolServerSecretValidationError("value is required; pass null to clear the credential.")
+        value = body["value"]
+        path = default_tool_server_secrets_path(DATA_DIRECTORY)
+        if value is None:
+            secrets = clear_tool_server_secret(path, secret_name)
+        elif isinstance(value, str) and value:
+            secrets = set_tool_server_secret(path, secret_name, value)
+        else:
+            raise ToolServerSecretValidationError("value must be a non-empty string, or null to clear it.")
+        return JSONResponse(_tool_servers_payload(configuration, secrets))
+    except ToolServerSecretValidationError as error:
+        return _tool_servers_error("invalid_request", str(error), 400)
+    except ConsoleConfigurationError as error:
+        return _tool_servers_error("invalid_request", str(error), 400)
+    except ToolServerSecretsStoreError as error:
+        logger.exception("Console tool-server credential store failed: %s", error)
+        return _tool_servers_error(
+            "tool_server_secrets_error", "The Console tool-server credential store is unusable.", 500
+        )
 
 
 async def _proxy_mcp_put(request: Request, path: str, query: str | None = None) -> Response:
@@ -1489,6 +1597,8 @@ async def _run_generation(
     history: list[dict[str, Any]],
     tool_round_limit: int,
     tool_result_character_limit: int,
+    tool_servers: Mapping[str, ToolServer],
+    tool_server_secrets: Mapping[str, str],
     athlete_id: str | None,
     athlete_label: str | None,
 ) -> None:
@@ -1506,6 +1616,8 @@ async def _run_generation(
             reasoning_effort=reasoning_effort,
             history=history,
             mcp_url=MCP_URL,
+            tool_servers=tool_servers,
+            tool_server_secrets=tool_server_secrets,
             tool_round_limit=tool_round_limit,
             tool_result_character_limit=tool_result_character_limit,
             tool_call_store=tool_call_store(DATA_DIRECTORY),
@@ -1562,6 +1674,14 @@ async def on_message(message: cl.Message) -> None:
         await _notice(content=f"Console configuration error: {error}").send()
         return
 
+    try:
+        tool_server_secrets = load_tool_server_secrets(default_tool_server_secrets_path(DATA_DIRECTORY))
+    except ToolServerSecretsStoreError as error:
+        logger.warning(
+            "Console tool-server credential store is unusable; falling back to the process environment: %s", error
+        )
+        tool_server_secrets = {}
+
     if not can_run_agent_turn(athlete_id):
         await _notice(content=NO_ATHLETE_ACCESS_NOTICE).send()
         return
@@ -1593,6 +1713,8 @@ async def on_message(message: cl.Message) -> None:
             _model_history(),
             tool_round_limit,
             tool_result_character_limit,
+            configuration.tool_servers,
+            tool_server_secrets,
             athlete_id,
             athlete_label,
         )

@@ -28,6 +28,7 @@
       "toolRounds": 8,
       "toolResultCharacters": 24000
     },
+    "mcpServers": {},
     "profiles": {
       "openai": {
         "label": "OpenAI",

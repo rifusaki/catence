@@ -5,11 +5,16 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 ENVIRONMENT_VARIABLE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+TOOL_SERVER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# ``$NAME`` and ``${NAME}`` references are expanded at connect time from the
+# Console credential store or the process environment; config.json never holds
+# the value itself.
+ENVIRONMENT_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 DEFAULT_TOOL_ROUND_LIMIT = 8
 DEFAULT_TOOL_RESULT_CHARACTER_LIMIT = 24_000
@@ -70,6 +75,34 @@ class ConsoleLimits:
 
     tool_rounds: int = DEFAULT_TOOL_ROUND_LIMIT
     tool_result_characters: int = DEFAULT_TOOL_RESULT_CHARACTER_LIMIT
+
+
+@dataclass(frozen=True)
+class ToolServer:
+    """One extra HTTP MCP server whose tools join the Console agent's turn.
+
+    ``url`` and ``headers`` may reference environment variables as ``$NAME`` or
+    ``${NAME}``. The referenced values are resolved per turn from the Console
+    credential store first and the process environment second, so credentials
+    never live in ``config.json``.
+    """
+
+    name: str
+    label: str
+    url: str
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+def referenced_environment(server: ToolServer) -> tuple[str, ...]:
+    """Environment variable names referenced by a tool server, in order, deduplicated."""
+
+    names: list[str] = []
+    for value in (server.url, *server.headers.values()):
+        for match in ENVIRONMENT_REFERENCE.finditer(value):
+            name = match.group(1) or match.group(2)
+            if name not in names:
+                names.append(name)
+    return tuple(names)
 
 
 @dataclass(frozen=True)
@@ -158,6 +191,7 @@ class ConsoleConfiguration:
     default_profile: str
     profiles: dict[str, ProviderProfile]
     limits: ConsoleLimits = ConsoleLimits()
+    tool_servers: dict[str, ToolServer] = field(default_factory=dict)
 
     def profile(self, profile_id: str) -> ProviderProfile:
         try:
@@ -310,7 +344,7 @@ def parse_console_configuration(root: Any) -> ConsoleConfiguration:
     """Validate an already-decoded ``config.json`` root object."""
 
     console = _object(root.get("console"), "console")
-    unknown_console_fields = set(console) - {"defaultProfile", "profiles", "limits"}
+    unknown_console_fields = set(console) - {"defaultProfile", "profiles", "limits", "mcpServers"}
     if unknown_console_fields:
         raise ConsoleConfigurationError(
             f"console contains unsupported fields: {', '.join(sorted(unknown_console_fields))}."
@@ -383,7 +417,56 @@ def parse_console_configuration(root: Any) -> ConsoleConfiguration:
     default_profile = console.get("defaultProfile", next(iter(profiles)))
     if not isinstance(default_profile, str) or default_profile not in profiles:
         raise ConsoleConfigurationError("console.defaultProfile must name one of console.profiles.")
-    return ConsoleConfiguration(default_profile=default_profile, profiles=profiles, limits=_limits(console.get("limits")))
+    return ConsoleConfiguration(
+        default_profile=default_profile,
+        profiles=profiles,
+        limits=_limits(console.get("limits")),
+        tool_servers=_tool_servers(console.get("mcpServers")),
+    )
+
+
+def _tool_servers(value: Any) -> dict[str, ToolServer]:
+    """Validate the ``console.mcpServers`` map of extra HTTP MCP servers."""
+
+    if value is None:
+        return {}
+    raw_servers = _object(value, "console.mcpServers")
+    servers: dict[str, ToolServer] = {}
+    for name, raw_server in raw_servers.items():
+        if not isinstance(name, str) or not TOOL_SERVER_NAME.match(name):
+            raise ConsoleConfigurationError(
+                "console.mcpServers names must start with a letter or digit and use only letters, digits, '.', '_', or '-'."
+            )
+        server = _object(raw_server, f"console.mcpServers.{name}")
+        unknown_fields = set(server) - {"label", "url", "headers"}
+        if unknown_fields:
+            raise ConsoleConfigurationError(
+                f"console.mcpServers.{name} contains unsupported fields: {', '.join(sorted(unknown_fields))}."
+            )
+        url = server.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ConsoleConfigurationError(f"console.mcpServers.{name}.url must be a non-empty string.")
+        if not url.startswith(("http://", "https://")):
+            raise ConsoleConfigurationError(f"console.mcpServers.{name}.url must be an http(s) URL.")
+        label = server.get("label", name)
+        if not isinstance(label, str) or not label.strip():
+            raise ConsoleConfigurationError(f"console.mcpServers.{name}.label must be a non-empty string.")
+        headers: dict[str, str] = {}
+        raw_headers = server.get("headers")
+        if raw_headers is not None:
+            raw_headers = _object(raw_headers, f"console.mcpServers.{name}.headers")
+            for header_name, header_value in raw_headers.items():
+                if not isinstance(header_name, str) or not header_name.strip():
+                    raise ConsoleConfigurationError(
+                        f"console.mcpServers.{name}.headers names must be non-empty strings."
+                    )
+                if not isinstance(header_value, str):
+                    raise ConsoleConfigurationError(
+                        f"console.mcpServers.{name}.headers values must be strings."
+                    )
+                headers[header_name] = header_value
+        servers[name] = ToolServer(name=name, label=label, url=url, headers=headers)
+    return servers
 
 
 def missing_environment(profile: ProviderProfile) -> tuple[str, ...]:

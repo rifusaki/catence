@@ -7,6 +7,7 @@ import pytest
 
 from catence_console import accounts, cli
 from catence_console.release import CATENCE_RELEASE_VERSION
+from catence_console.tool_server_secrets import default_tool_server_secrets_path
 
 
 class FakeResponse:
@@ -362,3 +363,115 @@ def test_users_commands_accept_an_explicit_home(monkeypatch, tmp_path):
     assert result == 0
     assert accounts.load_accounts(accounts.default_accounts_path(elsewhere))[0].username == "martina"
     assert accounts.load_accounts(accounts.default_accounts_path(tmp_path)) == []
+
+
+# --------------------------------------------------------------------- doctor
+
+
+def write_console_config(tmp_path, tool_servers):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "console": {
+                    "profiles": {"local": {"model": "openai/example"}},
+                    "mcpServers": tool_servers,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+EXA_TOOL_SERVER = {
+    "exa": {
+        "label": "Exa Web Search",
+        "url": "https://mcp.exa.ai/mcp",
+        "headers": {"x-api-key": "$EXA_API_KEY"},
+    }
+}
+
+
+def prepare_doctor(monkeypatch, tmp_path):
+    monkeypatch.setenv("CHAINLIT_AUTH_SECRET", "test-secret-that-is-long-enough-for-hs256")
+    monkeypatch.setenv("CATENCE_CONSOLE_USERNAME", "coach-env")
+    monkeypatch.setenv("CATENCE_CONSOLE_PASSWORD_HASH", "hash")
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    monkeypatch.setattr(cli, "_health", lambda _url: (True, {"runtimeVersion": "0.2.1", "protocolVersion": 1}))
+
+
+def test_doctor_reports_tool_server_credential_readiness(monkeypatch, tmp_path, capsys):
+    write_console_config(tmp_path, EXA_TOOL_SERVER)
+    prepare_doctor(monkeypatch, tmp_path)
+
+    result = cli.doctor(tmp_path, "http://127.0.0.1:8787/mcp")
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["toolServers"] == [
+        {
+            "id": "exa",
+            "label": "Exa Web Search",
+            "url": "https://mcp.exa.ai/mcp",
+            "missingEnvironment": ["EXA_API_KEY"],
+            "ready": False,
+        }
+    ]
+    # An unready tool server is a warning, not a health failure.
+    assert report["ok"] is True
+    assert result == 0
+
+
+def test_doctor_marks_a_tool_server_ready_with_a_stored_credential(monkeypatch, tmp_path, capsys):
+    write_console_config(tmp_path, EXA_TOOL_SERVER)
+    prepare_doctor(monkeypatch, tmp_path)
+    secrets_path = default_tool_server_secrets_path(tmp_path)
+    secrets_path.parent.mkdir(parents=True, exist_ok=True)
+    secrets_path.write_text(
+        json.dumps({"formatVersion": 1, "secrets": {"EXA_API_KEY": "stored"}}), encoding="utf-8"
+    )
+
+    result = cli.doctor(tmp_path, "http://127.0.0.1:8787/mcp")
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["toolServers"][0]["ready"] is True
+    assert report["toolServers"][0]["missingEnvironment"] == []
+    assert "toolServerSecretsError" not in report
+    assert result == 0
+
+
+def test_doctor_accepts_a_tool_server_credential_from_the_environment(monkeypatch, tmp_path, capsys):
+    write_console_config(tmp_path, EXA_TOOL_SERVER)
+    prepare_doctor(monkeypatch, tmp_path)
+    monkeypatch.setenv("EXA_API_KEY", "from-env")
+
+    result = cli.doctor(tmp_path, "http://127.0.0.1:8787/mcp")
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["toolServers"][0]["ready"] is True
+    assert result == 0
+
+
+def test_doctor_reports_a_broken_credential_store_without_failing(monkeypatch, tmp_path, capsys):
+    write_console_config(tmp_path, EXA_TOOL_SERVER)
+    prepare_doctor(monkeypatch, tmp_path)
+    secrets_path = default_tool_server_secrets_path(tmp_path)
+    secrets_path.parent.mkdir(parents=True, exist_ok=True)
+    secrets_path.write_text("{not json", encoding="utf-8")
+
+    result = cli.doctor(tmp_path, "http://127.0.0.1:8787/mcp")
+
+    report = json.loads(capsys.readouterr().out)
+    assert "toolServerSecretsError" in report
+    assert report["toolServers"][0]["ready"] is False
+    assert report["ok"] is True
+    assert result == 0
+
+
+def test_doctor_without_tool_servers_reports_an_empty_list(monkeypatch, tmp_path, capsys):
+    write_console_config(tmp_path, {})
+    prepare_doctor(monkeypatch, tmp_path)
+
+    result = cli.doctor(tmp_path, "http://127.0.0.1:8787/mcp")
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["toolServers"] == []
+    assert result == 0

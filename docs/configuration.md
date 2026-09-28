@@ -96,6 +96,7 @@ The Console model configuration. `defaultProfile` must name one of
   "console": {
     "defaultProfile": "openai",
     "limits": { "toolRounds": 8, "toolResultCharacters": 24000 },
+    "mcpServers": { … },
     "profiles": { … }
   }
 }
@@ -165,6 +166,52 @@ add custom variants, remove, set defaults). Disabled choices are stored in the
 Console database rather than here; every write preserves all non-console
 sections and is re-validated with the same strict parser before the file is
 replaced.
+
+### `console.mcpServers`
+
+Extra MCP tool servers the Console agent connects to alongside the Catence
+runtime. This is how the Console gains capabilities Catence does not provide,
+such as web search. HTTP (Streamable HTTP) servers only; each entry is keyed by
+a short server name used in tool step labels.
+
+```jsonc
+"mcpServers": {
+  "exa": {
+    "label": "Exa Web Search",
+    "url": "https://mcp.exa.ai/mcp",
+    "headers": { "x-api-key": "$EXA_API_KEY" }
+  }
+}
+```
+
+Allowed entry fields (strict):
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `label` | — | Display name in tool steps (defaults to the server name) |
+| `url` | yes | `http://` or `https://` MCP endpoint |
+| `headers` | — | Extra HTTP headers; values may reference environment variables |
+
+`url` and header values may reference credentials as `$NAME` or `${NAME}`.
+References resolve from the Console credential store first (the admin
+**Accounts** page), then the process environment, so a key can be entered
+after the runtime has started and applies to the next chat turn. A server
+whose credentials are missing is skipped with a warning step; other servers
+and Catence itself keep working. Tool names from extra servers are used as-is
+unless they collide with a Catence tool, in which case they are prefixed with
+the server name (`exa_web_search_exa`).
+
+The hosted Exa server (`https://mcp.exa.ai/mcp`) also works without a key
+(rate-limited) and offers `web_search_exa` and `web_fetch_exa` by default.
+Add `?tools=…` to the URL to expose a different tool set, e.g.
+`https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa`.
+
+The **Accounts** page (admin only) lists each configured server and its
+credential readiness, and lets an admin save or clear values without
+restarting the Console. Stored values live in
+`<data directory>/console/tool_server_secrets.json` (mode 0600) and take
+precedence over the process environment. `catence-console doctor` reports each
+server's readiness as well.
 
 ### The Console wizard
 

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable
+import logging
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import AsyncExitStack
 from typing import Any
 from uuid import uuid4
 
@@ -23,13 +25,16 @@ from litellm.exceptions import (
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-from .config import DEFAULT_TOOL_RESULT_CHARACTER_LIMIT, DEFAULT_TOOL_ROUND_LIMIT, ProviderProfile
+from .config import DEFAULT_TOOL_RESULT_CHARACTER_LIMIT, DEFAULT_TOOL_ROUND_LIMIT, ProviderProfile, ToolServer
 from .generation_sidecar import (
     finish_generation_sidecar,
     start_generation_sidecar,
     update_generation_sidecar,
 )
+from .mcp_servers import ToolServerConnection, ToolServerFailure, open_tool_servers
 from .persistence import SavedToolCall, ToolCallStore
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a careful endurance-training data assistant.
 Use Catence MCP tools for athlete-specific facts. Start with a named review tool
@@ -195,42 +200,85 @@ def _provider_safe_schema(node: Any) -> Any:
     return rewritten
 
 
-def _tool_definitions(tools: list[Any]) -> list[dict[str, Any]]:
-    definitions: list[dict[str, Any]] = []
-    for tool in tools:
-        raw = _as_json(tool)
-        if raw.get("name") in _HIDDEN_TOOL_NAMES:
-            continue
-        definitions.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": raw["name"],
-                    "description": raw.get("description", ""),
-                    "parameters": _provider_safe_schema(raw.get("inputSchema", raw.get("input_schema", {"type": "object", "properties": {}}))),
+def _tool_definition(raw: dict[str, Any], name: str) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": raw.get("description", ""),
+            "parameters": _provider_safe_schema(
+                raw.get("inputSchema", raw.get("input_schema", {"type": "object", "properties": {}}))
+            ),
+        },
+    }
+
+
+def _recall_tool_definition() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": _RECALL_SAVED_TOOL_RESULT,
+            "description": "Load the stored result for one earlier tool call in this chat. Use only when the compact prior-tool-call record is insufficient; otherwise call the authoritative Catence tool again if fresh data is needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "callId": {
+                        "type": "string",
+                        "description": "The callId listed in prior tool-call context.",
+                    }
                 },
-            }
-        )
-    definitions.append(
-        {
-            "type": "function",
-            "function": {
-                "name": _RECALL_SAVED_TOOL_RESULT,
-                "description": "Load the stored result for one earlier tool call in this chat. Use only when the compact prior-tool-call record is insufficient; otherwise call the authoritative Catence tool again if fresh data is needed.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "callId": {
-                            "type": "string",
-                            "description": "The callId listed in prior tool-call context.",
-                        }
-                    },
-                    "required": ["callId"],
-                    "additionalProperties": False,
-                },
+                "required": ["callId"],
+                "additionalProperties": False,
             },
-        }
-    )
+        },
+    }
+
+
+def _tool_routes(
+    catence_tools: list[Any],
+    connections: Sequence[ToolServerConnection],
+) -> tuple[list[dict[str, Any]], dict[str, tuple[ToolServerConnection | None, str]], list[str]]:
+    """Build model-facing tool definitions and a routing map.
+
+    Catence tools keep their names. Extra-server tools keep theirs unless the
+    name is already taken (or reserved), in which case the tool is namespaced
+    as ``<server>_<tool>``. Each routing entry maps the model-facing name to
+    the owning connection (``None`` for Catence) and the original tool name.
+    """
+
+    definitions: list[dict[str, Any]] = []
+    routes: dict[str, tuple[ToolServerConnection | None, str]] = {}
+    warnings: list[str] = []
+    for tool in catence_tools:
+        raw = _as_json(tool)
+        name = raw.get("name")
+        if not isinstance(name, str) or not name or name in _HIDDEN_TOOL_NAMES:
+            continue
+        routes[name] = (None, name)
+        definitions.append(_tool_definition(raw, name))
+    for connection in connections:
+        for tool in connection.tools:
+            raw = _as_json(tool)
+            original = raw.get("name")
+            if not isinstance(original, str) or not original:
+                continue
+            name = original
+            if name in routes or name == _RECALL_SAVED_TOOL_RESULT:
+                name = f"{connection.name}_{original}"
+            if name in routes or name == _RECALL_SAVED_TOOL_RESULT:
+                warnings.append(
+                    f"Tool {original!r} from {connection.name!r} is unavailable: "
+                    f"the name {name!r} is already taken."
+                )
+                continue
+            routes[name] = (connection, original)
+            definitions.append(_tool_definition(raw, name))
+    definitions.append(_recall_tool_definition())
+    return definitions, routes, warnings
+
+
+def _tool_definitions(tools: list[Any]) -> list[dict[str, Any]]:
+    definitions, _routes, _warnings = _tool_routes(list(tools), [])
     return definitions
 
 
@@ -355,8 +403,26 @@ def _saved_result_payload(store: ToolCallStore | None, thread_id: str | None, ar
     return result
 
 
-def _scoped_tool_arguments(name: str, arguments: dict[str, Any], athlete_id: str | None) -> dict[str, Any]:
-    if athlete_id and name != _RECALL_SAVED_TOOL_RESULT:
+def _scoped_tool_arguments(
+    name: str,
+    arguments: dict[str, Any],
+    athlete_id: str | None,
+    *,
+    catence_tools: set[str] | None = None,
+) -> dict[str, Any]:
+    """Force the selected athlete onto Catence-owned data tools.
+
+    ``catence_tools`` names the model-facing tools owned by the Catence
+    runtime; when given, tools from extra MCP servers pass through untouched.
+    Omitting it keeps the legacy behavior of scoping every tool except the
+    local recall tool.
+    """
+
+    if (
+        athlete_id
+        and name != _RECALL_SAVED_TOOL_RESULT
+        and (catence_tools is None or name in catence_tools)
+    ):
         return {**arguments, "athleteId": athlete_id}
     return arguments
 
@@ -382,12 +448,48 @@ async def _emit_reasoning_step(
         pass
 
 
+async def _report_tool_server_failures(
+    failures: Sequence[ToolServerFailure],
+    warnings: Sequence[str],
+    *,
+    parent_id: str | None = None,
+) -> None:
+    """Show configured-but-unavailable tool servers as a non-fatal step."""
+
+    for failure in failures:
+        logger.warning("Console tool server %r unavailable: %s", failure.name, failure.message)
+    for warning in warnings:
+        logger.warning("Console tool server tool skipped: %s", warning)
+    if not failures and not warnings:
+        return
+    try:
+        step = cl.Step(name="Tool servers", type="tool", default_open=False, parent_id=parent_id)
+        step.output = {
+            "unavailable": [
+                {
+                    "name": failure.name,
+                    "label": failure.label,
+                    "message": failure.message,
+                    "missingEnvironment": list(failure.missing_environment),
+                }
+                for failure in failures
+            ],
+            "warnings": list(warnings),
+        }
+        await step.send()
+    except Exception:
+        # Display is optional; ignore any context/send failure.
+        pass
+
+
 async def _invoke_tool(
-    session: ClientSession,
+    session: ClientSession | None,
     name: str,
     arguments: dict[str, Any],
     maximum_characters: int,
     *,
+    label: str = "Catence",
+    original_name: str | None = None,
     tool_call_store: ToolCallStore | None = None,
     thread_id: str | None = None,
     athlete_id: str | None = None,
@@ -399,14 +501,14 @@ async def _invoke_tool(
     # Nesting the step under its triggering user message keeps every artifact
     # of one turn attached to it, so editing that message can clean up the
     # whole subtree instead of leaving orphaned tool steps behind.
-    step = cl.Step(name=f"Catence · {name}", type="tool", default_open=False, parent_id=parent_id)
+    step = cl.Step(name=f"{label} · {name}", type="tool", default_open=False, parent_id=parent_id)
     step.input = arguments
     await step.send()
     try:
         if name == _RECALL_SAVED_TOOL_RESULT:
             payload = _saved_result_payload(tool_call_store, thread_id, arguments)
         else:
-            result = await session.call_tool(name, arguments)
+            result = await session.call_tool(original_name or name, arguments)
             payload = _tool_result_payload(result, maximum_characters)
         step.output = payload
         step.is_error = bool(payload.get("isError"))
@@ -467,6 +569,8 @@ async def respond(
     reasoning_effort: str | None,
     history: list[dict[str, Any]],
     mcp_url: str,
+    tool_servers: Mapping[str, ToolServer] | None = None,
+    tool_server_secrets: Mapping[str, str] | None = None,
     tool_round_limit: int = DEFAULT_TOOL_ROUND_LIMIT,
     tool_result_character_limit: int = DEFAULT_TOOL_RESULT_CHARACTER_LIMIT,
     tool_call_store: ToolCallStore | None = None,
@@ -487,118 +591,135 @@ async def respond(
     )
 
     try:
-        async with streamablehttp_client(mcp_url) as transport:
+        async with AsyncExitStack() as stack:
+            transport = await stack.enter_async_context(streamablehttp_client(mcp_url))
             read_stream, write_stream = transport[:2]
-            async with ClientSession(read_stream, write_stream) as session:
-                initialized = await session.initialize()
-                listed_tools = await session.list_tools()
-                tools = _tool_definitions(list(listed_tools.tools))
-                messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
-                if athlete_id:
-                    label = f" ({athlete_label})" if athlete_label else ""
-                    messages.insert(
-                        1,
-                        {
-                            "role": "system",
-                            "content": (
-                                f"This Console chat is scoped to athleteId {athlete_id!r}{label}. "
-                                "Every Catence data tool call is forced to that athlete; do not try to select or compare another athlete."
-                            ),
-                        },
-                    )
-                initialized_raw = _as_json(initialized)
-                server_instructions = initialized_raw.get("instructions") if isinstance(initialized_raw, dict) else None
-                if isinstance(server_instructions, str) and server_instructions.strip():
-                    messages.insert(1, {"role": "system", "content": f"Catence MCP server instructions:\n{server_instructions}"})
-                if tool_call_store is not None and thread_id:
-                    tool_history = _tool_history_message(tool_call_store.list(thread_id, limit=_TOOL_HISTORY_LIMIT))
-                    if tool_history:
-                        messages.insert(1, {"role": "system", "content": tool_history})
-                athlete_file = await _athlete_file_context(session, athlete_id)
-                if athlete_file:
-                    messages.insert(1, {"role": "system", "content": athlete_file})
+            session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+            initialized = await session.initialize()
+            listed_tools = await session.list_tools()
+            connections, failures = await open_tool_servers(
+                stack, tool_servers or {}, tool_server_secrets or {}
+            )
+            tools, routes, route_warnings = _tool_routes(list(listed_tools.tools), connections)
+            catence_tool_names = {
+                route_name
+                for route_name, (connection, _original) in routes.items()
+                if connection is None
+            }
+            await _report_tool_server_failures(failures, route_warnings, parent_id=step_parent_id)
+            messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+            if athlete_id:
+                label = f" ({athlete_label})" if athlete_label else ""
+                messages.insert(
+                    1,
+                    {
+                        "role": "system",
+                        "content": (
+                            f"This Console chat is scoped to athleteId {athlete_id!r}{label}. "
+                            "Every Catence data tool call is forced to that athlete; do not try to select or compare another athlete."
+                        ),
+                    },
+                )
+            initialized_raw = _as_json(initialized)
+            server_instructions = initialized_raw.get("instructions") if isinstance(initialized_raw, dict) else None
+            if isinstance(server_instructions, str) and server_instructions.strip():
+                messages.insert(1, {"role": "system", "content": f"Catence MCP server instructions:\n{server_instructions}"})
+            if tool_call_store is not None and thread_id:
+                tool_history = _tool_history_message(tool_call_store.list(thread_id, limit=_TOOL_HISTORY_LIMIT))
+                if tool_history:
+                    messages.insert(1, {"role": "system", "content": tool_history})
+            athlete_file = await _athlete_file_context(session, athlete_id)
+            if athlete_file:
+                messages.insert(1, {"role": "system", "content": athlete_file})
 
-                start_generation_sidecar(thread_id)
-                tool_calls_total = 0
-                # OpenCode Go uses this header for prompt-cache optimization, so
-                # the value must stay stable across every request of one
-                # conversation. The Chainlit thread id is that identity; the
-                # UUID fallback only covers callers without a thread.
-                opencode_session_id = thread_id or uuid4().hex
+            start_generation_sidecar(thread_id)
+            tool_calls_total = 0
+            # OpenCode Go uses this header for prompt-cache optimization, so
+            # the value must stay stable across every request of one
+            # conversation. The Chainlit thread id is that identity; the
+            # UUID fallback only covers callers without a thread.
+            opencode_session_id = thread_id or uuid4().hex
 
-                for _ in range(tool_round_limit):
-                    options: dict[str, Any] = {
-                        **profile.litellm_options(model_id),
-                        "messages": messages,
-                        "tools": tools,
-                        "tool_choice": "auto",
+            for _ in range(tool_round_limit):
+                options: dict[str, Any] = {
+                    **profile.litellm_options(model_id),
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                }
+                if profile.is_opencode_go:
+                    options["extra_headers"] = {
+                        _OPENCODE_GO_SESSION_HEADER: opencode_session_id,
+                        _OPENCODE_GO_CLIENT_HEADER: _OPENCODE_GO_CLIENT_ID,
                     }
-                    if profile.is_opencode_go:
-                        options["extra_headers"] = {
-                            _OPENCODE_GO_SESSION_HEADER: opencode_session_id,
-                            _OPENCODE_GO_CLIENT_HEADER: _OPENCODE_GO_CLIENT_ID,
-                        }
-                    if effective_reasoning_effort:
-                        options["reasoning_effort"] = effective_reasoning_effort
-                        options["allowed_openai_params"] = ["reasoning_effort"]
-                    completion = await complete(**options)
-                    message = completion.choices[0].message
-                    content = getattr(message, "content", None)
-                    tool_calls = list(getattr(message, "tool_calls", None) or [])
-                    reasoning = (
-                        getattr(message, "reasoning_content", None)
-                        or getattr(message, "reasoning", None)
-                        or getattr(message, "thinking", None)
+                if effective_reasoning_effort:
+                    options["reasoning_effort"] = effective_reasoning_effort
+                    options["allowed_openai_params"] = ["reasoning_effort"]
+                completion = await complete(**options)
+                message = completion.choices[0].message
+                content = getattr(message, "content", None)
+                tool_calls = list(getattr(message, "tool_calls", None) or [])
+                reasoning = (
+                    getattr(message, "reasoning_content", None)
+                    or getattr(message, "reasoning", None)
+                    or getattr(message, "thinking", None)
+                )
+                if reasoning:
+                    await _emit_reasoning_step(reasoning, parent_id=step_parent_id)
+                if not tool_calls:
+                    finish_generation_sidecar(
+                        thread_id, stage="completed", tool_call_count=tool_calls_total
                     )
-                    if reasoning:
-                        await _emit_reasoning_step(reasoning, parent_id=step_parent_id)
-                    if not tool_calls:
-                        finish_generation_sidecar(
-                            thread_id, stage="completed", tool_call_count=tool_calls_total
-                        )
-                        return content or "The provider finished without a written response."
+                    return content or "The provider finished without a written response."
 
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": _as_json(tool_calls),
+                    }
+                )
+                for tool_call in tool_calls:
+                    call_id, name, arguments = _tool_call_parts(tool_call)
+                    arguments = _scoped_tool_arguments(
+                        name, arguments, athlete_id, catence_tools=catence_tool_names
+                    )
+                    connection, original_name = routes.get(name, (None, name))
+                    owner = connection.session if connection is not None else session
+                    owner_label = connection.label if connection is not None else "Catence"
+                    payload = await _invoke_tool(
+                        owner,
+                        name,
+                        arguments,
+                        tool_result_character_limit,
+                        label=owner_label,
+                        original_name=original_name,
+                        tool_call_store=tool_call_store,
+                        thread_id=thread_id,
+                        athlete_id=None,
+                        parent_id=step_parent_id,
+                    )
+                    if tool_call_store is not None and thread_id and name != _RECALL_SAVED_TOOL_RESULT:
+                        tool_call_store.record(
+                            thread_id=thread_id,
+                            call_id=call_id,
+                            name=name,
+                            arguments=arguments,
+                            result=payload,
+                        )
                     messages.append(
                         {
-                            "role": "assistant",
-                            "content": content,
-                            "tool_calls": _as_json(tool_calls),
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": json.dumps(payload, ensure_ascii=False, default=str),
                         }
                     )
-                    for tool_call in tool_calls:
-                        call_id, name, arguments = _tool_call_parts(tool_call)
-                        arguments = _scoped_tool_arguments(name, arguments, athlete_id)
-                        payload = await _invoke_tool(
-                            session,
-                            name,
-                            arguments,
-                            tool_result_character_limit,
-                            tool_call_store=tool_call_store,
-                            thread_id=thread_id,
-                            athlete_id=None,
-                            parent_id=step_parent_id,
-                        )
-                        if tool_call_store is not None and thread_id and name != _RECALL_SAVED_TOOL_RESULT:
-                            tool_call_store.record(
-                                thread_id=thread_id,
-                                call_id=call_id,
-                                name=name,
-                                arguments=arguments,
-                                result=payload,
-                            )
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": call_id,
-                                "content": json.dumps(payload, ensure_ascii=False, default=str),
-                            }
-                        )
-                    tool_calls_total += len(tool_calls)
-                    update_generation_sidecar(
-                        thread_id,
-                        tool_call_count=tool_calls_total,
-                        last_tool=f"Catence · {name}",
-                    )
+                tool_calls_total += len(tool_calls)
+                update_generation_sidecar(
+                    thread_id,
+                    tool_call_count=tool_calls_total,
+                    last_tool=f"{owner_label} · {name}",
+                )
 
     except BaseExceptionGroup as group:
         raise _unwrap_exception_group(group) from None
@@ -606,4 +727,4 @@ async def respond(
     finish_generation_sidecar(
         thread_id, stage="completed", tool_call_count=tool_calls_total
     )
-    return f"I stopped after {tool_round_limit} Catence tool calls. Please narrow the question or raise the tool-round limit in settings."
+    return f"I stopped after {tool_round_limit} tool calls. Please narrow the question or raise the tool-round limit in settings."

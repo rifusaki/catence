@@ -6,7 +6,8 @@ import pytest
 from litellm.exceptions import AuthenticationError, InternalServerError, ServiceUnavailableError
 
 from catence_console import agent
-from catence_console.config import ModelOption, ProviderProfile
+from catence_console.config import ModelOption, ProviderProfile, ToolServer
+from catence_console.mcp_servers import ToolServerConnection, ToolServerFailure
 from catence_console.persistence import tool_call_store
 
 
@@ -724,3 +725,182 @@ def test_respond_injects_the_athlete_file_as_data(monkeypatch):
         message["role"] == "system" and "Athlete file (athlete-authored data" in message["content"]
         for message in messages
     )
+
+
+class _FakeExtraSession:
+    """Session double for one extra tool server; records the calls it receives."""
+
+    def __init__(self, tools):
+        self.tools = list(tools)
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_tool(self, name, arguments):
+        self.calls.append((name, arguments))
+        return {"content": [{"type": "text", "text": f"result for {name}"}]}
+
+
+def _exa_connection(tools):
+    session = _FakeExtraSession(tools)
+    connection = ToolServerConnection(name="exa", label="Exa Web Search", session=session, tools=session.tools)
+    return connection, session
+
+
+def _exa_server():
+    return ToolServer(name="exa", label="Exa Web Search", url="https://mcp.exa.ai/mcp")
+
+
+def _extra_open(monkeypatch, connections, failures=None):
+    async def fake_open(stack, servers, secrets):
+        return connections, list(failures or [])
+
+    monkeypatch.setattr(agent, "open_tool_servers", fake_open)
+
+
+def _search_tool():
+    return {"name": "web_search_exa", "description": "Search the web", "inputSchema": {"type": "object", "properties": {}}}
+
+
+def _tool_call_completion(name, arguments):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[{"id": "call-1", "function": {"name": name, "arguments": json.dumps(arguments)}}],
+                )
+            )
+        ]
+    )
+
+
+def _final_completion():
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Done.", tool_calls=[]))])
+
+
+def test_respond_offers_extra_tool_servers_and_routes_their_calls(monkeypatch):
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", FakeSession)
+    connection, session = _exa_connection([_search_tool()])
+    _extra_open(monkeypatch, [connection])
+    monkeypatch.setattr(agent.cl, "Step", _RecordingStep)
+    _RecordingStep.instances.clear()
+    captured = {}
+    completions = iter([_tool_call_completion("web_search_exa", {"query": "sub-40 10k"}), _final_completion()])
+
+    async def complete(**kwargs):
+        captured.update(kwargs)
+        return next(completions)
+
+    answer = asyncio.run(
+        agent.respond(
+            profile=ProviderProfile(id="local", label="Local", model="openai/example"),
+            model_id="default",
+            reasoning_effort=None,
+            history=[{"role": "user", "content": "Find a plan."}],
+            mcp_url="http://example.test/mcp",
+            tool_servers={"exa": _exa_server()},
+            tool_server_secrets={"EXA_API_KEY": "stored-secret"},
+            athlete_id="martina",
+            complete=complete,
+        )
+    )
+
+    assert answer == "Done."
+    names = [definition["function"]["name"] for definition in captured["tools"]]
+    assert names == ["daily_recovery_review", "web_search_exa", "recall_saved_tool_result"]
+    # The extra server never receives the Catence athlete scope.
+    assert session.calls == [("web_search_exa", {"query": "sub-40 10k"})]
+    assert [step.name for step in _RecordingStep.instances] == ["Exa Web Search · web_search_exa"]
+
+
+def test_extra_tool_names_are_namespaced_when_they_collide(monkeypatch):
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", FakeSession)
+    connection, session = _exa_connection(
+        [{"name": "daily_recovery_review", "description": "Collides", "inputSchema": {"type": "object", "properties": {}}}]
+    )
+    _extra_open(monkeypatch, [connection])
+    monkeypatch.setattr(agent.cl, "Step", _RecordingStep)
+    _RecordingStep.instances.clear()
+    captured = {}
+    completions = iter([_tool_call_completion("exa_daily_recovery_review", {}), _final_completion()])
+
+    async def complete(**kwargs):
+        captured.update(kwargs)
+        return next(completions)
+
+    answer = asyncio.run(
+        agent.respond(
+            profile=ProviderProfile(id="local", label="Local", model="openai/example"),
+            model_id="default",
+            reasoning_effort=None,
+            history=[],
+            mcp_url="http://example.test/mcp",
+            tool_servers={"exa": _exa_server()},
+            complete=complete,
+        )
+    )
+
+    assert answer == "Done."
+    names = [definition["function"]["name"] for definition in captured["tools"]]
+    assert names == ["daily_recovery_review", "exa_daily_recovery_review", "recall_saved_tool_result"]
+    # The model-facing prefix is stripped before the owning server is called.
+    assert session.calls == [("daily_recovery_review", {})]
+
+
+def test_tool_server_failures_are_reported_without_failing_the_turn(monkeypatch):
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", FakeSession)
+    failure = ToolServerFailure(
+        name="exa",
+        label="Exa Web Search",
+        message="Missing credentials: EXA_API_KEY.",
+        missing_environment=("EXA_API_KEY",),
+    )
+    _extra_open(monkeypatch, [], [failure])
+    monkeypatch.setattr(agent.cl, "Step", _RecordingStep)
+    _RecordingStep.instances.clear()
+    captured = {}
+
+    async def complete(**kwargs):
+        captured.update(kwargs)
+        return _final_completion()
+
+    answer = asyncio.run(
+        agent.respond(
+            profile=ProviderProfile(id="local", label="Local", model="openai/example"),
+            model_id="default",
+            reasoning_effort=None,
+            history=[],
+            mcp_url="http://example.test/mcp",
+            tool_servers={"exa": _exa_server()},
+            step_parent_id="user-message-1",
+            complete=complete,
+        )
+    )
+
+    assert answer == "Done."
+    steps = [step for step in _RecordingStep.instances if step.name == "Tool servers"]
+    assert len(steps) == 1
+    assert steps[0].parent_id == "user-message-1"
+    assert steps[0].output["unavailable"] == [
+        {
+            "name": "exa",
+            "label": "Exa Web Search",
+            "message": "Missing credentials: EXA_API_KEY.",
+            "missingEnvironment": ["EXA_API_KEY"],
+        }
+    ]
+    names = [definition["function"]["name"] for definition in captured["tools"]]
+    assert names == ["daily_recovery_review", "recall_saved_tool_result"]
+
+
+def test_scoped_arguments_only_touch_catence_tools_when_restricted():
+    catence_tools = {"read_series"}
+
+    assert agent._scoped_tool_arguments(
+        "web_search_exa", {"query": "x"}, "alex", catence_tools=catence_tools
+    ) == {"query": "x"}
+    assert agent._scoped_tool_arguments("read_series", {}, "alex", catence_tools=catence_tools) == {
+        "athleteId": "alex"
+    }

@@ -8,6 +8,7 @@ from catence_console.config import (
     ConsoleConfigurationError,
     ProviderProfile,
     load_console_configuration,
+    referenced_environment,
     write_provider_setup,
 )
 from catence_console.app import _chat_settings, _configured_preferences, _limit_setting, _normalized_preferences, _session_settings
@@ -602,4 +603,85 @@ def test_rejects_invalid_model_variants(tmp_path, variants):
     )
 
     with pytest.raises(ConsoleConfigurationError, match="variants"):
+        load_console_configuration(tmp_path)
+
+
+def test_parses_tool_servers_with_labels_headers_and_environment_references(tmp_path):
+    write_config(
+        tmp_path,
+        {
+            "profiles": {"local": {"model": "openai/example"}},
+            "mcpServers": {
+                "exa": {
+                    "url": "https://mcp.exa.ai/mcp",
+                    "headers": {"x-api-key": "$EXA_API_KEY"},
+                },
+                "weather": {
+                    "label": "Weather",
+                    "url": "https://weather.example.test/mcp",
+                },
+            },
+        },
+    )
+
+    configuration = load_console_configuration(tmp_path)
+
+    exa = configuration.tool_servers["exa"]
+    assert exa.name == "exa"
+    assert exa.label == "exa"
+    assert exa.url == "https://mcp.exa.ai/mcp"
+    assert exa.headers == {"x-api-key": "$EXA_API_KEY"}
+    assert referenced_environment(exa) == ("EXA_API_KEY",)
+    weather = configuration.tool_servers["weather"]
+    assert weather.label == "Weather"
+    assert weather.headers == {}
+    assert referenced_environment(weather) == ()
+
+
+def test_tool_servers_default_to_an_empty_map(tmp_path):
+    write_config(tmp_path, {"profiles": {"local": {"model": "openai/example"}}})
+
+    assert load_console_configuration(tmp_path).tool_servers == {}
+
+
+def test_tool_server_environment_references_are_deduplicated_in_order(tmp_path):
+    write_config(
+        tmp_path,
+        {
+            "profiles": {"local": {"model": "openai/example"}},
+            "mcpServers": {
+                "exa": {
+                    "url": "https://mcp.exa.ai/mcp?exaApiKey=${EXA_API_KEY}&again=$EXA_API_KEY",
+                    "headers": {"x-api-key": "$EXA_API_KEY", "x-other": "${OTHER_KEY}"},
+                }
+            },
+        },
+    )
+
+    server = load_console_configuration(tmp_path).tool_servers["exa"]
+
+    assert referenced_environment(server) == ("EXA_API_KEY", "OTHER_KEY")
+
+
+@pytest.mark.parametrize(
+    "servers, match",
+    [
+        ([], "mcpServers"),
+        ({"bad name": {"url": "https://example.test/mcp"}}, "names must start"),
+        ({"exa": {"url": ""}}, r"\.url must be a non-empty string"),
+        ({"exa": {"url": "ftp://example.test/mcp"}}, r"\.url must be an http"),
+        ({"exa": {"url": "https://example.test/mcp", "command": "npx"}}, "unsupported fields"),
+        ({"exa": {"url": "https://example.test/mcp", "label": ""}}, r"\.label must be a non-empty string"),
+        ({"exa": {"url": "https://example.test/mcp", "headers": []}}, r"\.headers"),
+        ({"exa": {"url": "https://example.test/mcp", "headers": {"": "value"}}}, "headers names"),
+        ({"exa": {"url": "https://example.test/mcp", "headers": {"x-api-key": 7}}}, "headers values"),
+    ],
+)
+def test_rejects_invalid_tool_servers(tmp_path, servers, match):
+    write_config(
+        tmp_path,
+        {"profiles": {"local": {"model": "openai/example"}}, "mcpServers": servers},
+    )
+
+    with pytest.raises(ConsoleConfigurationError, match=match):
         load_console_configuration(tmp_path)

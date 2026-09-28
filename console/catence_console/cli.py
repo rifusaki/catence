@@ -31,8 +31,13 @@ from .accounts import (
     update_account,
 )
 from .auth import missing_auth_environment, validate_auth_configuration
-from .config import ConsoleConfigurationError, load_console_configuration, missing_environment
+from .config import ConsoleConfigurationError, load_console_configuration, missing_environment, referenced_environment
 from .release import CATENCE_PROTOCOL_VERSION, CATENCE_RELEASE_VERSION
+from .tool_server_secrets import (
+    ToolServerSecretsStoreError,
+    default_tool_server_secrets_path,
+    load_tool_server_secrets,
+)
 
 
 def _json_output(value: object) -> None:
@@ -108,6 +113,28 @@ def doctor(catalog_home: Path, mcp_url: str) -> int:
             )
         report["defaultProfile"] = configuration.default_profile
         report["profiles"] = profiles
+        try:
+            tool_server_secrets = load_tool_server_secrets(default_tool_server_secrets_path(catalog_home))
+        except ToolServerSecretsStoreError as error:
+            report["toolServerSecretsError"] = str(error)
+            tool_server_secrets = {}
+        tool_servers = []
+        for server in configuration.tool_servers.values():
+            missing = [
+                name
+                for name in referenced_environment(server)
+                if not tool_server_secrets.get(name) and not os.environ.get(name)
+            ]
+            tool_servers.append(
+                {
+                    "id": server.name,
+                    "label": server.label,
+                    "url": server.url,
+                    "missingEnvironment": missing,
+                    "ready": not missing,
+                }
+            )
+        report["toolServers"] = tool_servers
     except ConsoleConfigurationError as error:
         report["configurationError"] = str(error)
         _json_output(report)
