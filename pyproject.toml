@@ -15,7 +15,7 @@ dependencies = [
 
 [tool.uv.sources]
 # fork commit
-garminconnect = { git = "https://github.com/rifusaki/python-garminconnect.git", rev = "cd4e3d9ef81a93681950138e08f57af226fd5735" }
+garminconnect = { git = "https://github.com/rifusaki/python-garminconnect.git", rev = "38b3d5003ae348de384f679976d0527316775f94" }
 
 [tool.uv]
 package = false
