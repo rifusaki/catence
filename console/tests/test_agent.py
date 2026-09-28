@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -37,7 +38,12 @@ class FakeSession:
                     "name": "daily_recovery_review",
                     "description": "Review recovery",
                     "inputSchema": {"type": "object", "properties": {}},
-                }
+                },
+                {
+                    "name": "list_athletes",
+                    "description": "List athletes",
+                    "inputSchema": {"type": "object", "properties": {}},
+                },
             ]
         )
 
@@ -106,7 +112,10 @@ def test_respond_normalizes_mcp_tools_for_litellm(monkeypatch):
             "parameters": {"type": "object", "properties": {}},
         },
     }
-    assert captured["tools"][1]["function"]["name"] == "recall_saved_tool_result"
+    assert [tool["function"]["name"] for tool in captured["tools"]] == [
+        "daily_recovery_review",
+        "recall_saved_tool_result",
+    ]
 
 
 def test_respond_never_sends_reasoning_effort_for_disabled_models(monkeypatch):
@@ -206,12 +215,106 @@ def test_tool_result_limit_marks_truncated_evidence():
     assert "20" in payload["message"]
 
 
+def test_tool_result_limit_keeps_classified_errors():
+    result = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "data": None,
+                        "error": {
+                            "code": "invalid_request",
+                            "message": "Read-only query failed: Binder Error: Ambiguous reference to column name \"activity_source_id\"",
+                        },
+                    }
+                ),
+            }
+        ],
+        "isError": True,
+    }
+
+    payload = agent._tool_result_payload(result, maximum_characters=10)
+
+    assert payload["isError"] is True
+    assert payload["truncated"] is True
+    assert payload["originalCharacters"] > 10
+    assert payload["error"]["code"] == "invalid_request"
+    assert "Ambiguous reference" in payload["error"]["message"]
+    assert payload["message"] == payload["error"]["message"]
+
+
+def test_tool_result_limit_caps_retained_error_message():
+    result = {
+        "content": [
+            {"type": "text", "text": json.dumps({"error": {"message": "y" * (agent._TRUNCATED_ERROR_MESSAGE_CHARACTERS + 50)}})},
+        ],
+        "isError": True,
+    }
+
+    payload = agent._tool_result_payload(result, maximum_characters=10)
+
+    assert payload["error"]["message"].endswith("…")
+    assert len(payload["error"]["message"]) == agent._TRUNCATED_ERROR_MESSAGE_CHARACTERS + 1
+
+
+def test_tool_definitions_hide_the_console_roster_listing():
+    definitions = agent._tool_definitions(
+        [
+            {"name": "list_athletes", "description": "List athletes", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "read_series", "description": "Read a series", "inputSchema": {"type": "object", "properties": {}}},
+        ]
+    )
+
+    assert [definition["function"]["name"] for definition in definitions] == ["read_series", "recall_saved_tool_result"]
+
+
 def test_selected_athlete_overrides_model_supplied_scope_for_data_tools():
     assert agent._scoped_tool_arguments("read_series", {"athleteId": "other", "dataset": "daily"}, "alex") == {
         "athleteId": "alex",
         "dataset": "daily",
     }
-    assert agent._scoped_tool_arguments("list_athletes", {}, "alex") == {}
+    # The roster listing is hidden from the model, but would still be scoped.
+    assert agent._scoped_tool_arguments("list_athletes", {}, "alex") == {"athleteId": "alex"}
+    assert agent._scoped_tool_arguments("recall_saved_tool_result", {"callId": "call-1"}, "alex") == {"callId": "call-1"}
+
+
+def test_respond_system_scope_message_names_the_selected_athlete(monkeypatch):
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", FakeSession)
+
+    def scope_messages(**overrides):
+        captured = {}
+
+        async def complete(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Done.", tool_calls=[]))])
+
+        asyncio.run(
+            agent.respond(
+                profile=ProviderProfile(id="local", label="Local", model="openai/example"),
+                model_id="default",
+                reasoning_effort=None,
+                history=[],
+                mcp_url="http://example.test/mcp",
+                complete=complete,
+                **overrides,
+            )
+        )
+        return [
+            message["content"]
+            for message in captured["messages"]
+            if message["role"] == "system" and "scoped to athleteId" in message["content"]
+        ]
+
+    assert scope_messages(athlete_id="martina", athlete_label="Martina") == [
+        "This Console chat is scoped to athleteId 'martina' (Martina). "
+        "Every Catence data tool call is forced to that athlete; do not try to select or compare another athlete."
+    ]
+    assert scope_messages(athlete_id="martina") == [
+        "This Console chat is scoped to athleteId 'martina'. "
+        "Every Catence data tool call is forced to that athlete; do not try to select or compare another athlete."
+    ]
 
 
 def test_respond_passes_mcp_instructions_and_saved_call_context_to_the_model(monkeypatch, tmp_path):
@@ -497,3 +600,127 @@ def test_describe_failure_unknown_error_keeps_the_doctor_hint():
 
     assert "boom" in message
     assert "doctor" in message
+
+
+def test_athlete_file_context_returns_a_fenced_athlete_authored_block():
+    class Session:
+        async def call_tool(self, name, arguments):
+            assert name == "get_athlete_file"
+            assert arguments == {"athleteId": "alex"}
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "data": {
+                                    "exists": True,
+                                    "content": "# Athlete file\n\n## Goals\n\n- Sub-40 10K",
+                                    "hash": "abc",
+                                    "updatedAt": "2026-01-01T00:00:00Z",
+                                }
+                            }
+                        ),
+                    }
+                ]
+            }
+
+    context = asyncio.run(agent._athlete_file_context(Session(), "alex"))
+
+    assert context is not None
+    assert "```markdown" in context
+    assert "Sub-40 10K" in context
+    assert "athlete-authored data" in context
+
+
+def test_athlete_file_context_caps_long_content():
+    long_content = "x" * (agent._ATHLETE_FILE_CONTEXT_CHARACTERS + 100)
+
+    class Session:
+        async def call_tool(self, name, arguments):
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"data": {"exists": True, "content": long_content, "hash": "abc", "updatedAt": None}}),
+                    }
+                ]
+            }
+
+    context = asyncio.run(agent._athlete_file_context(Session(), None))
+
+    assert context is not None
+    assert f"{'x' * agent._ATHLETE_FILE_CONTEXT_CHARACTERS}…" in context
+    assert "x" * (agent._ATHLETE_FILE_CONTEXT_CHARACTERS + 1) not in context
+
+
+def test_athlete_file_context_missing_file_returns_create_hint():
+    class Session:
+        async def call_tool(self, name, arguments):
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({"data": {"exists": False, "content": "# Athlete file", "hash": None, "updatedAt": None}}),
+                    }
+                ]
+            }
+
+    context = asyncio.run(agent._athlete_file_context(Session(), "alex"))
+
+    assert context is not None
+    assert "does not exist yet" in context
+    assert "update_athlete_file" in context
+
+
+def test_athlete_file_context_failures_stay_silent():
+    class Session:
+        async def call_tool(self, name, arguments):
+            raise RuntimeError("mcp unavailable")
+
+    assert asyncio.run(agent._athlete_file_context(Session(), "alex")) is None
+
+
+def test_respond_injects_the_athlete_file_as_data(monkeypatch):
+    athlete_file_result = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {"data": {"exists": True, "content": "# Athlete file\n\n## Goals\n\n- Sub-40 10K", "hash": "abc", "updatedAt": None}}
+                ),
+            }
+        ]
+    }
+
+    class InjectionSession(FakeSession):
+        async def call_tool(self, name, arguments):
+            return athlete_file_result
+
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", InjectionSession)
+
+    captured: dict[str, object] = {}
+
+    async def complete(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Done.", tool_calls=[]))])
+
+    answer = asyncio.run(
+        agent.respond(
+            profile=_profile(),
+            model_id="default",
+            reasoning_effort=None,
+            history=[{"role": "user", "content": "What should I focus on next?"}],
+            mcp_url="http://example.test/mcp",
+            athlete_id="alex",
+            complete=complete,
+        )
+    )
+
+    assert answer == "Done."
+    messages = captured["messages"]
+    assert any(
+        message["role"] == "system" and "Athlete file (athlete-authored data" in message["content"]
+        for message in messages
+    )
