@@ -1,6 +1,6 @@
 {
-  "version": "0.2.1-beta.10",
-  "pythonVersion": "0.2.1b7",
+  "version": "0.2.1-beta.11",
+  "pythonVersion": "0.2.1b8",
   "chainlitVersion": "0.2.5b1",
   "channel": "beta",
   "protocolVersion": 1,
