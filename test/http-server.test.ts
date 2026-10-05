@@ -1,11 +1,13 @@
 import type { AddressInfo } from 'node:net';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CATENCE_PROTOCOL_VERSION, CATENCE_RUNTIME_VERSION } from '../src/contracts/release.js';
 import { createCatenceHttpServer } from '../src/interfaces/http/server.js';
-import { startDetachedSync, ATHLETE_FILE_TEMPLATE, type DetachedSyncHandle, type DetachedSyncRequest } from '../src/runtime/index.js';
+import { initializeCatalog, resolveCatalogPaths, startDetachedSync, ATHLETE_FILE_TEMPLATE, type DetachedSyncHandle, type DetachedSyncRequest } from '../src/runtime/index.js';
 import { temporaryDatabase } from './helpers.js';
 
 const servers: Array<ReturnType<typeof createCatenceHttpServer>> = [];
@@ -79,6 +81,66 @@ describe('Catence Streamable HTTP server', () => {
 
     const invalidDashboard = await fetch(`${origin}/api/v1/dashboard?days=0`);
     expect(invalidDashboard.status).toBe(400);
+  });
+
+  it('creates catalog athletes through POST /api/v1/athletes', async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'catence-athletes-http-'));
+    const catalogPaths = resolveCatalogPaths(home);
+    await initializeCatalog(catalogPaths, { id: 'alex', label: 'Alex' });
+    const server = createCatenceHttpServer({ catalogPaths });
+    servers.push(server);
+    const origin = await listen(server);
+
+    const roster = await fetch(`${origin}/api/v1/athletes`);
+    expect(roster.status).toBe(200);
+    await expect(roster.json()).resolves.toMatchObject({
+      defaultAthleteId: 'alex',
+      athletes: [{ id: 'alex', label: 'Alex' }],
+    });
+
+    const invalid = await fetch(`${origin}/api/v1/athletes`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'Not Valid', label: 'Nobody' }),
+    });
+    expect(invalid.status).toBe(400);
+    await expect(invalid.json()).resolves.toMatchObject({ error: { code: 'athlete_create_failed' } });
+
+    const created = await fetch(`${origin}/api/v1/athletes`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'sam', label: 'Sam', setDefault: true }),
+    });
+    expect(created.status).toBe(201);
+    await expect(created.json()).resolves.toMatchObject({
+      defaultAthleteId: 'sam',
+      athletes: [
+        { id: 'alex', label: 'Alex' },
+        { id: 'sam', label: 'Sam' },
+      ],
+    });
+
+    const duplicate = await fetch(`${origin}/api/v1/athletes`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'sam', label: 'Sam again' }),
+    });
+    expect(duplicate.status).toBe(409);
+    await expect(duplicate.json()).resolves.toMatchObject({ error: { code: 'athlete_exists' } });
+
+    // A single-store (legacy) server has no catalog to extend.
+    const legacyFixture = await temporaryDatabase();
+    await legacyFixture.database.close();
+    const legacy = createCatenceHttpServer({ paths: legacyFixture.paths });
+    servers.push(legacy);
+    const legacyOrigin = await listen(legacy);
+    const rejected = await fetch(`${legacyOrigin}/api/v1/athletes`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'sam', label: 'Sam' }),
+    });
+    expect(rejected.status).toBe(400);
+    await expect(rejected.json()).resolves.toMatchObject({ error: { code: 'catalog_required' } });
   });
 
   it('starts detached syncs and reports progress plus last-completion timestamps', async () => {

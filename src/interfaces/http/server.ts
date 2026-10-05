@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import path from 'node:path';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
+  addAthlete,
   AthleteFileConflictError,
   AthleteFileTooLargeError,
   AthleteFileValidationError,
@@ -153,6 +154,24 @@ function parseSyncBody(body: unknown): SyncRequestBody {
     if (raw[flag] !== undefined && typeof raw[flag] !== 'boolean') throw new Error(`${flag} must be a boolean.`);
   }
   return raw as SyncRequestBody;
+}
+
+type AthleteCreateBody = {
+  id: string;
+  label: string;
+  setDefault: boolean;
+};
+
+function parseAthleteCreateBody(body: unknown): AthleteCreateBody {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new Error('Request body must be a JSON object.');
+  const raw = body as Record<string, unknown>;
+  for (const key of Object.keys(raw)) {
+    if (!['id', 'label', 'setDefault'].includes(key)) throw new Error(`Unknown athlete field: ${key}.`);
+  }
+  if (typeof raw.id !== 'string' || !raw.id.trim()) throw new Error('id is required.');
+  if (typeof raw.label !== 'string' || !raw.label.trim()) throw new Error('label is required.');
+  if (raw.setDefault !== undefined && typeof raw.setDefault !== 'boolean') throw new Error('setDefault must be a boolean.');
+  return { id: raw.id.trim(), label: raw.label.trim(), setDefault: raw.setDefault === true };
 }
 
 type AthleteFileBody = {
@@ -332,6 +351,33 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           json(response, 200, { defaultAthleteId: catalog.defaultAthleteId, athletes: catalog.athletes });
         } catch (error) {
           json(response, 400, { error: { code: 'catalog_unavailable', message: error instanceof Error ? error.message : String(error) } });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/athletes' && request.method === 'POST') {
+        if (!catalogPaths) {
+          json(response, 400, {
+            error: {
+              code: 'catalog_required',
+              message: 'Adding athletes requires a Catence catalog; this server uses a single legacy data store.',
+            },
+          });
+          return;
+        }
+        try {
+          const body = parseAthleteCreateBody(await readJsonBody(request));
+          const catalog = await loadCatalog(catalogPaths);
+          if (catalog.athletes.some((athlete) => athlete.id === body.id)) {
+            json(response, 409, { error: { code: 'athlete_exists', message: `Athlete ${body.id} already exists.` } });
+            return;
+          }
+          const updated = await addAthlete(catalogPaths, body);
+          json(response, 201, { defaultAthleteId: updated.defaultAthleteId, athletes: updated.athletes });
+        } catch (error) {
+          json(response, 400, {
+            error: { code: 'athlete_create_failed', message: error instanceof Error ? error.message : String(error) },
+          });
         }
         return;
       }
