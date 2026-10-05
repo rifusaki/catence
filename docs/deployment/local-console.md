@@ -136,7 +136,7 @@ catence-console doctor
 
 ### Manage models in the Console
 
-The **Models** page (header button) manages the model list without editing
+The **Settings → Models** tab manages the model list without editing
 `config.json` by hand:
 
 - Enable/disable toggles hide models from the chat's Model dropdown. Disabled
@@ -152,11 +152,25 @@ The **Models** page (header button) manages the model list without editing
   strict parser used at startup before it replaces the file, and secrets stay
   forbidden (only environment-variable names are ever stored).
 
-The dashboard header has a **Sync data** button that starts the same detached
+**Settings → Status** has a **Sync data** button that starts the same detached
 sync as `catence-data sync --provider all` through the authenticated Console
 origin, shows live progress while the run is active, and displays the last
-completed sync afterwards. Each manual sync also refreshes OpenCode Go model
-profiles first; a discovery failure never blocks the data sync.
+completed sync afterwards; the Dashboard keeps a read-only “Syncing…” pill and
+links there when a write lock makes its data unavailable. Each manual sync also
+refreshes OpenCode Go model profiles first; a discovery failure never blocks the
+data sync.
+
+### Add athletes in the Console
+
+Admins can add a catalog athlete from **Settings → Athletes** (athlete id,
+display name, and optionally “set as default”). The form calls the runtime's
+`POST /api/v1/athletes` through the Console, which rejects members with
+`403 admin_required` and otherwise performs the same catalog write as
+`catence-data athlete add --id <id> --label <label>`. The id must match
+`^[a-z][a-z0-9-]{0,62}$` and must not already exist (`409 athlete_exists`);
+single-store runtimes without a catalog refuse with `400 catalog_required`.
+The roster refreshes immediately, so a new athlete can be granted to members
+and selected in chat without restarting the Console.
 
 ## Console accounts
 
@@ -266,10 +280,12 @@ per-account grants at the login, then server-owned scoping per chat.
   announces *"This chat is scoped to athlete **<id>**."*
 - `list_athletes` is exempt from forcing so the roster can be rendered.
 
-The dashboard is fetched through the authenticated Console origin: Chainlit
-middleware proxies `GET /api/v1/dashboard` and `GET /api/v1/athletes` to the
-runtime only when the Console's JWT cookie is valid (otherwise 401), so raw
-port 8787 does not need to be exposed.
+Console pages and chats reach the runtime through the authenticated Console
+origin: Chainlit middleware proxies the Console's API surface — `GET
+/api/v1/dashboard`, `GET`/`POST /api/v1/athletes` (POST is admin-only), `GET
+/api/v1/threads/<id>/generation`, and the models, accounts, tool-server, and
+sync routes — to the runtime only when the Console's JWT cookie is valid
+(otherwise 401), so raw port 8787 does not need to be exposed.
 
 ## Model discovery (OpenCode Go)
 
@@ -288,8 +304,8 @@ disappeared from the live catalog.
 npm run discover:opencode-go -- --write ~/.catence/config.json
 ```
 
-Inside the Console's Models page, **Discover OpenCode Go models** runs the
-same merge for the current home without touching athlete data (runtime route
+Inside **Settings → Models**, **Discover OpenCode Go models** runs the same
+merge for the current home without touching athlete data (runtime route
 `POST /api/v1/models/discover`, proxied behind the Console login). Models can
 also be edited in place there — the update action rewrites the `console`
 section atomically and never stores secret values.

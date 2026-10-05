@@ -303,6 +303,10 @@ By default it is loopback-only. `CATENCE_HTTP_HOST` and `CATENCE_HTTP_PORT`
 override the host and port when the flags are omitted.
 
 - `GET /api/v1/athletes` returns IDs and labels only.
+- `POST /api/v1/athletes` creates a catalog athlete from
+  `{"id": "sam", "label": "Sam", "setDefault": false}` and answers with the
+  updated roster; duplicate ids are refused with `409 athlete_exists`, and
+  single-store runtimes without a catalog with `400 catalog_required`.
 - `GET /api/v1/dashboard` requires `athleteId`, for example
   `http://127.0.0.1:8787/api/v1/dashboard?athleteId=alex&days=28` (`endDate`
   is an optional `YYYY-MM-DD`; `days` ranges 1-90 and defaults to 28).

@@ -203,10 +203,10 @@ of the live catalog are pruned from the managed profiles, so the Console never
 offers a route the gateway no longer serves; if a pruned model was the
 profile's default, discovery selects a current one instead.
 
-You do not have to run the script manually: the Console dashboard's **Sync
-data** button (and `POST /api/v1/sync` with `"refreshModels": true`) refreshes
-these profiles from the live catalog before starting a data sync, and the
-Models page's **Discover OpenCode Go models** button (or
+You do not have to run the script manually: the **Sync data** button in
+**Settings → Status** (and `POST /api/v1/sync` with `"refreshModels": true`)
+refreshes these profiles from the live catalog before starting a data sync, and
+the **Discover OpenCode Go models** button in **Settings → Models** (or
 `POST /api/v1/models/discover`) refreshes them without syncing anything.
 Discovery failures — offline machine, catalog unreachable — are reported as a
 warning and never block or fail the sync itself.

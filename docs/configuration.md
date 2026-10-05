@@ -194,7 +194,7 @@ Allowed entry fields (strict):
 
 `url` and header values may reference credentials as `$NAME` or `${NAME}`.
 References resolve from the Console credential store first (the admin
-**Accounts** page), then the process environment, so a key can be entered
+**Settings → Accounts** tab), then the process environment, so a key can be entered
 after the runtime has started and applies to the next chat turn. A server
 whose credentials are missing is skipped with a warning step; other servers
 and Catence itself keep working. Tool names from extra servers are used as-is
@@ -206,8 +206,8 @@ The hosted Exa server (`https://mcp.exa.ai/mcp`) also works without a key
 Add `?tools=…` to the URL to expose a different tool set, e.g.
 `https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa`.
 
-The **Accounts** page (admin only) lists each configured server and its
-credential readiness, and lets an admin save or clear values without
+The **Settings → Accounts** tab (admin only) lists each configured server and
+its credential readiness, and lets an admin save or clear values without
 restarting the Console. Stored values live in
 `<data directory>/console/tool_server_secrets.json` (mode 0600) and take
 precedence over the process environment. `catence-console doctor` reports each
@@ -264,6 +264,8 @@ Resolution order per field: `providers.json` → `CATENCE_ATHLETE_<ID>_<VAR>` �
 | `CATENCE_HOME` | Data home served by the Console (default `~/.catence`) |
 | `CATENCE_MCP_URL` | MCP endpoint for the Console (default `http://127.0.0.1:8787/mcp`; when unset the Console auto-starts a runtime) |
 | `CATENCE_CONSOLE_HOST` | Default for `--ui-host` (`127.0.0.1`) |
+| `CATENCE_MODEL_CALL_TIMEOUT_SECONDS` | Per-model-call timeout while a generation runs (default `600`); a hung provider call fails the turn with a notice instead of blocking forever |
+| `CATENCE_MODEL_CALL_HEARTBEAT_SECONDS` | How often a running generation refreshes its progress sidecar while awaiting the provider (default `20`); keeps a live long call from being misreported as stalled |
 
 ### Model providers
 
