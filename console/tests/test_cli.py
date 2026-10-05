@@ -368,13 +368,14 @@ def test_users_commands_accept_an_explicit_home(monkeypatch, tmp_path):
 # --------------------------------------------------------------------- doctor
 
 
-def write_console_config(tmp_path, tool_servers):
+def write_console_config(tmp_path, tool_servers, *, default_tool_servers=True):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
                 "console": {
                     "profiles": {"local": {"model": "openai/example"}},
                     "mcpServers": tool_servers,
+                    "defaultToolServers": default_tool_servers,
                 }
             }
         ),
@@ -466,8 +467,27 @@ def test_doctor_reports_a_broken_credential_store_without_failing(monkeypatch, t
     assert result == 0
 
 
-def test_doctor_without_tool_servers_reports_an_empty_list(monkeypatch, tmp_path, capsys):
+def test_doctor_reports_the_default_tool_server(monkeypatch, tmp_path, capsys):
     write_console_config(tmp_path, {})
+    prepare_doctor(monkeypatch, tmp_path)
+
+    result = cli.doctor(tmp_path, "http://127.0.0.1:8787/mcp")
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["toolServers"] == [
+        {
+            "id": "exa",
+            "label": "Exa Web Search",
+            "url": "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa",
+            "missingEnvironment": [],
+            "ready": True,
+        }
+    ]
+    assert result == 0
+
+
+def test_doctor_can_opt_out_of_default_tool_servers(monkeypatch, tmp_path, capsys):
+    write_console_config(tmp_path, {}, default_tool_servers=False)
     prepare_doctor(monkeypatch, tmp_path)
 
     result = cli.doctor(tmp_path, "http://127.0.0.1:8787/mcp")

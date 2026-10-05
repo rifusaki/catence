@@ -155,6 +155,28 @@ def test_tool_servers_overview_lists_servers_and_credential_readiness(tool_serve
     }
 
 
+def test_tool_servers_overview_includes_the_default_exa_server(tmp_path, monkeypatch):
+    _prepare_home(tmp_path, monkeypatch, accounts=True)
+    (tmp_path / "config.json").write_text(
+        json.dumps({"console": {"profiles": {"local": {"model": "openai/example"}}}}),
+        encoding="utf-8",
+    )
+
+    response = client_for("coach").get("/api/v1/tool-servers")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "servers": [
+            {
+                "name": "exa",
+                "label": "Exa Web Search",
+                "url": "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa",
+                "secrets": [],
+            }
+        ]
+    }
+
+
 def test_tool_servers_overview_reports_console_and_environment_sources(tool_servers_home, monkeypatch):
     secrets_path = default_tool_server_secrets_path(tool_servers_home)
     secrets_path.parent.mkdir(parents=True, exist_ok=True)

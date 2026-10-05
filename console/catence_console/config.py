@@ -93,6 +93,20 @@ class ToolServer:
     headers: dict[str, str] = field(default_factory=dict)
 
 
+# The Console ships one extra tool server out of the box: the hosted Exa MCP
+# endpoint works without an API key (rate limited), and pinning the two tools
+# keeps the exposed set stable. ``console.mcpServers.exa`` overrides this entry
+# wholesale (for example to attach a key), and ``console.defaultToolServers:
+# false`` removes it.
+DEFAULT_TOOL_SERVERS: dict[str, ToolServer] = {
+    "exa": ToolServer(
+        name="exa",
+        label="Exa Web Search",
+        url="https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa",
+    )
+}
+
+
 def referenced_environment(server: ToolServer) -> tuple[str, ...]:
     """Environment variable names referenced by a tool server, in order, deduplicated."""
 
@@ -344,11 +358,20 @@ def parse_console_configuration(root: Any) -> ConsoleConfiguration:
     """Validate an already-decoded ``config.json`` root object."""
 
     console = _object(root.get("console"), "console")
-    unknown_console_fields = set(console) - {"defaultProfile", "profiles", "limits", "mcpServers"}
+    unknown_console_fields = set(console) - {
+        "defaultProfile",
+        "profiles",
+        "limits",
+        "mcpServers",
+        "defaultToolServers",
+    }
     if unknown_console_fields:
         raise ConsoleConfigurationError(
             f"console contains unsupported fields: {', '.join(sorted(unknown_console_fields))}."
         )
+    default_tool_servers = console.get("defaultToolServers", True)
+    if not isinstance(default_tool_servers, bool):
+        raise ConsoleConfigurationError("console.defaultToolServers must be a boolean.")
     raw_profiles = _object(console.get("profiles"), "console.profiles")
     if not raw_profiles:
         raise ConsoleConfigurationError("console.profiles must contain at least one named profile.")
@@ -421,17 +444,21 @@ def parse_console_configuration(root: Any) -> ConsoleConfiguration:
         default_profile=default_profile,
         profiles=profiles,
         limits=_limits(console.get("limits")),
-        tool_servers=_tool_servers(console.get("mcpServers")),
+        tool_servers=_tool_servers(console.get("mcpServers"), include_defaults=default_tool_servers),
     )
 
 
-def _tool_servers(value: Any) -> dict[str, ToolServer]:
-    """Validate the ``console.mcpServers`` map of extra HTTP MCP servers."""
+def _tool_servers(value: Any, *, include_defaults: bool = True) -> dict[str, ToolServer]:
+    """Validate ``console.mcpServers``, merged over the built-in defaults.
 
+    A user entry with the same name replaces the default server wholesale, so
+    ``exa`` can be re-pointed or given credentials without touching the rest.
+    """
+
+    servers: dict[str, ToolServer] = dict(DEFAULT_TOOL_SERVERS) if include_defaults else {}
     if value is None:
-        return {}
+        return servers
     raw_servers = _object(value, "console.mcpServers")
-    servers: dict[str, ToolServer] = {}
     for name, raw_server in raw_servers.items():
         if not isinstance(name, str) or not TOOL_SERVER_NAME.match(name):
             raise ConsoleConfigurationError(

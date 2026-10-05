@@ -96,6 +96,7 @@ The Console model configuration. `defaultProfile` must name one of
   "console": {
     "defaultProfile": "openai",
     "limits": { "toolRounds": 8, "toolResultCharacters": 24000 },
+    "defaultToolServers": true,
     "mcpServers": { … },
     "profiles": { … }
   }
@@ -169,20 +170,38 @@ replaced.
 
 ### `console.mcpServers`
 
-Extra MCP tool servers the Console agent connects to alongside the Catence
-runtime. This is how the Console gains capabilities Catence does not provide,
-such as web search. HTTP (Streamable HTTP) servers only; each entry is keyed by
-a short server name used in tool step labels.
+MCP tool servers the Console agent connects to alongside the Catence runtime.
+This is how the Console gains capabilities Catence does not provide, such as web
+search. HTTP (Streamable HTTP) servers only; each entry is keyed by a short
+server name used in tool step labels.
+
+The Console ships one default entry, **Exa Web Search** — the hosted endpoint
+works without a key (rate-limited), so search is available out of the box:
 
 ```jsonc
 "mcpServers": {
   "exa": {
     "label": "Exa Web Search",
-    "url": "https://mcp.exa.ai/mcp",
+    "url": "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa"
+  }
+}
+```
+
+To use an Exa API key instead (higher limits), add an `exa` entry of your own —
+it replaces the built-in one wholesale:
+
+```jsonc
+"mcpServers": {
+  "exa": {
+    "label": "Exa Web Search",
+    "url": "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa",
     "headers": { "x-api-key": "$EXA_API_KEY" }
   }
 }
 ```
+
+Set `"defaultToolServers": false` in the `console` section to remove the
+built-in server entirely.
 
 Allowed entry fields (strict):
 
@@ -199,17 +218,14 @@ after the runtime has started and applies to the next chat turn. A server
 whose credentials are missing is skipped with a warning step; other servers
 and Catence itself keep working. Tool names from extra servers are used as-is
 unless they collide with a Catence tool, in which case they are prefixed with
-the server name (`exa_web_search_exa`).
+the server name (`exa_web_search_exa`). The built-in default deliberately
+references no environment variable: a missing credential would mark it unready
+and skip it, so a key is attached by overriding `exa` as shown above.
 
-The hosted Exa server (`https://mcp.exa.ai/mcp`) also works without a key
-(rate-limited) and offers `web_search_exa` and `web_fetch_exa` by default.
-Add `?tools=…` to the URL to expose a different tool set, e.g.
-`https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa`.
-
-The **Settings → Accounts** tab (admin only) lists each configured server and
-its credential readiness, and lets an admin save or clear values without
-restarting the Console. Stored values live in
-`<data directory>/console/tool_server_secrets.json` (mode 0600) and take
+The **Settings → Accounts** tab (admin only) lists each configured server
+(including the built-in Exa entry) and its credential readiness, and lets an
+admin save or clear values without restarting the Console. Stored values live
+in `<data directory>/console/tool_server_secrets.json` (mode 0600) and take
 precedence over the process environment. `catence-console doctor` reports each
 server's readiness as well.
 

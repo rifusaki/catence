@@ -638,10 +638,60 @@ def test_parses_tool_servers_with_labels_headers_and_environment_references(tmp_
     assert referenced_environment(weather) == ()
 
 
-def test_tool_servers_default_to_an_empty_map(tmp_path):
+def test_tool_servers_default_to_the_keyless_exa_server(tmp_path):
     write_config(tmp_path, {"profiles": {"local": {"model": "openai/example"}}})
 
+    servers = load_console_configuration(tmp_path).tool_servers
+
+    assert list(servers) == ["exa"]
+    exa = servers["exa"]
+    assert exa.label == "Exa Web Search"
+    assert exa.url == "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa"
+    assert exa.headers == {}
+    # The default must stay keyless: an unresolved environment reference would
+    # make the server unready instead of quietly rate-limited.
+    assert referenced_environment(exa) == ()
+
+
+def test_user_tool_server_overrides_the_default_by_name(tmp_path):
+    write_config(
+        tmp_path,
+        {
+            "profiles": {"local": {"model": "openai/example"}},
+            "mcpServers": {
+                "exa": {
+                    "label": "Exa with a key",
+                    "url": "https://mcp.exa.ai/mcp?tools=web_search_exa",
+                    "headers": {"x-api-key": "$EXA_API_KEY"},
+                }
+            },
+        },
+    )
+
+    exa = load_console_configuration(tmp_path).tool_servers["exa"]
+
+    assert exa.label == "Exa with a key"
+    assert exa.url == "https://mcp.exa.ai/mcp?tools=web_search_exa"
+    assert exa.headers == {"x-api-key": "$EXA_API_KEY"}
+
+
+def test_default_tool_servers_can_be_disabled(tmp_path):
+    write_config(
+        tmp_path,
+        {"profiles": {"local": {"model": "openai/example"}}, "defaultToolServers": False},
+    )
+
     assert load_console_configuration(tmp_path).tool_servers == {}
+
+
+def test_rejects_a_non_boolean_default_tool_servers_flag(tmp_path):
+    write_config(
+        tmp_path,
+        {"profiles": {"local": {"model": "openai/example"}}, "defaultToolServers": "no"},
+    )
+
+    with pytest.raises(ConsoleConfigurationError, match="defaultToolServers must be a boolean"):
+        load_console_configuration(tmp_path)
 
 
 def test_tool_server_environment_references_are_deduplicated_in_order(tmp_path):
