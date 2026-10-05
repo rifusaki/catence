@@ -904,3 +904,66 @@ def test_scoped_arguments_only_touch_catence_tools_when_restricted():
     assert agent._scoped_tool_arguments("read_series", {}, "alex", catence_tools=catence_tools) == {
         "athleteId": "alex"
     }
+
+
+def test_respond_heartbeats_while_a_model_call_is_in_flight(monkeypatch):
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", FakeSession)
+    monkeypatch.setattr(agent, "_MODEL_CALL_HEARTBEAT_SECONDS", 0.01)
+    heartbeats = []
+
+    monkeypatch.setattr(agent, "start_generation_sidecar", lambda _thread_id: None)
+    monkeypatch.setattr(
+        agent,
+        "finish_generation_sidecar",
+        lambda _thread_id, *, stage, tool_call_count=0, last_tool=None: None,
+    )
+    monkeypatch.setattr(
+        agent,
+        "update_generation_sidecar",
+        lambda thread_id, *, tool_call_count, last_tool: heartbeats.append((thread_id, tool_call_count, last_tool)),
+    )
+
+    async def complete(**_kwargs):
+        await asyncio.sleep(0.05)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Done", tool_calls=[]))])
+
+    answer = asyncio.run(
+        agent.respond(
+            profile=ProviderProfile(id="local", label="Local", model="openai/example"),
+            model_id="default",
+            reasoning_effort=None,
+            history=[],
+            mcp_url="http://example.test/mcp",
+            thread_id="thread-1",
+            complete=complete,
+        )
+    )
+
+    assert answer == "Done"
+    assert heartbeats
+    assert all(heartbeat[0] == "thread-1" for heartbeat in heartbeats)
+
+
+def test_respond_times_out_a_hung_model_call(monkeypatch, tmp_path):
+    monkeypatch.setenv("CATENCE_HOME", str(tmp_path))
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "ClientSession", FakeSession)
+    monkeypatch.setattr(agent, "_MODEL_CALL_TIMEOUT_SECONDS", 0.05)
+
+    async def complete(**_kwargs):
+        await asyncio.sleep(5)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Done", tool_calls=[]))])
+
+    with pytest.raises(TimeoutError, match="did not answer"):
+        asyncio.run(
+            agent.respond(
+                profile=ProviderProfile(id="local", label="Local", model="openai/example"),
+                model_id="default",
+                reasoning_effort=None,
+                history=[],
+                mcp_url="http://example.test/mcp",
+                thread_id="thread-1",
+                complete=complete,
+            )
+        )

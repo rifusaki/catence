@@ -32,6 +32,7 @@ from .accounts import (
 )
 from .auth import missing_auth_environment, validate_auth_configuration
 from .config import ConsoleConfigurationError, load_console_configuration, missing_environment, referenced_environment
+from .generation_sidecar import clear_orphaned_generation_sidecars
 from .release import CATENCE_PROTOCOL_VERSION, CATENCE_RELEASE_VERSION
 from .tool_server_secrets import (
     ToolServerSecretsStoreError,
@@ -432,6 +433,16 @@ def serve(args: argparse.Namespace) -> int:
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+    except Exception:
+        pass
+
+    # A Console process killed mid-turn leaves a "running" generation sidecar
+    # behind, which would lock the chat UI forever. Clear what a previous
+    # process left behind before starting a new one.
+    try:
+        cleared = clear_orphaned_generation_sidecars()
+        if cleared:
+            print(f"Cleared {cleared} orphaned generation status file(s).", file=sys.stderr, flush=True)
     except Exception:
         pass
 

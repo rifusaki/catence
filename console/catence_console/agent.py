@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
 from typing import Any
@@ -100,6 +102,12 @@ _TRUNCATED_ERROR_MESSAGE_CHARACTERS = 2_000
 _OPENCODE_GO_SESSION_HEADER = "x-opencode-session"
 _OPENCODE_GO_CLIENT_HEADER = "x-opencode-client"
 _OPENCODE_GO_CLIENT_ID = "catence-console"
+
+# A model call can outlast several tool rounds, so the generation sidecar is
+# refreshed while the provider request is in flight; otherwise a healthy turn
+# would eventually look stale (and a crashed one would keep looking alive).
+_MODEL_CALL_HEARTBEAT_SECONDS = float(os.environ.get("CATENCE_MODEL_CALL_HEARTBEAT_SECONDS", "20"))
+_MODEL_CALL_TIMEOUT_SECONDS = float(os.environ.get("CATENCE_MODEL_CALL_TIMEOUT_SECONDS", "600"))
 
 def _as_json(value: Any) -> Any:
     if hasattr(value, "model_dump"):
@@ -562,6 +570,47 @@ async def _athlete_file_context(session: ClientSession, athlete_id: str | None) 
     )
 
 
+async def _await_model_call(
+    complete: Callable[..., Awaitable[Any]],
+    options: dict[str, Any],
+    *,
+    thread_id: str | None,
+    tool_call_count: int,
+    last_tool: str | None,
+) -> Any:
+    """Await one provider call while keeping the generation heartbeat fresh.
+
+    The heartbeat loop keeps a long model call from looking stale; the timeout
+    gives a hung provider request a bounded lifetime so the chat UI can recover
+    instead of polling a forever-running sidecar.
+    """
+
+    async def heartbeat() -> None:
+        while True:
+            await asyncio.sleep(_MODEL_CALL_HEARTBEAT_SECONDS)
+            update_generation_sidecar(
+                thread_id, tool_call_count=tool_call_count, last_tool=last_tool
+            )
+
+    beat = asyncio.create_task(heartbeat()) if thread_id else None
+    try:
+        return await asyncio.wait_for(
+            complete(**options), timeout=_MODEL_CALL_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"The provider did not answer within {int(_MODEL_CALL_TIMEOUT_SECONDS)} seconds. "
+            "Retry, or pick another model in settings."
+        ) from None
+    finally:
+        if beat is not None:
+            beat.cancel()
+            try:
+                await beat
+            except asyncio.CancelledError:
+                pass
+
+
 async def respond(
     *,
     profile: ProviderProfile,
@@ -634,6 +683,7 @@ async def respond(
 
             start_generation_sidecar(thread_id)
             tool_calls_total = 0
+            last_tool_label: str | None = None
             # OpenCode Go uses this header for prompt-cache optimization, so
             # the value must stay stable across every request of one
             # conversation. The Chainlit thread id is that identity; the
@@ -655,7 +705,13 @@ async def respond(
                 if effective_reasoning_effort:
                     options["reasoning_effort"] = effective_reasoning_effort
                     options["allowed_openai_params"] = ["reasoning_effort"]
-                completion = await complete(**options)
+                completion = await _await_model_call(
+                    complete,
+                    options,
+                    thread_id=thread_id,
+                    tool_call_count=tool_calls_total,
+                    last_tool=last_tool_label,
+                )
                 message = completion.choices[0].message
                 content = getattr(message, "content", None)
                 tool_calls = list(getattr(message, "tool_calls", None) or [])
@@ -715,10 +771,11 @@ async def respond(
                         }
                     )
                 tool_calls_total += len(tool_calls)
+                last_tool_label = f"{owner_label} · {name}"
                 update_generation_sidecar(
                     thread_id,
                     tool_call_count=tool_calls_total,
-                    last_tool=f"{owner_label} · {name}",
+                    last_tool=last_tool_label,
                 )
 
     except BaseExceptionGroup as group:

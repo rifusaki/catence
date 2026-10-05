@@ -163,3 +163,45 @@ def read_generation_sidecar(thread_id: str) -> dict[str, Any] | None:
         age_ms = float("inf")
 
     return {**data, "running": True, "stale": age_ms > STALE_MS}
+
+
+def clear_orphaned_generation_sidecars() -> int:
+    """Remove sidecars a previous Console process left behind.
+
+    A process killed mid-turn never writes a terminal stage, so its sidecar
+    would keep reporting ``running`` and lock the chat UI. Called at startup;
+    terminal, temp, and stale files are cleared, while a sidecar whose
+    heartbeat is still fresh is kept for another live Console sharing the
+    home directory.
+    """
+
+    directory = _home() / "generation"
+    if not directory.exists():
+        return 0
+    removed = 0
+    for path in directory.glob("*.generation.json*"):
+        try:
+            if path.suffix == ".tmp":
+                path.unlink(missing_ok=True)
+                removed += 1
+                continue
+            data = json.loads(path.read_text())
+        except Exception:
+            continue
+        heartbeat = data.get("heartbeatAt")
+        age_ms: float = float("inf")
+        if heartbeat:
+            try:
+                hb = datetime.fromisoformat(heartbeat)
+                if hb.tzinfo is None:
+                    hb = hb.replace(tzinfo=timezone.utc)
+                age_ms = (datetime.now(timezone.utc) - hb).total_seconds() * 1000
+            except Exception:
+                age_ms = float("inf")
+        if data.get("stage") in TERMINAL_STAGES or age_ms > STALE_MS:
+            try:
+                path.unlink(missing_ok=True)
+                removed += 1
+            except Exception:
+                pass
+    return removed

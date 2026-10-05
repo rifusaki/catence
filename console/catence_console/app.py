@@ -54,7 +54,7 @@ from catence_console.config import (
     write_provider_setup,
 )
 from catence_console.config_io import read_config_root, write_console_section
-from catence_console.generation_sidecar import finish_generation_sidecar
+from catence_console.generation_sidecar import GenerationStage, finish_generation_sidecar
 from catence_console.tool_server_secrets import (
     ToolServerSecretValidationError,
     ToolServerSecretsStoreError,
@@ -80,6 +80,11 @@ logger = logging.getLogger(__name__)
 # the websocket session) so a page refresh or disconnect cannot abort it; the
 # answer is persisted to the data layer and recovered when the thread reloads.
 _ACTIVE_GENERATIONS: dict[str, "asyncio.Task[None]"] = {}
+
+# Threads where the user pressed Stop. A provider client can swallow the
+# cancellation mid-request, so this flag makes the turn end without delivering
+# a stale answer once the pending request finally returns.
+_STOP_REQUESTED: set[str] = set()
 
 
 def _mcp_http_url(path: str) -> str:
@@ -274,6 +279,17 @@ async def athletes_proxy(request: Request) -> Response:
     return JSONResponse(filter_roster(payload, account))
 
 
+async def add_athlete_proxy(request: Request) -> Response:
+    """Create a catalog athlete through the runtime's write API (admins only)."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to add athletes.")
+    return await _proxy_mcp_post(request, "/api/v1/athletes")
+
+
 async def health_proxy(request: Request) -> Response:
     return await _proxy_mcp_get(request, "/api/v1/health")
 
@@ -350,8 +366,11 @@ async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Res
 
     if request.method == "GET" and request.url.path == "/api/v1/dashboard":
         return await dashboard_proxy(request)
-    if request.method == "GET" and request.url.path == "/api/v1/athletes":
-        return await athletes_proxy(request)
+    if request.url.path == "/api/v1/athletes":
+        if request.method == "GET":
+            return await athletes_proxy(request)
+        if request.method == "POST":
+            return await add_athlete_proxy(request)
     if request.method == "GET" and request.url.path == "/api/v1/health":
         return await health_proxy(request)
     if request.url.path == "/api/v1/models":
@@ -388,6 +407,12 @@ async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Res
         return await sync_trigger_proxy(request)
     if request.method == "GET" and request.url.path == "/api/v1/sync/status":
         return await sync_status_proxy(request)
+    if (
+        request.method == "GET"
+        and request.url.path.startswith("/api/v1/threads/")
+        and request.url.path.endswith("/generation")
+    ):
+        return await generation_status_proxy(request)
     if request.url.path == "/api/v1/athlete-file":
         if request.method in {"GET", "PUT"}:
             return await athlete_file_proxy(request)
@@ -1027,6 +1052,17 @@ async def sync_status_proxy(request: Request) -> Response:
     return await _athlete_scoped_get(request, "/api/v1/sync/status")
 
 
+async def generation_status_proxy(request: Request) -> Response:
+    """Proxy a thread's live generation status through the Console origin.
+
+    Browsers cannot always reach the runtime origin directly, so the Console
+    forwards this route itself; it is authenticated like the other dashboard
+    proxies.
+    """
+
+    return await _proxy_mcp_get(request, request.url.path)
+
+
 def _session_identity() -> ConsoleAccount | None:
     """The Console account of the current Chainlit session, if any."""
 
@@ -1447,11 +1483,10 @@ async def _setup_wizard() -> ConsoleConfiguration | None:
 
 
 async def _initialize_chat(configuration: ConsoleConfiguration) -> None:
-    """Send configurable widgets and the current readiness message."""
+    """Send the configurable chat settings widget for a fresh chat."""
 
     preferences = _restore_preferences(configuration)
     default_athlete_id, athletes = _athlete_roster()
-    profile, model_id = configuration.selected_model(preferences.model_choice)
     await _chat_settings(
         configuration,
         model_choice=preferences.model_choice,
@@ -1461,26 +1496,6 @@ async def _initialize_chat(configuration: ConsoleConfiguration) -> None:
         athlete_id=preferences.athlete_id or default_athlete_id,
         athletes=athletes,
         default_athlete_id=default_athlete_id,
-    ).send()
-
-    missing = missing_environment(profile)
-    readiness = "ready" if not missing else f"missing environment variables: {', '.join(missing)}"
-    selected_model = profile.model_option(model_id)
-    selected_effort = None if preferences.reasoning_effort == "default" else preferences.reasoning_effort
-    scoped_athlete_id = preferences.athlete_id or default_athlete_id
-    scope = (
-        f"This chat is scoped to athlete **{scoped_athlete_id}**."
-        if scoped_athlete_id
-        else NO_ATHLETE_ACCESS_NOTICE
-    )
-    await _notice(
-        content=(
-            f"Catence Console is {readiness}. Using **{selected_model.label}** with **{selected_effort or 'provider default'}** thinking, "
-            f"up to **{preferences.tool_rounds}** tool rounds and **{preferences.tool_result_characters:,}** evidence characters per result. "
-            f"{scope} "
-            "I can use the same local MCP tools as your coding agent. "
-            "Try a recovery review, training-load check, or a question about a recent activity."
-        )
     ).send()
 
 
@@ -1609,6 +1624,7 @@ async def _run_generation(
     """
 
     thread_id = cl.context.session.thread_id
+    stage: GenerationStage = "failed"
     try:
         answer = await respond(
             profile=profile,
@@ -1626,11 +1642,16 @@ async def _run_generation(
             athlete_label=athlete_label,
             step_parent_id=message.id,
         )
+        if thread_id in _STOP_REQUESTED:
+            # The user stopped this turn while the provider request was still
+            # in flight (the cancellation was swallowed); deliver nothing stale.
+            stage = "interrupted"
+            return
         await cl.Message(content=answer).send()
+        stage = "completed"
     except asyncio.CancelledError:
         logger.info("Catence generation cancelled for thread %s", thread_id)
-        finish_generation_sidecar(thread_id, stage="interrupted")
-        return
+        stage = "interrupted"
     except Exception as error:
         logger.exception(
             "Catence model request failed for profile %s and model %s",
@@ -1642,8 +1663,11 @@ async def _run_generation(
         except Exception:
             pass
     finally:
-        finish_generation_sidecar(thread_id, stage="completed")
-        _ACTIVE_GENERATIONS.pop(thread_id, None)
+        finish_generation_sidecar(thread_id, stage=stage)
+        current = asyncio.current_task()
+        if _ACTIVE_GENERATIONS.get(thread_id) is current:
+            _ACTIVE_GENERATIONS.pop(thread_id, None)
+            _STOP_REQUESTED.discard(thread_id)
 
 
 @cl.on_stop
@@ -1652,8 +1676,25 @@ async def on_stop() -> None:
 
     thread_id = cl.context.session.thread_id
     task = _ACTIVE_GENERATIONS.get(thread_id)
-    if task is not None and not task.done():
-        task.cancel()
+    if task is None or task.done():
+        _ACTIVE_GENERATIONS.pop(thread_id, None)
+        _STOP_REQUESTED.discard(thread_id)
+        # Clear a sidecar a previous process or finished task may have left
+        # behind so the UI unlocks instead of polling a forever-running status.
+        finish_generation_sidecar(thread_id, stage="interrupted")
+        return
+    _STOP_REQUESTED.add(thread_id)
+    task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+    except (asyncio.CancelledError, Exception):
+        pass
+    if task.done():
+        _ACTIVE_GENERATIONS.pop(thread_id, None)
+        _STOP_REQUESTED.discard(thread_id)
+    # If the provider client swallowed the cancellation, the turn stays
+    # tracked; the stop flag makes it end quietly once the request returns.
+    finish_generation_sidecar(thread_id, stage="interrupted")
 
 
 @cl.on_message
@@ -1704,6 +1745,7 @@ async def on_message(message: cl.Message) -> None:
     # Detach the turn so a disconnect/refresh cannot abort it. The live client
     # still receives streamed steps over the socket while connected; the answer
     # is persisted to the data layer and recovered when the thread reloads.
+    _STOP_REQUESTED.discard(thread_id)
     _ACTIVE_GENERATIONS[thread_id] = asyncio.create_task(
         _run_generation(
             message,

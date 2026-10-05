@@ -348,3 +348,144 @@ def test_zero_grant_members_get_a_notice_instead_of_an_agent_turn(monkeypatch):
     asyncio.run(app.on_message(FakeMessage(content="hello")))
 
     assert sent == [app.NO_ATHLETE_ACCESS_NOTICE]
+
+
+def test_add_athlete_route_requires_login():
+    response = TestClient(app.chainlit_server).post("/api/v1/athletes", json={"id": "sam", "label": "Sam"})
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_add_athlete_proxy_is_admin_only_and_forwards_the_body(console_home, monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout=0):
+        captured["request"] = request
+        return _Upstream(json.dumps(ROSTER).encode("utf-8"), status=201)
+
+    monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
+
+    member = client_for("rifusaki").post("/api/v1/athletes", json={"id": "sam", "label": "Sam"})
+    assert member.status_code == 403
+    assert member.json()["error"]["code"] == "admin_required"
+
+    response = client_for("coach").post("/api/v1/athletes", json={"id": "sam", "label": "Sam", "setDefault": True})
+
+    assert response.status_code == 201
+    forwarded = captured["request"]
+    assert forwarded.get_method() == "POST"
+    assert forwarded.full_url.endswith("/api/v1/athletes")
+    assert json.loads(forwarded.data) == {"id": "sam", "label": "Sam", "setDefault": True}
+
+
+def test_generation_status_proxy_requires_login_and_forwards_the_path(console_home, monkeypatch):
+    captured = {}
+
+    def fake_urlopen(target, timeout=0):
+        captured["target"] = target
+        return _Upstream(b'{"threadId": "abc", "running": true, "stale": false}')
+
+    monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
+
+    anonymous = TestClient(app.chainlit_server).get("/api/v1/threads/abc/generation")
+    assert anonymous.status_code == 401
+
+    response = client_for("rifusaki").get("/api/v1/threads/abc/generation")
+
+    assert response.status_code == 200
+    assert response.json() == {"threadId": "abc", "running": True, "stale": False}
+    assert captured["target"].endswith("/api/v1/threads/abc/generation")
+
+
+def test_on_stop_clears_a_sidecar_left_by_a_dead_process(monkeypatch, tmp_path):
+    monkeypatch.setenv("CATENCE_HOME", str(tmp_path))
+    monkeypatch.setattr(app.cl, "context", SimpleNamespace(session=SimpleNamespace(thread_id="dead-thread")))
+    directory = tmp_path / "generation"
+    directory.mkdir()
+    sidecar = directory / "dead-thread.generation.json"
+    sidecar.write_text(json.dumps({"stage": "running", "heartbeatAt": "2026-01-01T00:00:00+00:00"}))
+    app._ACTIVE_GENERATIONS.clear()
+
+    asyncio.run(app.on_stop())
+
+    assert not sidecar.exists()
+    assert app._ACTIVE_GENERATIONS == {}
+
+
+def test_on_stop_cancels_a_live_generation(monkeypatch, tmp_path):
+    monkeypatch.setenv("CATENCE_HOME", str(tmp_path))
+    monkeypatch.setattr(app.cl, "context", SimpleNamespace(session=SimpleNamespace(thread_id="live-thread")))
+    app._ACTIVE_GENERATIONS.clear()
+    app._STOP_REQUESTED.clear()
+
+    async def scenario():
+        cancelled = asyncio.Event()
+
+        async def sleeper():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        task = asyncio.create_task(sleeper())
+        app._ACTIVE_GENERATIONS["live-thread"] = task
+        await asyncio.sleep(0)
+
+        await app.on_stop()
+
+        assert cancelled.is_set()
+        assert task.cancelled()
+        assert "live-thread" not in app._ACTIVE_GENERATIONS
+        assert "live-thread" not in app._STOP_REQUESTED
+
+    asyncio.run(scenario())
+
+
+def test_stopped_generation_does_not_deliver_a_stale_answer(monkeypatch, tmp_path):
+    monkeypatch.setenv("CATENCE_HOME", str(tmp_path))
+    monkeypatch.setattr(app.cl, "context", SimpleNamespace(session=SimpleNamespace(thread_id="stopped-thread")))
+    sent = []
+
+    class FakeMessage:
+        def __init__(self, *, content, metadata=None):
+            self.content = content
+            self.id = "message-1"
+
+        async def send(self):
+            sent.append(self.content)
+
+    async def fake_respond(**_kwargs):
+        return "a late answer"
+
+    monkeypatch.setattr(app, "respond", fake_respond)
+    monkeypatch.setattr(app.cl, "Message", FakeMessage)
+    app._ACTIVE_GENERATIONS.clear()
+    app._STOP_REQUESTED.clear()
+
+    async def scenario():
+        app._STOP_REQUESTED.add("stopped-thread")
+        task = asyncio.create_task(
+            app._run_generation(
+                FakeMessage(content="question"),
+                SimpleNamespace(id="local", label="Local"),
+                "default",
+                None,
+                [],
+                8,
+                24_000,
+                {},
+                {},
+                "martina",
+                "Martina",
+            )
+        )
+        app._ACTIVE_GENERATIONS["stopped-thread"] = task
+        await task
+
+    asyncio.run(scenario())
+
+    assert sent == []
+    assert "stopped-thread" not in app._STOP_REQUESTED
+    assert app._ACTIVE_GENERATIONS == {}
