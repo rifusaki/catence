@@ -398,6 +398,111 @@ def test_generation_status_proxy_requires_login_and_forwards_the_path(console_ho
     assert captured["target"].endswith("/api/v1/threads/abc/generation")
 
 
+def test_athlete_secrets_proxy_requires_login(console_home):
+    anonymous = TestClient(app.chainlit_server)
+
+    assert anonymous.get("/api/v1/athlete-secrets?athleteId=martina").status_code == 401
+    assert (
+        anonymous.put(
+            "/api/v1/athlete-secrets",
+            json={"athleteId": "martina", "provider": "garmin", "field": "email", "value": "x"},
+        ).status_code
+        == 401
+    )
+    assert (
+        anonymous.post(
+            "/api/v1/athlete-secrets/remove",
+            json={"athleteId": "martina", "provider": "garmin", "field": "email"},
+        ).status_code
+        == 401
+    )
+
+
+def test_athlete_secrets_proxy_is_admin_only(console_home, monkeypatch):
+    monkeypatch.setattr(
+        app.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail("members must not reach the runtime for credentials"),
+    )
+
+    member = client_for("rifusaki")
+    overview = member.get("/api/v1/athlete-secrets?athleteId=martina")
+    write = member.put(
+        "/api/v1/athlete-secrets",
+        json={"athleteId": "martina", "provider": "garmin", "field": "email", "value": "x"},
+    )
+    remove = member.post(
+        "/api/v1/athlete-secrets/remove",
+        json={"athleteId": "martina", "provider": "garmin", "field": "email"},
+    )
+
+    for response in (overview, write, remove):
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "admin_required"
+
+
+def test_athlete_secrets_proxy_forwards_reads_writes_and_removals(console_home, monkeypatch):
+    captured = []
+    metadata = {
+        "athleteId": "martina",
+        "providers": [{"id": "garmin", "label": "Garmin", "fields": [{"name": "email", "configured": False}]}],
+    }
+
+    def fake_urlopen(target, timeout=0):
+        captured.append(target)
+        return _Upstream(json.dumps(metadata).encode("utf-8"))
+
+    monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
+
+    admin = client_for("coach")
+    overview = admin.get("/api/v1/athlete-secrets?athleteId=martina")
+    write = admin.put(
+        "/api/v1/athlete-secrets",
+        json={"athleteId": "martina", "provider": "garmin", "field": "email", "value": "secret-value"},
+    )
+    remove = admin.post(
+        "/api/v1/athlete-secrets/remove",
+        json={"athleteId": "martina", "provider": "garmin", "field": "email"},
+    )
+
+    assert overview.status_code == 200
+    assert overview.json() == metadata
+    assert write.status_code == 200
+    assert remove.status_code == 200
+
+    read_target = captured[0]
+    assert isinstance(read_target, str)
+    assert read_target.endswith("/api/v1/athlete-secrets?athleteId=martina")
+
+    write_request = captured[1]
+    assert write_request.get_method() == "PUT"
+    assert write_request.full_url.endswith("/api/v1/athlete-secrets")
+    assert json.loads(write_request.data) == {
+        "athleteId": "martina",
+        "provider": "garmin",
+        "field": "email",
+        "value": "secret-value",
+    }
+
+    remove_request = captured[2]
+    assert remove_request.get_method() == "POST"
+    assert remove_request.full_url.endswith("/api/v1/athlete-secrets/remove")
+    assert json.loads(remove_request.data) == {"athleteId": "martina", "provider": "garmin", "field": "email"}
+
+
+def test_athlete_secrets_proxy_passes_through_runtime_errors(console_home, monkeypatch):
+    payload = b'{"error": {"code": "athlete_secret_write_failed", "message": "email is not a supported garmin secret field."}}'
+    monkeypatch.setattr(app.urllib.request, "urlopen", lambda *args, **kwargs: _Upstream(payload, status=400))
+
+    response = client_for("coach").put(
+        "/api/v1/athlete-secrets",
+        json={"athleteId": "martina", "provider": "garmin", "field": "nope", "value": "x"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "athlete_secret_write_failed"
+
+
 def test_on_stop_clears_a_sidecar_left_by_a_dead_process(monkeypatch, tmp_path):
     monkeypatch.setenv("CATENCE_HOME", str(tmp_path))
     monkeypatch.setattr(app.cl, "context", SimpleNamespace(session=SimpleNamespace(thread_id="dead-thread")))

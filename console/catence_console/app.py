@@ -290,6 +290,34 @@ async def add_athlete_proxy(request: Request) -> Response:
     return await _proxy_mcp_post(request, "/api/v1/athletes")
 
 
+async def athlete_secrets_overview(request: Request) -> Response:
+    """Read athlete credential metadata through the runtime (admins only).
+
+    Only field names and configured flags cross this boundary; secret values
+    never leave the runtime.
+    """
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to manage athlete credentials.")
+    return await _proxy_mcp_get(request, request.url.path)
+
+
+async def mutate_athlete_secret(request: Request) -> Response:
+    """Write or remove one athlete credential through the runtime (admins only)."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to manage athlete credentials.")
+    if request.method == "PUT":
+        return await _proxy_mcp_put(request, "/api/v1/athlete-secrets")
+    return await _proxy_mcp_post(request, "/api/v1/athlete-secrets/remove")
+
+
 async def health_proxy(request: Request) -> Response:
     return await _proxy_mcp_get(request, "/api/v1/health")
 
@@ -417,6 +445,14 @@ async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Res
         if request.method in {"GET", "PUT"}:
             return await athlete_file_proxy(request)
         return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use GET or PUT for /api/v1/athlete-file."}}, status_code=405)
+    if request.url.path == "/api/v1/athlete-secrets":
+        if request.method == "GET":
+            return await athlete_secrets_overview(request)
+        if request.method == "PUT":
+            return await mutate_athlete_secret(request)
+        return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use GET or PUT for /api/v1/athlete-secrets."}}, status_code=405)
+    if request.method == "POST" and request.url.path == "/api/v1/athlete-secrets/remove":
+        return await mutate_athlete_secret(request)
     return await call_next(request)
 
 
