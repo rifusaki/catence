@@ -248,11 +248,15 @@ profiles and preserve existing ones, limits, and `defaultProfile` unless
 | `CATENCE_HOME` | Catalog home (default `~/.catence`); equivalent to `--home` |
 | `CATENCE_HTTP_HOST` / `CATENCE_HTTP_PORT` | Defaults for `catence serve --host/--port` (host `127.0.0.1`, port `8787`) |
 
-Provider credentials are normally stored per athlete with
-`catence-data secret set` (see [`local-mcp.md`](deployment/local-mcp.md#3-store-provider-credentials-stdin-only-never-shell-history)); those secrets are injected
-into the provider worker environment, and inherited `GARMIN_*`/`INTERVALS_*`/
-`STRAVA_*` variables are stripped first so an athlete without a provider cannot
-inherit its credentials.
+Provider credentials are stored per athlete, either with `catence-data secret
+set` (see [`local-mcp.md`](deployment/local-mcp.md#3-store-provider-credentials-stdin-only-never-shell-history))
+or by an administrator from **Settings → Athletes → Credentials** in the
+Console. The Console editor is write-only: it shows each field as configured or
+not, and values can be replaced or removed (`catence-data secret remove`, or the
+dialog's Remove button) but never read back. Those secrets are injected into the
+provider worker environment, and inherited `GARMIN_*`/`INTERVALS_*`/`STRAVA_*`
+variables are stripped first so an athlete without a provider cannot inherit its
+credentials.
 
 For local and Docker development you can also keep credentials in env without
 `secret set` — see the two fallback modes below. File values always win over

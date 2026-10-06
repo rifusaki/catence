@@ -77,6 +77,12 @@ printf %s 'strava-client-secret' | catence-data --athlete alex secret set --prov
 Set only the providers you actually sync; `secret set` accepts each field
 independently.
 
+Administrators can also manage any athlete's credentials from **Settings →
+Athletes → Credentials** in the Console. The dialog is write-only — it shows
+each field as configured or not and lets you replace or remove values, but
+values are never displayed. `catence-data --athlete <id> secret remove
+--provider <provider> --field <field>` mirrors the dialog for scripted setups.
+
 ## 4. Sync data and build retrieval context
 
 ```sh
@@ -282,10 +288,12 @@ per-account grants at the login, then server-owned scoping per chat.
 
 Console pages and chats reach the runtime through the authenticated Console
 origin: Chainlit middleware proxies the Console's API surface — `GET
-/api/v1/dashboard`, `GET`/`POST /api/v1/athletes` (POST is admin-only), `GET
-/api/v1/threads/<id>/generation`, and the models, accounts, tool-server, and
-sync routes — to the runtime only when the Console's JWT cookie is valid
-(otherwise 401), so raw port 8787 does not need to be exposed.
+/api/v1/dashboard`, `GET`/`POST /api/v1/athletes` (POST is admin-only),
+`GET`/`PUT /api/v1/athlete-secrets` and `POST /api/v1/athlete-secrets/remove`
+(all admin-only), `GET /api/v1/threads/<id>/generation`, and the models,
+accounts, tool-server, and sync routes — to the runtime only when the Console's
+JWT cookie is valid (otherwise 401), so raw port 8787 does not need to be
+exposed.
 
 ## Model discovery (OpenCode Go)
 
