@@ -10,6 +10,7 @@ import {
   channelForVersion,
   createDemoStore,
   dataStatus,
+  deleteAthleteSecret,
   defaultCatalogHome,
   disconnectStravaAccount,
   fetchNpmDistTags,
@@ -100,7 +101,7 @@ athleteCommand.command('add')
     process.stdout.write(`${JSON.stringify(await addAthlete(currentCatalog(), { id: options.id, label: options.label, setDefault: options.default }), null, 2)}\n`);
   });
 
-const secretCommand = program.command('secret').description('Write a provider value into one athlete’s owner-only secret store.');
+const secretCommand = program.command('secret').description('Write or remove a provider value in one athlete’s owner-only secret store.');
 secretCommand.command('set')
   .requiredOption('--provider <provider>', 'garmin, intervals, or strava')
   .requiredOption('--field <field>', 'provider secret field')
@@ -110,6 +111,16 @@ secretCommand.command('set')
     const { paths } = await currentAthlete();
     await setAthleteSecret(paths, options.provider, options.field, await stdinSecret());
     process.stdout.write(`${JSON.stringify({ athleteId: program.opts<{ athlete: string }>().athlete, provider: options.provider, field: options.field, stored: true }, null, 2)}\n`);
+  });
+
+secretCommand.command('remove')
+  .requiredOption('--provider <provider>', 'garmin, intervals, or strava')
+  .requiredOption('--field <field>', 'provider secret field')
+  .action(async (options: { provider: 'garmin' | 'intervals' | 'strava'; field: string }) => {
+    if (!['garmin', 'intervals', 'strava'].includes(options.provider)) throw new Error('--provider must be garmin, intervals, or strava.');
+    const { paths } = await currentAthlete();
+    await deleteAthleteSecret(paths, options.provider, options.field);
+    process.stdout.write(`${JSON.stringify({ athleteId: program.opts<{ athlete: string }>().athlete, provider: options.provider, field: options.field, removed: true }, null, 2)}\n`);
   });
 
 program.command('demo')

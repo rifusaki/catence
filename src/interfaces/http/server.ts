@@ -9,6 +9,8 @@ import {
   AthleteFileValidationError,
   catenceRuntimeHealth,
   DashboardSnapshotService,
+  deleteAthleteSecret,
+  describeAthleteSecrets,
   DetachedSyncBusyError,
   type DetachedSyncSpawner,
   DETACHED_SYNC_PROVIDERS,
@@ -21,12 +23,14 @@ import {
   readAthleteFileRevision,
   resolveAthlete,
   resolveCatalogPaths,
+  setAthleteSecret,
   startDetachedSync,
   syncProgress,
   updateAthleteFile,
   type AthleteFileOperation,
   type CatalogPaths,
   type CatencePaths,
+  type SecretProvider,
 } from '../../runtime/index.js';
 import { createCatenceMcpServer } from '../mcp/server.js';
 import { generationStatus } from './generation-status.js';
@@ -204,6 +208,44 @@ function parseAthleteFileBody(body: unknown): AthleteFileBody {
     hasExpectedHash: Object.prototype.hasOwnProperty.call(raw, 'expectedHash'),
     expectedHash: (raw.expectedHash ?? null) as string | null,
   };
+}
+
+type AthleteSecretBody = {
+  athleteId?: string;
+  provider: SecretProvider;
+  field: string;
+  value: string;
+};
+
+function parseAthleteSecretBody(body: unknown): AthleteSecretBody {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new Error('Request body must be a JSON object.');
+  const raw = body as Record<string, unknown>;
+  for (const key of Object.keys(raw)) {
+    if (!['athleteId', 'provider', 'field', 'value'].includes(key)) throw new Error(`Unknown athlete-secret field: ${key}.`);
+  }
+  if (raw.athleteId !== undefined && typeof raw.athleteId !== 'string') throw new Error('athleteId must be a string.');
+  if (typeof raw.provider !== 'string' || !raw.provider.trim()) throw new Error('provider is required.');
+  if (typeof raw.field !== 'string' || !raw.field.trim()) throw new Error('field is required.');
+  if (typeof raw.value !== 'string' || !raw.value.trim()) throw new Error('value is required.');
+  return { athleteId: raw.athleteId as string | undefined, provider: raw.provider.trim() as SecretProvider, field: raw.field.trim(), value: raw.value };
+}
+
+type AthleteSecretRemovalBody = {
+  athleteId?: string;
+  provider: SecretProvider;
+  field: string;
+};
+
+function parseAthleteSecretRemovalBody(body: unknown): AthleteSecretRemovalBody {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new Error('Request body must be a JSON object.');
+  const raw = body as Record<string, unknown>;
+  for (const key of Object.keys(raw)) {
+    if (!['athleteId', 'provider', 'field'].includes(key)) throw new Error(`Unknown athlete-secret field: ${key}.`);
+  }
+  if (raw.athleteId !== undefined && typeof raw.athleteId !== 'string') throw new Error('athleteId must be a string.');
+  if (typeof raw.provider !== 'string' || !raw.provider.trim()) throw new Error('provider is required.');
+  if (typeof raw.field !== 'string' || !raw.field.trim()) throw new Error('field is required.');
+  return { athleteId: raw.athleteId as string | undefined, provider: raw.provider.trim() as SecretProvider, field: raw.field.trim() };
 }
 
 async function resolveSyncPaths(catalogPaths: CatalogPaths | null, staticPaths: CatencePaths | null, body: SyncRequestBody): Promise<CatencePaths> {
@@ -452,6 +494,48 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           } else {
             json(response, 400, { error: { code: 'athlete_file_write_failed', message: error instanceof Error ? error.message : String(error) } });
           }
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/athlete-secrets' && request.method === 'GET') {
+        try {
+          const url = new URL(request.url ?? '/', 'http://localhost');
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          json(response, 200, { athleteId: url.searchParams.get('athleteId') ?? 'local', providers: await describeAthleteSecrets(paths) });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          json(response, 400, { error: { code: 'athlete_secrets_unavailable', message } });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/athlete-secrets' && request.method === 'PUT') {
+        try {
+          const parsed = parseAthleteSecretBody(await readJsonBody(request));
+          const url = new URL(request.url ?? '/', 'http://localhost');
+          if (!url.searchParams.get('athleteId') && parsed.athleteId) url.searchParams.set('athleteId', parsed.athleteId);
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          await setAthleteSecret(paths, parsed.provider, parsed.field, parsed.value);
+          json(response, 200, { athleteId: url.searchParams.get('athleteId') ?? 'local', providers: await describeAthleteSecrets(paths) });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          json(response, 400, { error: { code: 'athlete_secret_write_failed', message } });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/athlete-secrets/remove' && request.method === 'POST') {
+        try {
+          const parsed = parseAthleteSecretRemovalBody(await readJsonBody(request));
+          const url = new URL(request.url ?? '/', 'http://localhost');
+          if (!url.searchParams.get('athleteId') && parsed.athleteId) url.searchParams.set('athleteId', parsed.athleteId);
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          await deleteAthleteSecret(paths, parsed.provider, parsed.field);
+          json(response, 200, { athleteId: url.searchParams.get('athleteId') ?? 'local', providers: await describeAthleteSecrets(paths) });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          json(response, 400, { error: { code: 'athlete_secret_remove_failed', message } });
         }
         return;
       }

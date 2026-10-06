@@ -1,5 +1,5 @@
 import type { AddressInfo } from 'node:net';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -7,7 +7,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { afterEach, describe, expect, it } from 'vitest';
 import { CATENCE_PROTOCOL_VERSION, CATENCE_RUNTIME_VERSION } from '../src/contracts/release.js';
 import { createCatenceHttpServer } from '../src/interfaces/http/server.js';
-import { initializeCatalog, resolveCatalogPaths, startDetachedSync, ATHLETE_FILE_TEMPLATE, type DetachedSyncHandle, type DetachedSyncRequest } from '../src/runtime/index.js';
+import { athleteStorePaths, initializeCatalog, providerSecretPath, resolveCatalogPaths, startDetachedSync, ATHLETE_FILE_TEMPLATE, type DetachedSyncHandle, type DetachedSyncRequest } from '../src/runtime/index.js';
 import { temporaryDatabase } from './helpers.js';
 
 const servers: Array<ReturnType<typeof createCatenceHttpServer>> = [];
@@ -141,6 +141,78 @@ describe('Catence Streamable HTTP server', () => {
     });
     expect(rejected.status).toBe(400);
     await expect(rejected.json()).resolves.toMatchObject({ error: { code: 'catalog_required' } });
+  });
+
+  it('manages athlete provider secrets without ever returning the values', async () => {
+    const home = await mkdtemp(path.join(tmpdir(), 'catence-secrets-http-'));
+    const catalogPaths = resolveCatalogPaths(home);
+    await initializeCatalog(catalogPaths, { id: 'alex', label: 'Alex' });
+    const server = createCatenceHttpServer({ catalogPaths });
+    servers.push(server);
+    const origin = await listen(server);
+
+    const initial = await fetch(`${origin}/api/v1/athlete-secrets?athleteId=alex`);
+    expect(initial.status).toBe(200);
+    await expect(initial.json()).resolves.toMatchObject({
+      athleteId: 'alex',
+      providers: [
+        { id: 'garmin', label: 'Garmin', fields: [{ name: 'email', configured: false }, { name: 'password', configured: false }] },
+        { id: 'intervals', label: 'Intervals.icu' },
+        { id: 'strava', label: 'Strava' },
+      ],
+    });
+
+    const stored = 'garmin-app-password';
+    const written = await fetch(`${origin}/api/v1/athlete-secrets`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ athleteId: 'alex', provider: 'garmin', field: 'password', value: stored }),
+    });
+    expect(written.status).toBe(200);
+    const writtenText = await written.text();
+    expect(writtenText).not.toContain(stored);
+    const writtenBody = JSON.parse(writtenText) as {
+      athleteId: string;
+      providers: Array<{ id: string; fields: Array<{ name: string; configured: boolean }> }>;
+    };
+    expect(writtenBody.athleteId).toBe('alex');
+    expect(writtenBody.providers[0].fields).toEqual([
+      { name: 'email', configured: false },
+      { name: 'password', configured: true },
+    ]);
+
+    const paths = athleteStorePaths(catalogPaths, 'alex');
+    const secretFile = providerSecretPath(paths);
+    expect(JSON.parse(await readFile(secretFile, 'utf8'))).toEqual({ garmin: { password: stored } });
+    expect((await stat(secretFile)).mode & 0o777).toBe(0o600);
+
+    const invalid = await fetch(`${origin}/api/v1/athlete-secrets`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ athleteId: 'alex', provider: 'garmin', field: 'nope', value: 'x' }),
+    });
+    expect(invalid.status).toBe(400);
+    await expect(invalid.json()).resolves.toMatchObject({ error: { code: 'athlete_secret_write_failed' } });
+
+    const unknownKey = await fetch(`${origin}/api/v1/athlete-secrets`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ athleteId: 'alex', provider: 'garmin', field: 'password', value: 'x', extra: true }),
+    });
+    expect(unknownKey.status).toBe(400);
+
+    const removed = await fetch(`${origin}/api/v1/athlete-secrets/remove`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ athleteId: 'alex', provider: 'garmin', field: 'password' }),
+    });
+    expect(removed.status).toBe(200);
+    const removedBody = (await removed.json()) as { providers: Array<{ id: string; fields: Array<{ name: string; configured: boolean }> }> };
+    expect(removedBody.providers[0].fields[1]).toEqual({ name: 'password', configured: false });
+
+    const missingAthlete = await fetch(`${origin}/api/v1/athlete-secrets`);
+    expect(missingAthlete.status).toBe(400);
+    await expect(missingAthlete.json()).resolves.toMatchObject({ error: { code: 'athlete_secrets_unavailable' } });
   });
 
   it('starts detached syncs and reports progress plus last-completion timestamps', async () => {

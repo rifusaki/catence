@@ -19,6 +19,26 @@ const secretFields = {
   strava: ['clientId', 'clientSecret'],
 } as const;
 
+const secretProviderOrder: readonly SecretProvider[] = ['garmin', 'intervals', 'strava'];
+
+/** Display labels for the Console credentials editor. */
+export const secretProviderLabels: Record<SecretProvider, string> = {
+  garmin: 'Garmin',
+  intervals: 'Intervals.icu',
+  strava: 'Strava',
+};
+
+export type SecretFieldDescription = {
+  name: string;
+  configured: boolean;
+};
+
+export type SecretProviderDescription = {
+  id: SecretProvider;
+  label: string;
+  fields: SecretFieldDescription[];
+};
+
 export function providerSecretPath(paths: CatencePaths): string {
   return path.join(paths.secrets, 'providers.json');
 }
@@ -34,12 +54,18 @@ export async function readAthleteSecrets(paths: CatencePaths): Promise<AthleteSe
   }
 }
 
-export async function setAthleteSecret(paths: CatencePaths, provider: SecretProvider, field: string, value: string): Promise<void> {
-  if (!(secretFields[provider] as readonly string[]).includes(field)) throw new Error(`${field} is not a supported ${provider} secret field.`);
-  if (!value.trim()) throw new Error('Secret values cannot be empty.');
-  await ensurePaths(paths);
+/** Metadata only: which provider fields are configured. Values are never returned. */
+export async function describeAthleteSecrets(paths: CatencePaths): Promise<SecretProviderDescription[]> {
   const secrets = await readAthleteSecrets(paths);
-  const next = { ...secrets, [provider]: { ...(secrets[provider] ?? {}), [field]: value } };
+  return secretProviderOrder.map((provider) => ({
+    id: provider,
+    label: secretProviderLabels[provider],
+    fields: secretFields[provider].map((name) => ({ name, configured: name in (secrets[provider] ?? {}) })),
+  }));
+}
+
+async function writeAthleteSecrets(paths: CatencePaths, next: AthleteSecrets): Promise<void> {
+  await ensurePaths(paths);
   const { writeFile, rename } = await import('node:fs/promises');
   const destination = providerSecretPath(paths);
   const temporary = `${destination}.tmp`;
@@ -47,6 +73,31 @@ export async function setAthleteSecret(paths: CatencePaths, provider: SecretProv
   await chmod(temporary, 0o600);
   await rename(temporary, destination);
   await chmod(destination, 0o600);
+}
+
+export async function setAthleteSecret(paths: CatencePaths, provider: SecretProvider, field: string, value: string): Promise<void> {
+  if (!(secretFields[provider] as readonly string[]).includes(field)) throw new Error(`${field} is not a supported ${provider} secret field.`);
+  if (!value.trim()) throw new Error('Secret values cannot be empty.');
+  const secrets = await readAthleteSecrets(paths);
+  const next = { ...secrets, [provider]: { ...(secrets[provider] ?? {}), [field]: value } };
+  await writeAthleteSecrets(paths, next);
+}
+
+/** Remove one stored provider field; an already-absent field is a no-op. */
+export async function deleteAthleteSecret(paths: CatencePaths, provider: SecretProvider, field: string): Promise<void> {
+  if (!(provider in secretFields)) throw new Error(`${provider} is not a supported provider.`);
+  if (!(secretFields[provider] as readonly string[]).includes(field)) throw new Error(`${field} is not a supported ${provider} secret field.`);
+  const secrets = await readAthleteSecrets(paths);
+  const existing = secrets[provider];
+  if (!existing || !(field in existing)) return;
+  const remaining: Record<string, string> = {};
+  for (const [name, value] of Object.entries(existing)) {
+    if (name !== field && typeof value === 'string') remaining[name] = value;
+  }
+  const draft = Object.assign({} as Record<string, unknown>, secrets);
+  if (Object.keys(remaining).length === 0) delete draft[provider];
+  else draft[provider] = remaining;
+  await writeAthleteSecrets(paths, secretSchema.parse(draft));
 }
 
 function isTruthyEnvValue(value: string | undefined): boolean {

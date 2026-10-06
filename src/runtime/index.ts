@@ -36,8 +36,8 @@ export {
   resolveCatalogPaths,
 } from '../core/runtime/catalog.js';
 export type { Athlete, CatalogPaths, CatenceCatalog } from '../core/runtime/catalog.js';
-export { athleteProviderEnvironment, providerSecretPath, readAthleteSecrets, setAthleteSecret } from '../core/runtime/secrets.js';
-export type { AthleteSecrets, SecretProvider } from '../core/runtime/secrets.js';
+export { athleteProviderEnvironment, deleteAthleteSecret, describeAthleteSecrets, providerSecretPath, readAthleteSecrets, secretProviderLabels, setAthleteSecret } from '../core/runtime/secrets.js';
+export type { AthleteSecrets, SecretFieldDescription, SecretProvider, SecretProviderDescription } from '../core/runtime/secrets.js';
 export {
   ATHLETE_FILE_MAX_CHARACTERS,
   ATHLETE_FILE_TEMPLATE,
