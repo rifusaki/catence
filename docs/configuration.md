@@ -247,6 +247,7 @@ profiles and preserve existing ones, limits, and `defaultProfile` unless
 | --- | --- |
 | `CATENCE_HOME` | Catalog home (default `~/.catence`); equivalent to `--home` |
 | `CATENCE_HTTP_HOST` / `CATENCE_HTTP_PORT` | Defaults for `catence serve --host/--port` (host `127.0.0.1`, port `8787`) |
+| `CATENCE_MCP_TOKEN_FILE` | Default for `catence serve --auth-token-file`; when set, every endpoint except `/health` and `/api/v1/health` requires `Authorization: Bearer <token>` |
 
 Provider credentials are stored per athlete, either with `catence-data secret
 set` (see [`local-mcp.md`](deployment/local-mcp.md#3-store-provider-credentials-stdin-only-never-shell-history))

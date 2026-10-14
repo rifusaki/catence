@@ -33,6 +33,7 @@ from .accounts import (
 from .auth import missing_auth_environment, validate_auth_configuration
 from .config import ConsoleConfigurationError, load_console_configuration, missing_environment, referenced_environment
 from .generation_sidecar import clear_orphaned_generation_sidecars
+from .mcp_auth import runtime_token
 from .release import CATENCE_PROTOCOL_VERSION, CATENCE_RELEASE_VERSION
 from .tool_server_secrets import (
     ToolServerSecretsStoreError,
@@ -406,6 +407,9 @@ def serve(args: argparse.Namespace) -> int:
     mcp_url = args.mcp_url or f"http://{args.mcp_host}:{args.mcp_port}/mcp"
     console_root = Path(__file__).resolve().parent
     validate_auth_configuration()
+    # Fail fast when the runtime's auth token file is configured but unreadable;
+    # every later proxy and agent call would otherwise fail with confusing 401s.
+    runtime_token()
 
     # Best-effort data migration for Docker updates. The Node runtime bumps
     # the DuckDB schema (canonical_training_derived_avg_power_w etc.); a

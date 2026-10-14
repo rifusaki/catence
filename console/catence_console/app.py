@@ -38,6 +38,7 @@ from catence_console.accounts import (
     update_account,
 )
 from catence_console.agent import describe_model_failure, respond
+from catence_console.mcp_auth import runtime_authorization_headers
 from catence_console.config import (
     DEFAULT_TOOL_RESULT_CHARACTER_LIMIT,
     DEFAULT_TOOL_ROUND_LIMIT,
@@ -246,7 +247,7 @@ async def _proxy_mcp_get(request: Request, path: str, query: str | None = None) 
 
     def fetch() -> tuple[int, bytes, str]:
         try:
-            with urllib.request.urlopen(target, timeout=10) as upstream:
+            with urllib.request.urlopen(urllib.request.Request(target, headers=runtime_authorization_headers()), timeout=10) as upstream:
                 return upstream.status, upstream.read(), upstream.headers.get_content_type()
         except urllib.error.HTTPError as error:
             return error.code, error.read(), error.headers.get_content_type()
@@ -1010,7 +1011,7 @@ async def _proxy_mcp_put(request: Request, path: str, query: str | None = None) 
     if effective_query:
         target = f"{target}?{effective_query}"
     payload = await request.body()
-    headers = {"content-type": "application/json"}
+    headers = {"content-type": "application/json", **runtime_authorization_headers()}
     expected_hash = request.headers.get("if-match")
     if expected_hash:
         headers["if-match"] = expected_hash
@@ -1037,7 +1038,9 @@ async def _proxy_mcp_post(request: Request, path: str, payload: bytes | None = N
         payload = await request.body()
 
     def fetch() -> tuple[int, bytes, str]:
-        request_ = urllib.request.Request(target, data=payload, method="POST", headers={"content-type": "application/json"})
+        request_ = urllib.request.Request(
+            target, data=payload, method="POST", headers={"content-type": "application/json", **runtime_authorization_headers()}
+        )
         try:
             with urllib.request.urlopen(request_, timeout=15) as upstream:
                 return upstream.status, upstream.read(), upstream.headers.get_content_type()
@@ -1123,7 +1126,9 @@ def _roster_payload() -> dict[str, Any]:
     """Fetch and validate the runtime's athlete roster."""
 
     try:
-        with urllib.request.urlopen(_mcp_http_url("/api/v1/athletes"), timeout=3) as response:
+        with urllib.request.urlopen(
+            urllib.request.Request(_mcp_http_url("/api/v1/athletes"), headers=runtime_authorization_headers()), timeout=3
+        ) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
         raise ConsoleConfigurationError(f"Could not load the Catence athlete roster: {error}") from error

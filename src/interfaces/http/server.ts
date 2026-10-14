@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -43,6 +44,13 @@ export type CatenceHttpServerOptions = {
   /** Internal compatibility hook for tests and embedded single-store callers. */
   paths?: CatencePaths;
   allowedOrigins?: readonly string[];
+  /**
+   * When set, every request except the health endpoints and CORS preflights
+   * must present `Authorization: Bearer <token>`. The MCP server has no
+   * authentication of its own; this gates it (and the JSON APIs) for
+   * non-loopback exposure such as a Cloudflare Tunnel to an MCP client.
+   */
+  bearerToken?: string;
   /** Internal compatibility hook for tests: override the detached sync spawner. */
   startSync?: typeof startDetachedSync;
   /** Internal compatibility hook for tests: passed into the default startDetachedSync. */
@@ -50,6 +58,18 @@ export type CatenceHttpServerOptions = {
   /** Internal compatibility hook for tests: override OpenCode Go model discovery. */
   mergeModels?: typeof mergeOpenCodeGoConsoleProfiles;
 };
+
+/** Endpoints that stay open when bearer authentication is enabled: they carry
+ * no personal data and must answer unauthenticated readiness probes. */
+const UNAUTHENTICATED_PATHS = new Set(['/health', '/api/v1/health']);
+
+function isAuthorized(request: IncomingMessage, bearerToken: string | undefined): boolean {
+  if (!bearerToken) return true;
+  const received = Buffer.from(request.headers.authorization ?? '');
+  const expected = Buffer.from(`Bearer ${bearerToken}`);
+  // timingSafeEqual throws on length mismatch, so compare sizes first.
+  return received.length === expected.length && timingSafeEqual(received, expected);
+}
 
 function json(response: ServerResponse, statusCode: number, value: unknown): void {
   const body = JSON.stringify(jsonSafe(value));
@@ -370,6 +390,13 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       const pathname = new URL(request.url ?? '/', 'http://localhost').pathname;
       if (request.method === 'OPTIONS') {
         response.writeHead(204).end();
+        return;
+      }
+
+      if (!UNAUTHENTICATED_PATHS.has(pathname) && !isAuthorized(request, options.bearerToken)) {
+        // No WWW-Authenticate on purpose: MCP connector auto-detection treats a
+        // plain 401 as a bearer gate rather than an OAuth server.
+        json(response, 401, { error: { code: 'unauthorized', message: 'A valid Authorization: Bearer token is required.' } });
         return;
       }
 

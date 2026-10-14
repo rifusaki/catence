@@ -83,6 +83,37 @@ describe('Catence Streamable HTTP server', () => {
     expect(invalidDashboard.status).toBe(400);
   });
 
+  it('gates every endpoint except health behind the bearer token', async () => {
+    const { paths, database } = await temporaryDatabase();
+    await database.close();
+    const server = createCatenceHttpServer({ paths, bearerToken: 'secret-token' });
+    servers.push(server);
+    const origin = await listen(server);
+
+    const unauthenticated = await fetch(`${origin}/mcp`);
+    expect(unauthenticated.status).toBe(401);
+    await expect(unauthenticated.json()).resolves.toEqual(expect.objectContaining({ error: expect.objectContaining({ code: 'unauthorized' }) }));
+    expect(unauthenticated.headers.get('www-authenticate')).toBeNull();
+
+    const wrongToken = await fetch(`${origin}/api/v1/athletes`, { headers: { authorization: 'Bearer nope' } });
+    expect(wrongToken.status).toBe(401);
+
+    const unauthorizedDashboard = await fetch(`${origin}/api/v1/dashboard?athleteId=local`);
+    expect(unauthorizedDashboard.status).toBe(401);
+
+    const health = await fetch(`${origin}/health`);
+    expect(health.status).toBe(200);
+    const apiHealth = await fetch(`${origin}/api/v1/health`);
+    expect(apiHealth.status).toBe(200);
+
+    const preflight = await fetch(`${origin}/api/v1/athletes`, { method: 'OPTIONS' });
+    expect(preflight.status).toBe(204);
+
+    const authorized = await fetch(`${origin}/api/v1/athletes`, { headers: { authorization: 'Bearer secret-token' } });
+    expect(authorized.status).toBe(200);
+    await expect(authorized.json()).resolves.toEqual(expect.objectContaining({ defaultAthleteId: 'local' }));
+  });
+
   it('creates catalog athletes through POST /api/v1/athletes', async () => {
     const home = await mkdtemp(path.join(tmpdir(), 'catence-athletes-http-'));
     const catalogPaths = resolveCatalogPaths(home);

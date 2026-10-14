@@ -2,7 +2,7 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { existsSync } from 'node:fs';
 import { addAthlete, athleteStorePaths, CatenceDatabase, createDemoStore, defaultCatalogHome, initializeCatalog, loadCatalog, resolveCatalogPaths } from '../../runtime/index.js';
-import { parseServeCliOptions, SERVE_USAGE } from '../http/cli-options.js';
+import { loadBearerToken, parseServeCliOptions, SERVE_USAGE } from '../http/cli-options.js';
 import { createCatenceHttpServer } from '../http/server.js';
 import { MCP_USAGE, parseMcpCliOptions } from './cli-options.js';
 import { createCatenceMcpServer } from './server.js';
@@ -45,9 +45,11 @@ async function run(): Promise<void> {
       return;
     }
     await migrateCatalogStores(options.home);
+    const bearerToken = options.authTokenFile ? loadBearerToken(options.authTokenFile) : undefined;
     const httpServer = createCatenceHttpServer({
       catalogPaths: resolveCatalogPaths(options.home),
       allowedOrigins: options.allowedOrigins,
+      bearerToken,
     });
     await new Promise<void>((resolve, reject) => {
       httpServer.once('error', reject);
@@ -57,6 +59,7 @@ async function run(): Promise<void> {
       });
     });
     console.error(`Catence Streamable HTTP server is listening at http://${options.host}:${options.port}/mcp`);
+    if (bearerToken) console.error('Bearer-token authentication is enabled; health endpoints stay open for readiness probes.');
     const close = () => {
       httpServer.close(() => process.exit(0));
     };

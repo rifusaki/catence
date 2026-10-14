@@ -302,6 +302,31 @@ catence serve --host 127.0.0.1 --port 8787
 By default it is loopback-only. `CATENCE_HTTP_HOST` and `CATENCE_HTTP_PORT`
 override the host and port when the flags are omitted.
 
+#### Bearer-token authentication
+
+The server has no authentication of its own; when it must be reachable beyond
+loopback (for example through a Cloudflare Tunnel to an MCP client such as
+Mistral Work), require a bearer token with `--auth-token-file <path>`
+(environment equivalent: `CATENCE_MCP_TOKEN_FILE`):
+
+```sh
+catence serve --host 127.0.0.1 --port 8787 --auth-token-file /path/to/token
+```
+
+- The file holds one token (whitespace-trimmed); generate one with
+  `openssl rand -hex 32`. An unreadable or empty file aborts startup.
+- Every endpoint except `/health` and `/api/v1/health` (kept open for readiness
+  probes) then answers `401` without an exact
+  `Authorization: Bearer <token>` header. The `401` deliberately carries no
+  `WWW-Authenticate`, so MCP clients with auth auto-detection (Mistral Work)
+  classify the server as bearer-auth rather than OAuth.
+- CORS preflights (`OPTIONS`) pass through without a token.
+- Rotation: rewrite the file and restart the server. Keep the token out of
+  `.env`, `config.json`, shell history, and repositories.
+- The Console attaches the same header automatically to its runtime calls when
+  `CATENCE_MCP_TOKEN_FILE` is set, and refuses to start if the file is
+  unreadable.
+
 - `GET /api/v1/athletes` returns IDs and labels only.
 - `POST /api/v1/athletes` creates a catalog athlete from
   `{"id": "sam", "label": "Sam", "setDefault": false}` and answers with the

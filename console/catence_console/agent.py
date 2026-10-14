@@ -33,6 +33,7 @@ from .generation_sidecar import (
     start_generation_sidecar,
     update_generation_sidecar,
 )
+from .mcp_auth import runtime_authorization_headers
 from .mcp_servers import ToolServerConnection, ToolServerFailure, open_tool_servers
 from .persistence import SavedToolCall, ToolCallStore
 
@@ -646,7 +647,7 @@ async def respond(
 
     try:
         async with AsyncExitStack() as stack:
-            transport = await stack.enter_async_context(streamablehttp_client(mcp_url))
+            transport = await stack.enter_async_context(streamablehttp_client(mcp_url, headers=runtime_authorization_headers()))
             read_stream, write_stream = transport[:2]
             session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
             initialized = await session.initialize()

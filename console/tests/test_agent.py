@@ -82,7 +82,7 @@ def test_provider_safe_schema_rewrites_tuple_items_for_upstream_gateways():
 
 
 def test_respond_normalizes_mcp_tools_for_litellm(monkeypatch):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
     captured = {}
 
@@ -120,7 +120,7 @@ def test_respond_normalizes_mcp_tools_for_litellm(monkeypatch):
 
 
 def test_respond_never_sends_reasoning_effort_for_disabled_models(monkeypatch):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
     captured = {}
 
@@ -156,7 +156,7 @@ def test_respond_never_sends_reasoning_effort_for_disabled_models(monkeypatch):
 
 @pytest.mark.parametrize("base_env", ["OPENCODE_GO_API_BASE", "OPENCODE_GO_MESSAGES_API_BASE"])
 def test_respond_sends_opencode_go_headers_for_go_profiles(monkeypatch, base_env):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
     captured = {}
 
@@ -187,7 +187,7 @@ def test_respond_sends_opencode_go_headers_for_go_profiles(monkeypatch, base_env
 
 
 def test_respond_omits_opencode_go_headers_for_other_profiles(monkeypatch):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
     captured = {}
 
@@ -281,7 +281,7 @@ def test_selected_athlete_overrides_model_supplied_scope_for_data_tools():
 
 
 def test_respond_system_scope_message_names_the_selected_athlete(monkeypatch):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
 
     def scope_messages(**overrides):
@@ -319,7 +319,7 @@ def test_respond_system_scope_message_names_the_selected_athlete(monkeypatch):
 
 
 def test_respond_passes_mcp_instructions_and_saved_call_context_to_the_model(monkeypatch, tmp_path):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
     store = tool_call_store(tmp_path)
     store.record(
@@ -370,7 +370,7 @@ def test_respond_passes_mcp_instructions_and_saved_call_context_to_the_model(mon
 
 
 def test_respond_records_completed_mcp_calls(monkeypatch, tmp_path):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
     store = tool_call_store(tmp_path)
 
@@ -427,7 +427,7 @@ def test_respond_records_completed_mcp_calls(monkeypatch, tmp_path):
 
 
 def test_respond_unwraps_client_session_task_group_exception(monkeypatch):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", WrappingSession)
 
     async def complete(**kwargs):
@@ -447,7 +447,7 @@ def test_respond_unwraps_client_session_task_group_exception(monkeypatch):
 
 
 def test_respond_keeps_multi_error_groups_grouped(monkeypatch):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", WrappingSession)
 
     async def complete(**kwargs):
@@ -495,7 +495,7 @@ class _RecordingStep:
 
 def test_tool_steps_nest_under_the_triggering_user_message(monkeypatch):
     """Tool steps must carry the edited/regenerated message as their parent."""
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
     monkeypatch.setattr(agent.cl, "Step", _RecordingStep)
     _RecordingStep.instances.clear()
@@ -698,7 +698,7 @@ def test_respond_injects_the_athlete_file_as_data(monkeypatch):
         async def call_tool(self, name, arguments):
             return athlete_file_result
 
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", InjectionSession)
 
     captured: dict[str, object] = {}
@@ -778,7 +778,7 @@ def _final_completion():
 
 
 def test_respond_offers_extra_tool_servers_and_routes_their_calls(monkeypatch):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
     connection, session = _exa_connection([_search_tool()])
     _extra_open(monkeypatch, [connection])
@@ -814,7 +814,7 @@ def test_respond_offers_extra_tool_servers_and_routes_their_calls(monkeypatch):
 
 
 def test_extra_tool_names_are_namespaced_when_they_collide(monkeypatch):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
     connection, session = _exa_connection(
         [{"name": "daily_recovery_review", "description": "Collides", "inputSchema": {"type": "object", "properties": {}}}]
@@ -849,7 +849,7 @@ def test_extra_tool_names_are_namespaced_when_they_collide(monkeypatch):
 
 
 def test_tool_server_failures_are_reported_without_failing_the_turn(monkeypatch):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
     failure = ToolServerFailure(
         name="exa",
@@ -907,7 +907,7 @@ def test_scoped_arguments_only_touch_catence_tools_when_restricted():
 
 
 def test_respond_heartbeats_while_a_model_call_is_in_flight(monkeypatch):
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
     monkeypatch.setattr(agent, "_MODEL_CALL_HEARTBEAT_SECONDS", 0.01)
     heartbeats = []
@@ -947,7 +947,7 @@ def test_respond_heartbeats_while_a_model_call_is_in_flight(monkeypatch):
 
 def test_respond_times_out_a_hung_model_call(monkeypatch, tmp_path):
     monkeypatch.setenv("CATENCE_HOME", str(tmp_path))
-    monkeypatch.setattr(agent, "streamablehttp_client", lambda _: FakeTransport())
+    monkeypatch.setattr(agent, "streamablehttp_client", lambda url, **kwargs: FakeTransport())
     monkeypatch.setattr(agent, "ClientSession", FakeSession)
     monkeypatch.setattr(agent, "_MODEL_CALL_TIMEOUT_SECONDS", 0.05)
 

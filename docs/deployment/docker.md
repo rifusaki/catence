@@ -506,6 +506,34 @@ claude mcp add --transport http catence -- http://<tailscale-ip>:8787/mcp
   same-origin route.
 - SSH port forwarding keeps the trust boundary at your SSH credentials.
 
+### Bearer-token authentication for remote MCP clients
+
+To serve the MCP endpoint to a remote MCP client (for example a Mistral Work
+custom connector) over a Cloudflare Tunnel, enable bearer-token
+authentication instead of leaving the runtime unauthenticated. Set
+`CATENCE_MCP_TOKEN_FILE` in `catence-deploy/.env` to a host file holding one
+token (`openssl rand -hex 32`); the deploy script bind-mounts that file
+read-only into the container at the same path:
+
+```sh
+# once, when the stack is already deployed:
+printf %s "$(openssl rand -hex 32)" > /srv/catence-mcp-token   # mode 0600, outside the data volume
+echo "CATENCE_MCP_TOKEN_FILE=/srv/catence-mcp-token" >> catence-deploy/.env
+./scripts/deploy-console.sh beta    # re-renders compose with the token mount
+```
+
+With the token configured, every runtime endpoint except `/health` and
+`/api/v1/health` answers `401` without an exact `Authorization: Bearer
+<token>` header — including `/mcp` and the JSON APIs. The Console attaches
+the header automatically to its own runtime calls, and refuses to start when
+the configured file is unreadable or empty.
+
+Keep `CATENCE_MCP_BIND=127.0.0.1` (the default): the tunnel client on the
+host forwards to the host-loopback mapping, so the port still never binds a
+LAN interface. Point the tunnel ingress for the MCP hostname at
+`http://127.0.0.1:8787` and complete the client's credential flow with the
+same token. Rotate by rewriting the file and restarting the stack.
+
 ## Exposing the Console safely
 
 Keep the Console port bound to `127.0.0.1` (the default) and front it with a

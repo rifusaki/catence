@@ -1,8 +1,11 @@
+import { readFileSync } from 'node:fs';
+
 export type ServeCliOptions = {
   home?: string;
   host: string;
   port: number;
   allowedOrigins: string[];
+  authTokenFile?: string;
   help: boolean;
 };
 
@@ -15,7 +18,21 @@ Options:
   --host <host>              Listener host. Defaults to 127.0.0.1.
   --port <port>              Listener port. Defaults to 8787.
   --allow-origin <origin>    Browser origin allowed to call Catence APIs. May be repeated.
+  --auth-token-file <path>   Require 'Authorization: Bearer <token>' on every request except
+                             the health endpoints. Defaults to CATENCE_MCP_TOKEN_FILE.
   -h, --help                 Show this help text.`;
+
+/** Read and validate the bearer token from a file: trimmed, non-empty, or fail loudly. */
+export function loadBearerToken(filePath: string): string {
+  let token: string;
+  try {
+    token = readFileSync(filePath, 'utf8').trim();
+  } catch (error) {
+    throw new Error(`Cannot read the auth token file ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!token) throw new Error(`The auth token file ${filePath} is empty.`);
+  return token;
+}
 
 function requiredValue(arguments_: readonly string[], index: number, option: string): string {
   const value = arguments_[index + 1];
@@ -35,10 +52,11 @@ export function parseServeCliOptions(arguments_: readonly string[]): ServeCliOpt
   let host = process.env.CATENCE_HTTP_HOST ?? '127.0.0.1';
   let port = process.env.CATENCE_HTTP_PORT ? parsePort(process.env.CATENCE_HTTP_PORT) : 8787;
   const allowedOrigins: string[] = [];
+  let authTokenFile: string | undefined = process.env.CATENCE_MCP_TOKEN_FILE || undefined;
 
   for (let index = 0; index < arguments_.length; index++) {
     const argument = arguments_[index];
-    if (argument === '-h' || argument === '--help') return { home, host, port, allowedOrigins, help: true };
+    if (argument === '-h' || argument === '--help') return { home, host, port, allowedOrigins, authTokenFile, help: true };
     if (argument === '--home') {
       home = requiredValue(arguments_, index, '--home');
       index++;
@@ -47,6 +65,16 @@ export function parseServeCliOptions(arguments_: readonly string[]): ServeCliOpt
     if (argument.startsWith('--home=')) {
       home = argument.slice('--home='.length);
       if (!home) throw new Error('--home requires a value.');
+      continue;
+    }
+    if (argument === '--auth-token-file') {
+      authTokenFile = requiredValue(arguments_, index, '--auth-token-file');
+      index++;
+      continue;
+    }
+    if (argument.startsWith('--auth-token-file=')) {
+      authTokenFile = argument.slice('--auth-token-file='.length);
+      if (!authTokenFile) throw new Error('--auth-token-file requires a value.');
       continue;
     }
     if (argument === '--host') {
@@ -82,5 +110,5 @@ export function parseServeCliOptions(arguments_: readonly string[]): ServeCliOpt
     throw new Error(`Unknown option: ${argument}`);
   }
 
-  return { home, host, port, allowedOrigins, help: false };
+  return { home, host, port, allowedOrigins, authTokenFile, help: false };
 }

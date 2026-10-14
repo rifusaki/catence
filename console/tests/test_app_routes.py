@@ -157,7 +157,7 @@ def test_member_without_athlete_parameter_falls_back_to_the_first_grant(console_
     response = client_for("rifusaki").get("/api/v1/dashboard?days=7")
 
     assert response.status_code == 200
-    assert captured["target"].endswith("/api/v1/dashboard?days=7&athleteId=martina")
+    assert captured["target"].full_url.endswith("/api/v1/dashboard?days=7&athleteId=martina")
 
 
 def test_zero_grant_member_is_forbidden_on_athlete_scoped_routes(console_home):
@@ -395,7 +395,7 @@ def test_generation_status_proxy_requires_login_and_forwards_the_path(console_ho
 
     assert response.status_code == 200
     assert response.json() == {"threadId": "abc", "running": True, "stale": False}
-    assert captured["target"].endswith("/api/v1/threads/abc/generation")
+    assert captured["target"].full_url.endswith("/api/v1/threads/abc/generation")
 
 
 def test_athlete_secrets_proxy_requires_login(console_home):
@@ -471,8 +471,8 @@ def test_athlete_secrets_proxy_forwards_reads_writes_and_removals(console_home, 
     assert remove.status_code == 200
 
     read_target = captured[0]
-    assert isinstance(read_target, str)
-    assert read_target.endswith("/api/v1/athlete-secrets?athleteId=martina")
+    assert read_target.get_method() == "GET"
+    assert read_target.full_url.endswith("/api/v1/athlete-secrets?athleteId=martina")
 
     write_request = captured[1]
     assert write_request.get_method() == "PUT"

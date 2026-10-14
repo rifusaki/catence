@@ -37,6 +37,7 @@ PORT="${CATENCE_CONSOLE_PORT:-8000}"
 BIND="${CATENCE_BIND_ADDRESS:-127.0.0.1}"
 MCP_BIND="${CATENCE_MCP_BIND:-}"
 MCP_PORT="${CATENCE_MCP_PORT:-8787}"
+MCP_TOKEN_FILE="${CATENCE_MCP_TOKEN_FILE:-}"   # optional host file with the bearer token
 DEPLOY_DIR="${CATENCE_DEPLOY_DIR:-catence-deploy}"
 USERNAME="${CATENCE_CONSOLE_USERNAME:-}"
 NPM_VERSION="${CATENCE_NPM_VERSION:-}"           # optional pin
@@ -175,6 +176,7 @@ if [ -f "$DEPLOY_DIR/.env" ]; then
   [ -n "${OPENCODE_GO_API_BASE:-}" ]         || OPENCODE_GO_API_BASE="$(dotenv_get OPENCODE_GO_API_BASE "$DEPLOY_DIR/.env")"
   [ -n "${OPENCODE_GO_MESSAGES_API_BASE:-}" ] || OPENCODE_GO_MESSAGES_API_BASE="$(dotenv_get OPENCODE_GO_MESSAGES_API_BASE "$DEPLOY_DIR/.env")"
   [ -n "${MCP_BIND:-}" ]            || MCP_BIND="$(dotenv_get CATENCE_MCP_BIND "$DEPLOY_DIR/.env")"
+  [ -n "${MCP_TOKEN_FILE:-}" ]      || MCP_TOKEN_FILE="$(dotenv_get CATENCE_MCP_TOKEN_FILE "$DEPLOY_DIR/.env")"
 fi
 
 # The environment break-glass account is a pair: remember the username as
@@ -360,6 +362,20 @@ write_compose() {
     volumes_block="volumes:
   ${DATA_VOLUME}:"
   fi
+  # The bearer token file is bind-mounted read-only at the same path inside the
+  # container, so the token itself never enters .env or the image. Without a
+  # configured file the runtime stays unauthenticated (loopback-only).
+  local token_env token_volume=""
+  if [ -n "$MCP_TOKEN_FILE" ]; then
+    if [ ! -f "$MCP_TOKEN_FILE" ]; then
+      echo "CATENCE_MCP_TOKEN_FILE points to a missing file: $MCP_TOKEN_FILE" >&2
+      exit 1
+    fi
+    token_env="CATENCE_MCP_TOKEN_FILE: \"${MCP_TOKEN_FILE}\""
+    token_volume="      - ${MCP_TOKEN_FILE}:${MCP_TOKEN_FILE}:ro"
+  else
+    token_env="CATENCE_MCP_TOKEN_FILE: \"\""
+  fi
 
   cat > "$DEPLOY_DIR/docker-compose.yml" <<EOF
 name: ${PROJECT}
@@ -381,6 +397,7 @@ services:
     environment:
       CATENCE_HOME: /data
       CATENCE_MCP_BIND: "\${CATENCE_MCP_BIND:-${MCP_BIND}}"
+      ${token_env}
       CATENCE_CONSOLE_USERNAME: "\${CATENCE_CONSOLE_USERNAME:-}"
       CATENCE_CONSOLE_PASSWORD_HASH: "\${CATENCE_CONSOLE_PASSWORD_HASH:-}"
       CHAINLIT_AUTH_SECRET: "\${CHAINLIT_AUTH_SECRET:-}"
@@ -392,6 +409,7 @@ services:
       OPENCODE_GO_MESSAGES_API_BASE: "\${OPENCODE_GO_MESSAGES_API_BASE:-}"
     volumes:
       - ${volume_spec}:/data
+${token_volume}
 
 ${volumes_block}
 EOF
@@ -413,6 +431,7 @@ CATENCE_CONSOLE_USERNAME=${env_username}
 CATENCE_CONSOLE_PASSWORD_HASH=${PASSWORD_HASH}
 CHAINLIT_AUTH_SECRET=${AUTH_SECRET}
 CATENCE_MCP_BIND=${MCP_BIND}
+CATENCE_MCP_TOKEN_FILE=${MCP_TOKEN_FILE}
 OPENAI_API_KEY=${OPENAI_API_KEY:-}
 OPENAI_API_BASE=${OPENAI_API_BASE:-}
 ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
