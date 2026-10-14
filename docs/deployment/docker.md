@@ -509,30 +509,43 @@ claude mcp add --transport http catence -- http://<tailscale-ip>:8787/mcp
 ### Bearer-token authentication for remote MCP clients
 
 To serve the MCP endpoint to a remote MCP client (for example a Mistral Work
-custom connector) over a Cloudflare Tunnel, enable bearer-token
-authentication instead of leaving the runtime unauthenticated. Set
-`CATENCE_MCP_TOKEN_FILE` in `catence-deploy/.env` to a host file holding one
-token (`openssl rand -hex 32`); the deploy script bind-mounts that file
-read-only into the container at the same path:
+custom connector) over a Cloudflare Tunnel, switch on the native
+bearer-token gate. The deploy scaffold arms it at `/data/mcp-token` (inside
+the data volume, so it survives rebuilds); the file's presence is the switch
+and Catence generates the token itself:
 
 ```sh
-# once, when the stack is already deployed:
-printf %s "$(openssl rand -hex 32)" > /srv/catence-mcp-token   # mode 0600, outside the data volume
-echo "CATENCE_MCP_TOKEN_FILE=/srv/catence-mcp-token" >> catence-deploy/.env
-./scripts/deploy-console.sh beta    # re-renders compose with the token mount
+# enable from the host (or use the Console Settings once logged in):
+docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env \
+  exec console catence-data --home /data mcp enable
+
+# print the token for the client's credential flow:
+docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env \
+  exec console catence-data --home /data mcp token
+
+# disable again:
+docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env \
+  exec console catence-data --home /data mcp disable
 ```
 
-With the token configured, every runtime endpoint except `/health` and
+With the gate enabled, every runtime endpoint except `/health` and
 `/api/v1/health` answers `401` without an exact `Authorization: Bearer
-<token>` header — including `/mcp` and the JSON APIs. The Console attaches
-the header automatically to its own runtime calls, and refuses to start when
-the configured file is unreadable or empty.
+<token>` header — including `/mcp` and the JSON APIs. Toggling takes effect
+without a restart; the Console attaches the header automatically to its own
+runtime calls.
 
 Keep `CATENCE_MCP_BIND=127.0.0.1` (the default): the tunnel client on the
 host forwards to the host-loopback mapping, so the port still never binds a
 LAN interface. Point the tunnel ingress for the MCP hostname at
 `http://127.0.0.1:8787` and complete the client's credential flow with the
-same token. Rotate by rewriting the file and restarting the stack.
+token from `mcp token`. Rotate with `mcp disable && mcp enable` and
+re-authenticate the client. The only additional setup the tunnel needs is
+the ingress rule for the MCP hostname.
+
+A custom host-side token file is still possible: set
+`CATENCE_MCP_TOKEN_FILE=<host path>` in `.env`. The file is then bind-mounted
+read-only at the same path, so it must already exist on the host — enabling
+from the Console cannot create it.
 
 ## Exposing the Console safely
 

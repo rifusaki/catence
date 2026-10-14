@@ -1,8 +1,16 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { loadBearerToken, parseServeCliOptions, SERVE_USAGE } from '../src/interfaces/http/cli-options.js';
+import {
+  defaultBearerTokenPath,
+  disableBearerToken,
+  ensureBearerToken,
+  loadBearerToken,
+  parseServeCliOptions,
+  readBearerToken,
+  SERVE_USAGE,
+} from '../src/interfaces/http/cli-options.js';
 
 describe('parseServeCliOptions', () => {
   it('uses local-only defaults', () => {
@@ -56,5 +64,24 @@ describe('loadBearerToken', () => {
     writeFileSync(filePath, '   \n');
     expect(() => loadBearerToken(filePath)).toThrow('is empty');
     expect(() => loadBearerToken(path.join(directory, 'missing'))).toThrow('Cannot read the auth token file');
+  });
+});
+
+describe('bearer-token lifecycle', () => {
+  it('generates a 0600 token once, reuses it, and disable removes it', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'catence-exposure-'));
+    const filePath = defaultBearerTokenPath(directory);
+    expect(filePath).toBe(path.join(directory, 'mcp-token'));
+    expect(readBearerToken(filePath)).toBeNull();
+
+    const generated = ensureBearerToken(filePath);
+    expect(generated).toMatch(/^[0-9a-f]{64}$/);
+    expect(readBearerToken(filePath)).toBe(generated);
+    expect(ensureBearerToken(filePath)).toBe(generated);
+
+    disableBearerToken(filePath);
+    expect(readBearerToken(filePath)).toBeNull();
+    disableBearerToken(filePath); // idempotent
+    rmSync(directory, { recursive: true, force: true });
   });
 });

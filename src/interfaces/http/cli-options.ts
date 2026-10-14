@@ -1,4 +1,5 @@
-import { readFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 
 export type ServeCliOptions = {
   home?: string;
@@ -18,11 +19,17 @@ Options:
   --host <host>              Listener host. Defaults to 127.0.0.1.
   --port <port>              Listener port. Defaults to 8787.
   --allow-origin <origin>    Browser origin allowed to call Catence APIs. May be repeated.
-  --auth-token-file <path>   Require 'Authorization: Bearer <token>' on every request except
-                             the health endpoints. Defaults to CATENCE_MCP_TOKEN_FILE.
+  --auth-token-file <path>   Bearer-token file for the HTTP gate. Its presence switches authentication on;
+                             generate/inspect it with 'catence-data mcp enable|token'.
+                             Defaults to CATENCE_MCP_TOKEN_FILE or <catalog-home>/mcp-token.
   -h, --help                 Show this help text.`;
 
-/** Read and validate the bearer token from a file: trimmed, non-empty, or fail loudly. */
+/** The canonical token location inside a catalog home. */
+export function defaultBearerTokenPath(catalogRoot: string): string {
+  return `${catalogRoot.replace(/[/\\]+$/, '')}/mcp-token`;
+}
+
+/** Read and validate a stored bearer token: trimmed, non-empty, or fail loudly. */
 export function loadBearerToken(filePath: string): string {
   let token: string;
   try {
@@ -32,6 +39,79 @@ export function loadBearerToken(filePath: string): string {
   }
   if (!token) throw new Error(`The auth token file ${filePath} is empty.`);
   return token;
+}
+
+/**
+ * The bearer token for the server: the stored one, or a freshly generated
+ * token written to the file (mode 0600) when it does not exist yet. Users
+ * never hand-craft tokens; they enable auth and read the result with
+ * `catence-data mcp-token`.
+ */
+export function ensureBearerToken(filePath: string): string {
+  if (existsSync(filePath)) return loadBearerToken(filePath);
+  const token = randomBytes(32).toString('hex');
+  writeFileSync(filePath, token, { mode: 0o600 });
+  return token;
+}
+
+export function disableBearerToken(filePath: string): void {
+  if (existsSync(filePath)) rmSync(filePath);
+}
+
+/** The bearer token when exposure is enabled, or null when no token file exists. */
+export function readBearerToken(filePath: string): string | null {
+  return existsSync(filePath) ? loadBearerToken(filePath) : null;
+}
+
+type CachedToken = { mtimeMs: number; token: string | null };
+const tokenCache = new Map<string, CachedToken>();
+
+/**
+ * The currently active bearer token for the HTTP gate, cached by the token
+ * file's mtime so enabling or disabling is picked up without a restart. A
+ * missing file disables the gate; an existing but unreadable or empty file
+ * fails closed (the gate rejects everything except health probes).
+ */
+export function activeBearerToken(filePath: string): string | null | 'invalid' {
+  let mtimeMs = 0;
+  try {
+    mtimeMs = statSync(filePath).mtimeMs;
+  } catch {
+    tokenCache.set(filePath, { mtimeMs: 0, token: null });
+    return null;
+  }
+  const cached = tokenCache.get(filePath);
+  if (cached && cached.mtimeMs === mtimeMs) {
+    return cached.token === null ? 'invalid' : cached.token;
+  }
+  try {
+    const token = loadBearerToken(filePath);
+    tokenCache.set(filePath, { mtimeMs, token });
+    return token;
+  } catch {
+    tokenCache.set(filePath, { mtimeMs, token: null });
+    return 'invalid';
+  }
+}
+
+export type McpExposureStatus = {
+  enabled: boolean;
+  tokenFile: string;
+  endpoint: string;
+  healthEndpoint: string;
+  token?: string;
+};
+
+export function mcpExposureStatus(filePath: string, endpointBase: string): McpExposureStatus {
+  const token = readBearerToken(filePath);
+  const base = endpointBase.replace(/\/+$/, '');
+  return {
+    enabled: token !== null,
+    tokenFile: filePath,
+    endpoint: `${base}/mcp`,
+    healthEndpoint: `${base}/health`,
+    ...(token !== null ? { token } : {}),
+  };
 }
 
 function requiredValue(arguments_: readonly string[], index: number, option: string): string {

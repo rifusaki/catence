@@ -3,6 +3,13 @@ import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { Command } from 'commander';
 import {
+  defaultBearerTokenPath,
+  disableBearerToken,
+  ensureBearerToken,
+  mcpExposureStatus,
+  readBearerToken,
+} from '../http/cli-options.js';
+import {
   addAthlete,
   athleteStorePaths,
   CATENCE_RUNTIME_VERSION,
@@ -74,6 +81,45 @@ async function stdinSecret(): Promise<string> {
   if (!value) throw new Error('--value-stdin received an empty secret.');
   return value;
 }
+
+const mcpCommand = program.command('mcp').description('Manage Streamable HTTP MCP exposure: the bearer-token gate, its token, and endpoint URLs.');
+const mcpLocalEndpoint = (): string => `http://127.0.0.1:${process.env.CATENCE_HTTP_PORT ?? '8787'}`;
+
+mcpCommand.command('status')
+  .description('Report whether the bearer-token gate is enabled, the token, and the endpoint URLs.')
+  .option('--file <path>', 'non-default token file path')
+  .action(async (options: { file?: string }) => {
+    const tokenFile = options.file ?? defaultBearerTokenPath(currentCatalog().root);
+    process.stdout.write(`${JSON.stringify(mcpExposureStatus(tokenFile, mcpLocalEndpoint()), null, 2)}\n`);
+  });
+
+mcpCommand.command('enable')
+  .description('Enable the bearer-token gate: generate the token file (mode 0600) if it does not exist.')
+  .option('--file <path>', 'non-default token file path')
+  .action(async (options: { file?: string }) => {
+    const tokenFile = options.file ?? defaultBearerTokenPath(currentCatalog().root);
+    ensureBearerToken(tokenFile);
+    process.stdout.write(`${JSON.stringify(mcpExposureStatus(tokenFile, mcpLocalEndpoint()), null, 2)}\n`);
+  });
+
+mcpCommand.command('disable')
+  .description('Disable the bearer-token gate by removing the token file. Remote access is refused again.')
+  .option('--file <path>', 'non-default token file path')
+  .action(async (options: { file?: string }) => {
+    const tokenFile = options.file ?? defaultBearerTokenPath(currentCatalog().root);
+    disableBearerToken(tokenFile);
+    process.stdout.write(`${JSON.stringify(mcpExposureStatus(tokenFile, mcpLocalEndpoint()), null, 2)}\n`);
+  });
+
+mcpCommand.command('token')
+  .description('Print only the bearer token for pasting into an MCP client credential flow.')
+  .option('--file <path>', 'non-default token file path')
+  .action(async (options: { file?: string }) => {
+    const tokenFile = options.file ?? defaultBearerTokenPath(currentCatalog().root);
+    const token = readBearerToken(tokenFile);
+    if (token === null) throw new Error(`MCP exposure is not enabled; run 'catence-data mcp enable' first.`);
+    process.stdout.write(`${token}\n`);
+  });
 
 program.command('setup')
   .description('Create a home catalog and its first athlete store. Existing 0.1 stores must be re-synced.')

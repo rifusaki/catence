@@ -306,26 +306,40 @@ override the host and port when the flags are omitted.
 
 The server has no authentication of its own; when it must be reachable beyond
 loopback (for example through a Cloudflare Tunnel to an MCP client such as
-Mistral Work), require a bearer token with `--auth-token-file <path>`
-(environment equivalent: `CATENCE_MCP_TOKEN_FILE`):
+Mistral Work), switch on the bearer-token gate. The gate is armed at a token
+file — `<catalog-home>/mcp-token` by default, or the path given by
+`--auth-token-file` (environment equivalent: `CATENCE_MCP_TOKEN_FILE`) — and
+the **file's presence is the switch**: create it to enable, remove it to
+disable, no restart needed.
+
+Catence generates the token itself; never hand-craft one:
 
 ```sh
-catence serve --host 127.0.0.1 --port 8787 --auth-token-file /path/to/token
+catence-data mcp status    # enabled, token file, endpoint URLs
+catence-data mcp enable    # generate the token file (mode 0600) if missing
+catence-data mcp token      # print the token for the client credential flow
+catence-data mcp disable   # remove the file; remote access is refused again
 ```
 
-- The file holds one token (whitespace-trimmed); generate one with
-  `openssl rand -hex 32`. An unreadable or empty file aborts startup.
 - Every endpoint except `/health` and `/api/v1/health` (kept open for readiness
-  probes) then answers `401` without an exact
-  `Authorization: Bearer <token>` header. The `401` deliberately carries no
+  probes) answers `401` without an exact `Authorization: Bearer <token>`
+  header while the gate is on. The `401` deliberately carries no
   `WWW-Authenticate`, so MCP clients with auth auto-detection (Mistral Work)
   classify the server as bearer-auth rather than OAuth.
 - CORS preflights (`OPTIONS`) pass through without a token.
-- Rotation: rewrite the file and restart the server. Keep the token out of
+- An existing but unreadable or empty token file fails closed: the gate
+  rejects everything except the health probes until the file is fixed or
+  removed.
+- `GET /api/v1/mcp-exposure` reports the same status the Console Settings page
+  shows (including the token); `POST /api/v1/mcp-exposure` with
+  `{"enabled": true|false}` toggles the gate. The Console exposes both to
+  admins only.
+- Rotation: `catence-data mcp disable && catence-data mcp enable` (or rewrite
+  the file), then re-authenticate the MCP client. Keep the token out of
   `.env`, `config.json`, shell history, and repositories.
-- The Console attaches the same header automatically to its runtime calls when
-  `CATENCE_MCP_TOKEN_FILE` is set, and refuses to start if the file is
-  unreadable.
+- The Console attaches the same header automatically to its runtime calls and
+  reads the token file lazily, so enabling the gate from the Console or CLI
+  needs no Console restart either.
 
 - `GET /api/v1/athletes` returns IDs and labels only.
 - `POST /api/v1/athletes` creates a catalog athlete from

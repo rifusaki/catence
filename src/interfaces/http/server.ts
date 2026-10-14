@@ -33,6 +33,7 @@ import {
   type CatencePaths,
   type SecretProvider,
 } from '../../runtime/index.js';
+import { activeBearerToken, ensureBearerToken, disableBearerToken, mcpExposureStatus } from './cli-options.js';
 import { createCatenceMcpServer } from '../mcp/server.js';
 import { generationStatus } from './generation-status.js';
 
@@ -45,12 +46,20 @@ export type CatenceHttpServerOptions = {
   paths?: CatencePaths;
   allowedOrigins?: readonly string[];
   /**
-   * When set, every request except the health endpoints and CORS preflights
-   * must present `Authorization: Bearer <token>`. The MCP server has no
-   * authentication of its own; this gates it (and the JSON APIs) for
-   * non-loopback exposure such as a Cloudflare Tunnel to an MCP client.
+   * Static bearer token for the gate (tests and embedded single-store callers).
+   * Mutually exclusive with bearerTokenFile.
    */
   bearerToken?: string;
+  /**
+   * Token file whose presence switches the gate on: every request except the
+   * health endpoints and CORS preflights must present
+   * `Authorization: Bearer <token>`. The file is re-read on mtime change, so
+   * `catence-data mcp enable|disable` (and the /api/v1/mcp-exposure route)
+   * take effect without a restart. The MCP server has no other
+   * authentication; this gates it (and the JSON APIs) for non-loopback
+   * exposure such as a Cloudflare Tunnel to an MCP client.
+   */
+  bearerTokenFile?: string;
   /** Internal compatibility hook for tests: override the detached sync spawner. */
   startSync?: typeof startDetachedSync;
   /** Internal compatibility hook for tests: passed into the default startDetachedSync. */
@@ -63,8 +72,11 @@ export type CatenceHttpServerOptions = {
  * no personal data and must answer unauthenticated readiness probes. */
 const UNAUTHENTICATED_PATHS = new Set(['/health', '/api/v1/health']);
 
-function isAuthorized(request: IncomingMessage, bearerToken: string | undefined): boolean {
-  if (!bearerToken) return true;
+function isAuthorized(request: IncomingMessage, options: CatenceHttpServerOptions): boolean {
+  const bearerToken =
+    options.bearerToken !== undefined ? options.bearerToken : options.bearerTokenFile !== undefined ? activeBearerToken(options.bearerTokenFile) : undefined;
+  if (bearerToken === undefined || bearerToken === null) return true;
+  if (bearerToken === 'invalid') return false;
   const received = Buffer.from(request.headers.authorization ?? '');
   const expected = Buffer.from(`Bearer ${bearerToken}`);
   // timingSafeEqual throws on length mismatch, so compare sizes first.
@@ -393,7 +405,7 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
         return;
       }
 
-      if (!UNAUTHENTICATED_PATHS.has(pathname) && !isAuthorized(request, options.bearerToken)) {
+      if (!UNAUTHENTICATED_PATHS.has(pathname) && !isAuthorized(request, options)) {
         // No WWW-Authenticate on purpose: MCP connector auto-detection treats a
         // plain 401 as a bearer gate rather than an OAuth server.
         json(response, 401, { error: { code: 'unauthorized', message: 'A valid Authorization: Bearer token is required.' } });
@@ -663,6 +675,34 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
               message: error instanceof Error ? error.message : String(error)
             }
           });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/mcp-exposure' && request.method === 'GET') {
+        if (!options.bearerTokenFile) {
+          json(response, 400, { error: { code: 'exposure_not_configured', message: 'This server was started without a bearer-token file; restart it with --auth-token-file to manage MCP exposure.' } });
+          return;
+        }
+        json(response, 200, mcpExposureStatus(options.bearerTokenFile, `http://${request.headers.host ?? '127.0.0.1:8787'}`));
+        return;
+      }
+
+      if (pathname === '/api/v1/mcp-exposure' && request.method === 'POST') {
+        if (!options.bearerTokenFile) {
+          json(response, 400, { error: { code: 'exposure_not_configured', message: 'This server was started without a bearer-token file; restart it with --auth-token-file to manage MCP exposure.' } });
+          return;
+        }
+        try {
+          const body = await readJsonBody(request);
+          if (typeof body !== 'object' || body === null || Array.isArray(body) || !('enabled' in body) || typeof (body as Record<string, unknown>).enabled !== 'boolean') {
+            throw new Error('Request body must be a JSON object with a boolean "enabled" field.');
+          }
+          if ((body as Record<string, unknown>).enabled) ensureBearerToken(options.bearerTokenFile);
+          else disableBearerToken(options.bearerTokenFile);
+          json(response, 200, mcpExposureStatus(options.bearerTokenFile, `http://${request.headers.host ?? '127.0.0.1:8787'}`));
+        } catch (error) {
+          json(response, 400, { error: { code: 'exposure_update_failed', message: error instanceof Error ? error.message : String(error) } });
         }
         return;
       }

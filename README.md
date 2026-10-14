@@ -120,7 +120,7 @@ Optional local Streamable HTTP MCP and HTTP APIs:
 catence serve --host 127.0.0.1 --port 8787
 ```
 
-`GET /api/v1/athletes` returns IDs and labels only. `GET /api/v1/dashboard` requires `athleteId`, for example `http://127.0.0.1:8787/api/v1/dashboard?athleteId=alex&days=28`. Browser origins must be listed with `--allow-origin`; the packaged Console instead proxies the dashboard through its authenticated same-origin route. `POST /api/v1/athletes` creates a catalog athlete (`{"id": "sam", "label": "Sam", "setDefault": false}`); the packaged Console exposes the same call to admins from **Settings → Athletes**. The MCP server has no authentication of its own unless `--auth-token-file` (or `CATENCE_MCP_TOKEN_FILE`) requires a bearer token on every endpoint except the health probes.
+`GET /api/v1/athletes` returns IDs and labels only. `GET /api/v1/dashboard` requires `athleteId`, for example `http://127.0.0.1:8787/api/v1/dashboard?athleteId=alex&days=28`. Browser origins must be listed with `--allow-origin`; the packaged Console instead proxies the dashboard through its authenticated same-origin route. `POST /api/v1/athletes` creates a catalog athlete (`{"id": "sam", "label": "Sam", "setDefault": false}`); the packaged Console exposes the same call to admins from **Settings → Athletes**. The MCP server has no authentication of its own beyond the optional bearer-token gate: `catence-data mcp enable` generates a token at `<home>/mcp-token` and every endpoint except the health probes then requires `Authorization: Bearer <token>`; `mcp status`/`mcp token`/`mcp disable` manage it, and the Console Settings expose the same controls to admins.
 
 ## Configuration
 

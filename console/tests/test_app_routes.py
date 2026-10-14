@@ -594,3 +594,47 @@ def test_stopped_generation_does_not_deliver_a_stale_answer(monkeypatch, tmp_pat
     assert sent == []
     assert "stopped-thread" not in app._STOP_REQUESTED
     assert app._ACTIVE_GENERATIONS == {}
+
+
+def test_mcp_exposure_proxy_is_admin_only(console_home, monkeypatch):
+    monkeypatch.setattr(
+        app.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail("members must not reach the runtime for MCP exposure"),
+    )
+
+    member = client_for("rifusaki")
+    overview = member.get("/api/v1/mcp-exposure")
+    update = member.post("/api/v1/mcp-exposure", json={"enabled": True})
+
+    for response in (overview, update):
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "admin_required"
+
+
+def test_mcp_exposure_proxy_requires_login(console_home):
+    anonymous = TestClient(app.chainlit_server)
+
+    assert anonymous.get("/api/v1/mcp-exposure").status_code == 401
+    assert anonymous.post("/api/v1/mcp-exposure", json={"enabled": True}).status_code == 401
+
+
+def test_mcp_exposure_proxy_forwards_reads_and_updates(console_home, monkeypatch):
+    captured = []
+
+    def fake_urlopen(request, timeout=0):
+        captured.append(request)
+        return _Upstream(json.dumps({"enabled": True, "tokenFile": "/data/mcp-token", "token": "abc"}).encode("utf-8"))
+
+    monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
+
+    overview = client_for("coach").get("/api/v1/mcp-exposure")
+    assert overview.status_code == 200
+    assert overview.json()["enabled"] is True
+    assert captured[0].get_method() == "GET"
+    assert captured[0].full_url.endswith("/api/v1/mcp-exposure")
+
+    update = client_for("coach").post("/api/v1/mcp-exposure", json={"enabled": True})
+    assert update.status_code == 200
+    assert captured[1].get_method() == "POST"
+    assert json.loads(captured[1].data) == {"enabled": True}

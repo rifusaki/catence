@@ -2,7 +2,7 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { existsSync } from 'node:fs';
 import { addAthlete, athleteStorePaths, CatenceDatabase, createDemoStore, defaultCatalogHome, initializeCatalog, loadCatalog, resolveCatalogPaths } from '../../runtime/index.js';
-import { loadBearerToken, parseServeCliOptions, SERVE_USAGE } from '../http/cli-options.js';
+import { defaultBearerTokenPath, parseServeCliOptions, SERVE_USAGE } from '../http/cli-options.js';
 import { createCatenceHttpServer } from '../http/server.js';
 import { MCP_USAGE, parseMcpCliOptions } from './cli-options.js';
 import { createCatenceMcpServer } from './server.js';
@@ -45,11 +45,13 @@ async function run(): Promise<void> {
       return;
     }
     await migrateCatalogStores(options.home);
-    const bearerToken = options.authTokenFile ? loadBearerToken(options.authTokenFile) : undefined;
+    const catalogPaths = resolveCatalogPaths(options.home);
     const httpServer = createCatenceHttpServer({
-      catalogPaths: resolveCatalogPaths(options.home),
+      catalogPaths,
       allowedOrigins: options.allowedOrigins,
-      bearerToken,
+      // The token file's presence switches authentication on; enable it with
+      // `catence-data mcp enable` (or the Console Settings / exposure API).
+      bearerTokenFile: options.authTokenFile ?? defaultBearerTokenPath(catalogPaths.root),
     });
     await new Promise<void>((resolve, reject) => {
       httpServer.once('error', reject);
@@ -59,7 +61,7 @@ async function run(): Promise<void> {
       });
     });
     console.error(`Catence Streamable HTTP server is listening at http://${options.host}:${options.port}/mcp`);
-    if (bearerToken) console.error('Bearer-token authentication is enabled; health endpoints stay open for readiness probes.');
+    console.error(`Bearer-token authentication is armed at ${options.authTokenFile ?? defaultBearerTokenPath(catalogPaths.root)}; enable it with 'catence-data mcp enable'. Health endpoints stay open for readiness probes.`);
     const close = () => {
       httpServer.close(() => process.exit(0));
     };

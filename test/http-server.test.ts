@@ -1,5 +1,5 @@
 import type { AddressInfo } from 'node:net';
-import { mkdtemp, readFile, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -81,6 +81,41 @@ describe('Catence Streamable HTTP server', () => {
 
     const invalidDashboard = await fetch(`${origin}/api/v1/dashboard?days=0`);
     expect(invalidDashboard.status).toBe(400);
+  });
+
+  it('switches the bearer gate on and off through the token file and the exposure API', async () => {
+    const { paths, database } = await temporaryDatabase();
+    await database.close();
+    const tokenFile = path.join(await mkdtemp(path.join(tmpdir(), 'catence-gate-')), 'mcp-token');
+    const server = createCatenceHttpServer({ paths, bearerTokenFile: tokenFile });
+    servers.push(server);
+    const origin = await listen(server);
+
+    // Gate off: requests pass without a token; exposure reports disabled.
+    expect((await fetch(`${origin}/api/v1/athletes`)).status).toBe(200);
+    const disabled = await (await fetch(`${origin}/api/v1/mcp-exposure`)).json();
+    expect(disabled).toMatchObject({ enabled: false, tokenFile, endpoint: expect.stringContaining('/mcp') });
+    expect(disabled.token).toBeUndefined();
+
+    // Enable through the API: the generated token is returned once.
+    const enabledResponse = await fetch(`${origin}/api/v1/mcp-exposure`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: true }),
+    });
+    const enabled = await enabledResponse.json();
+    expect(enabled.enabled).toBe(true);
+    expect(typeof enabled.token).toBe('string');
+
+    // Gate on without a restart: same connection-less client needs the token.
+    expect((await fetch(`${origin}/api/v1/athletes`)).status).toBe(401);
+    const authorized = await fetch(`${origin}/api/v1/athletes`, { headers: { authorization: `Bearer ${enabled.token}` } });
+    expect(authorized.status).toBe(200);
+
+    // An empty token file fails closed instead of silently opening the gate.
+    await writeFile(tokenFile, '   \n');
+    expect((await fetch(`${origin}/api/v1/athletes`, { headers: { authorization: `Bearer ${enabled.token}` } })).status).toBe(401);
+    await rm(path.dirname(tokenFile), { recursive: true, force: true });
   });
 
   it('gates every endpoint except health behind the bearer token', async () => {

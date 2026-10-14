@@ -322,6 +322,28 @@ async def mutate_athlete_secret(request: Request) -> Response:
 async def health_proxy(request: Request) -> Response:
     return await _proxy_mcp_get(request, "/api/v1/health")
 
+
+async def mcp_exposure_overview(request: Request) -> Response:
+    """Read the MCP exposure status (gate, token, endpoint URLs) for Settings (admins only)."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to manage MCP exposure.")
+    return await _proxy_mcp_get(request, "/api/v1/mcp-exposure")
+
+
+async def mcp_exposure_update(request: Request) -> Response:
+    """Enable or disable the MCP bearer-token gate through the runtime (admins only)."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to manage MCP exposure.")
+    return await _proxy_mcp_post(request, "/api/v1/mcp-exposure", payload=await request.body())
+
 async def athlete_file_proxy(request: Request) -> Response:
     """Read or write the athlete file through the runtime's hash-guarded route."""
 
@@ -454,6 +476,12 @@ async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Res
         return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use GET or PUT for /api/v1/athlete-secrets."}}, status_code=405)
     if request.method == "POST" and request.url.path == "/api/v1/athlete-secrets/remove":
         return await mutate_athlete_secret(request)
+    if request.url.path == "/api/v1/mcp-exposure":
+        if request.method == "GET":
+            return await mcp_exposure_overview(request)
+        if request.method == "POST":
+            return await mcp_exposure_update(request)
+        return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use GET or POST for /api/v1/mcp-exposure."}}, status_code=405)
     return await call_next(request)
 
 

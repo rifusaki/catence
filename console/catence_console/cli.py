@@ -407,8 +407,8 @@ def serve(args: argparse.Namespace) -> int:
     mcp_url = args.mcp_url or f"http://{args.mcp_host}:{args.mcp_port}/mcp"
     console_root = Path(__file__).resolve().parent
     validate_auth_configuration()
-    # Fail fast when the runtime's auth token file is configured but unreadable;
-    # every later proxy and agent call would otherwise fail with confusing 401s.
+    # Fail fast when the runtime's auth token file exists but is unreadable or
+    # empty; a missing file just means the gate is off until it is enabled.
     runtime_token()
 
     # Best-effort data migration for Docker updates. The Node runtime bumps

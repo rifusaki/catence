@@ -37,7 +37,10 @@ PORT="${CATENCE_CONSOLE_PORT:-8000}"
 BIND="${CATENCE_BIND_ADDRESS:-127.0.0.1}"
 MCP_BIND="${CATENCE_MCP_BIND:-}"
 MCP_PORT="${CATENCE_MCP_PORT:-8787}"
-MCP_TOKEN_FILE="${CATENCE_MCP_TOKEN_FILE:-}"   # optional host file with the bearer token
+# Optional custom bearer-token file on the host. Defaults to the canonical
+# location inside the data volume (/data/mcp-token), which the runtime and the
+# Console manage via 'catence-data mcp enable' or the Console Settings.
+MCP_TOKEN_FILE="${CATENCE_MCP_TOKEN_FILE:-}"
 DEPLOY_DIR="${CATENCE_DEPLOY_DIR:-catence-deploy}"
 USERNAME="${CATENCE_CONSOLE_USERNAME:-}"
 NPM_VERSION="${CATENCE_NPM_VERSION:-}"           # optional pin
@@ -362,9 +365,11 @@ write_compose() {
     volumes_block="volumes:
   ${DATA_VOLUME}:"
   fi
-  # The bearer token file is bind-mounted read-only at the same path inside the
-  # container, so the token itself never enters .env or the image. Without a
-  # configured file the runtime stays unauthenticated (loopback-only).
+  # The bearer-token gate is switched on by the presence of a token file. By
+  # default the file lives in the data volume (/data/mcp-token) and is managed
+  # with 'catence-data mcp enable' or the Console Settings. A custom host path
+  # is bind-mounted read-only at the same path; enabling then cannot create
+  # it, so the file must already exist on the host.
   local token_env token_volume=""
   if [ -n "$MCP_TOKEN_FILE" ]; then
     if [ ! -f "$MCP_TOKEN_FILE" ]; then
@@ -374,7 +379,7 @@ write_compose() {
     token_env="CATENCE_MCP_TOKEN_FILE: \"${MCP_TOKEN_FILE}\""
     token_volume="      - ${MCP_TOKEN_FILE}:${MCP_TOKEN_FILE}:ro"
   else
-    token_env="CATENCE_MCP_TOKEN_FILE: \"\""
+    token_env="CATENCE_MCP_TOKEN_FILE: \"/data/mcp-token\""
   fi
 
   cat > "$DEPLOY_DIR/docker-compose.yml" <<EOF
