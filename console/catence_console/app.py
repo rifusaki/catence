@@ -458,6 +458,10 @@ async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Res
         return await sync_trigger_proxy(request)
     if request.method == "GET" and request.url.path == "/api/v1/sync/status":
         return await sync_status_proxy(request)
+    if request.method == "GET" and request.url.path == "/api/v1/sync/schedule":
+        return await _athlete_scoped_get(request, "/api/v1/sync/schedule")
+    if request.method == "PUT" and request.url.path == "/api/v1/sync/schedule":
+        return await sync_schedule_update_proxy(request)
     if (
         request.method == "GET"
         and request.url.path.startswith("/api/v1/threads/")
@@ -1029,7 +1033,7 @@ async def mutate_tool_server_secret(request: Request) -> Response:
         )
 
 
-async def _proxy_mcp_put(request: Request, path: str, query: str | None = None) -> Response:
+async def _proxy_mcp_put(request: Request, path: str, query: str | None = None, payload: bytes | None = None) -> Response:
     """Forward an authenticated PUT body to the runtime's JSON API."""
 
     if not _authenticated(request):
@@ -1038,7 +1042,8 @@ async def _proxy_mcp_put(request: Request, path: str, query: str | None = None) 
     effective_query = request.url.query if query is None else query
     if effective_query:
         target = f"{target}?{effective_query}"
-    payload = await request.body()
+    if payload is None:
+        payload = await request.body()
     headers = {"content-type": "application/json", **runtime_authorization_headers()}
     expected_hash = request.headers.get("if-match")
     if expected_hash:
@@ -1117,6 +1122,29 @@ async def sync_status_proxy(request: Request) -> Response:
     """Proxy live sync progress and last-completion timestamps from the runtime."""
 
     return await _athlete_scoped_get(request, "/api/v1/sync/status")
+
+
+async def sync_schedule_update_proxy(request: Request) -> Response:
+    """Apply an auto-sync schedule change through the runtime's PUT route."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    payload = await request.body()
+    body = _parsed_json_object(payload)
+    named = body.get("athleteId") if body is not None else None
+    requested = named if isinstance(named, str) and named else None
+    allowed, athlete_id = athlete_scope(account, requested)
+    if not allowed:
+        return _athlete_forbidden()
+    if athlete_id is not None and athlete_id != requested:
+        if body is None:
+            return JSONResponse(
+                {"error": {"code": "invalid_request", "message": "Request body must be a JSON object."}},
+                status_code=400,
+            )
+        payload = json.dumps({**body, "athleteId": athlete_id}).encode("utf-8")
+    return await _proxy_mcp_put(request, "/api/v1/sync/schedule", payload=payload)
 
 
 async def generation_status_proxy(request: Request) -> Response:
