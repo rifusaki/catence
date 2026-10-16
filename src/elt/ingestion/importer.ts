@@ -121,6 +121,10 @@ export async function importJsonl(database: CatenceDatabase, runId: string, file
     if (inTransaction) await database.run('ROLLBACK');
     throw error;
   }
+  if (inTransaction) {
+    await database.run('COMMIT');
+    inTransaction = false;
+  }
   const qualityStartedAt = Date.now();
   for (const activityId of pass.deferredQualityActivityIds) {
     await refreshActivityQuality(database, activityId);

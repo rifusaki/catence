@@ -1,7 +1,10 @@
+import { mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { reimportWeight } from '../src/elt/application/management.js';
 import { CatenceDatabase } from '../src/elt/storage/database.js';
-import { importRecord } from '../src/elt/ingestion/importer.js';
+import { importJsonl, importRecord } from '../src/elt/ingestion/importer.js';
 import { temporaryDatabase } from './helpers.js';
 
 describe('normalization importer', () => {
@@ -403,6 +406,37 @@ describe('normalization importer', () => {
       const activities = await database.rows<{ count: number }>('SELECT count(*)::INTEGER AS count FROM activities');
       expect(errors[0]?.count).toBe(1);
       expect(activities[0]?.count).toBe(1);
+    } finally {
+      await database.close();
+    }
+  });
+});
+
+describe('staging file import transactions', () => {
+  it('commits a trailing partial chunk and leaves the connection ready for the next transaction', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = '4c1a0bd8-1a1e-4a1a-9a1a-1a1a1a1a1a1a';
+    const stagingFile = path.join(await mkdtemp(path.join(tmpdir(), 'catence-import-')), 'partial.jsonl');
+    const manifest = { kind: 'run_manifest', schemaVersion: 1, provider: 'garmin', runId, fromDate: '2026-10-16', createdAt: '2026-10-16T00:00:00.000Z' };
+    const activity = (index: number) => ({
+      kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity', remoteId: `a-${index}`, parentRemoteId: null,
+      occurredOn: '2026-10-16', sourceUpdatedAt: null, rawObjectHash: null, payload: { activityId: `a-${index}`, startTimeGMT: '2026-10-16T10:00:00Z', activityType: 'running', distance: 1000 * index, duration: 60 * index },
+      extension: {},
+    });
+    // 203 records: one committed full chunk of 200 plus a trailing partial
+    // chunk of 3 that must also be committed before importJsonl returns.
+    await writeFile(stagingFile, [manifest, ...Array.from({ length: 203 }, (_, index) => activity(index))].map((record) => JSON.stringify(record)).join('\n') + '\n', 'utf8');
+    try {
+      const imported = await importJsonl(database, runId, stagingFile);
+      expect(imported).toBe(204);
+      // A fresh transaction must succeed: the next phase (retrieval index
+      // rebuild) opens one on the same connection.
+      await database.run('BEGIN TRANSACTION');
+      await database.run('COMMIT');
+      const counted = await database.rows<{ count: number }>('SELECT count(*)::INTEGER AS count FROM raw_objects');
+      expect(Number(counted[0]?.count)).toBe(0);
+      const activities = await database.rows<{ count: number }>('SELECT count(*)::INTEGER AS count FROM activity_sources');
+      expect(Number(activities[0]?.count)).toBe(203);
     } finally {
       await database.close();
     }
