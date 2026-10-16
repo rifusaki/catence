@@ -91,6 +91,15 @@ export {
 } from '../elt/application/detached-sync.js';
 export type { DetachedSyncHandle, DetachedSyncProvider, DetachedSyncRequest, DetachedSyncSpawner } from '../elt/application/detached-sync.js';
 export {
+  AUTO_SYNC_INTERVAL_MINUTES,
+  DEFAULT_AUTO_SYNC_INTERVAL_MINUTES,
+  parseAutoSyncInterval,
+  readAutoSyncSchedule,
+  startAutoSyncScheduler,
+  updateAutoSyncSchedule,
+} from '../elt/application/autosync.js';
+export type { AutoSyncConfig, AutoSyncIntervalMinutes, AutoSyncSchedule, AutoSyncScheduler, AutoSyncSchedulerOptions } from '../elt/application/autosync.js';
+export {
   buildOpenCodeGoConsoleProfiles,
   classifyOpenCodeGoModel,
   fetchOpenCodeGoModelIds,

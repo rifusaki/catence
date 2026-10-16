@@ -75,12 +75,32 @@ def main() -> None:
     email = os.environ.get("GARMIN_EMAIL")
     if not email:
         raise SystemExit("GARMIN_EMAIL is required.")
-    password = os.environ.get("GARMIN_PASSWORD") or getpass.getpass("Garmin password: ")
-    writer = StagingWriter(args.data_dir, args.output)
-    writer.manifest(args.run_id, args.from_date.isoformat())
     token_store = args.data_dir / "auth" / "garmin_tokens.json"
     token_store.parent.mkdir(parents=True, exist_ok=True)
-    client = Garmin(email, password, prompt_mfa=lambda: input("Garmin MFA code: "))
+    if not sys.stdin.isatty():
+        # Unattended auto-sync must never hang on a hidden prompt: fail fast
+        # so the run records a visible error instead.
+        password = os.environ.get("GARMIN_PASSWORD")
+        if not password and not token_store.exists():
+            raise SystemExit(
+                "Garmin login is required (no stored token, no GARMIN_PASSWORD, "
+                "and stdin is not interactive). Run an interactive sync once to "
+                "store the session token, or set GARMIN_PASSWORD."
+            )
+    else:
+        password = os.environ.get("GARMIN_PASSWORD") or getpass.getpass("Garmin password: ")
+
+    def prompt_mfa() -> str:
+        if not sys.stdin.isatty():
+            raise SystemExit(
+                "Garmin MFA is required but stdin is not interactive; the "
+                "session token expired. Run an interactive sync once to renew it."
+            )
+        return input("Garmin MFA code: ")
+
+    writer = StagingWriter(args.data_dir, args.output)
+    writer.manifest(args.run_id, args.from_date.isoformat())
+    client = Garmin(email, password, prompt_mfa=prompt_mfa)
     client.login(str(token_store))
     reporter = ProgressReporter(args.run_id)
     reporter.set_stage("login")

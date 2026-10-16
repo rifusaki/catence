@@ -335,6 +335,51 @@ describe('Catence Streamable HTTP server', () => {
     });
   });
 
+  it('reads and updates the auto-sync schedule', async () => {
+    const { paths, database } = await temporaryDatabase();
+    await database.close();
+    const server = createCatenceHttpServer({ paths });
+    servers.push(server);
+    const origin = await listen(server);
+
+    const initial = await fetch(`${origin}/api/v1/sync/schedule`);
+    expect(initial.status).toBe(200);
+    await expect(initial.json()).resolves.toMatchObject({
+      athleteId: 'local',
+      enabled: true,
+      intervalMinutes: 120,
+      nextRunAt: null,
+    });
+
+    const unsupported = await fetch(`${origin}/api/v1/sync/schedule`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ intervalMinutes: 45 }),
+    });
+    expect(unsupported.status).toBe(400);
+    await expect(unsupported.json()).resolves.toMatchObject({ error: { code: 'schedule_update_failed' } });
+
+    const unknownField = await fetch(`${origin}/api/v1/sync/schedule`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cadence: 'fast' }),
+    });
+    expect(unknownField.status).toBe(400);
+
+    const updated = await fetch(`${origin}/api/v1/sync/schedule`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ intervalMinutes: '6h' }),
+    });
+    expect(updated.status).toBe(200);
+    await expect(updated.json()).resolves.toMatchObject({ athleteId: 'local', enabled: true, intervalMinutes: 360 });
+
+    const reread = await fetch(`${origin}/api/v1/sync/schedule`);
+    await expect(reread.json()).resolves.toMatchObject({ intervalMinutes: 360 });
+    const persisted = JSON.parse(await readFile(path.join(paths.root, 'autosync.json'), 'utf8'));
+    expect(persisted).toMatchObject({ enabled: true, intervalMinutes: 360 });
+  });
+
   it('populates lastSync from completed runs via the read-only repository', async () => {
     const { paths, database } = await temporaryDatabase();
     await database.run(

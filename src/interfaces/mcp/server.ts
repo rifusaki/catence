@@ -369,7 +369,17 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
   }, tool('start_detached_sync', async (input) => {
     const paths = activePaths();
     const athleteId = activeAthlete()?.id ?? 'local';
-    const handle = await startSync({ paths, athleteId, provider: input.provider, from: input.from, refresh: input.refresh });
+    const handle = await startSync({
+      paths,
+      athleteId,
+      provider: input.provider,
+      from: input.from,
+      refresh: input.refresh,
+      // The child resolves the athlete within the catalog, not within the
+      // athlete store this tool resolved for locks and logs: passing the
+      // store itself trips the legacy-store guard in catalog deployments.
+      ...(catalogPaths ? { cliHome: catalogPaths.root } : {}),
+    });
     return {
       data: { ...handle, progressTool: 'catence_sync_progress' },
       provenance: { operation: 'detached_sync_spawn' },

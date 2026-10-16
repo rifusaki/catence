@@ -29,7 +29,9 @@ import {
   linkActivity,
   loadCatalog,
   npmGlobalPrefix,
+  parseAutoSyncInterval,
   planSelfUpdate,
+  readAutoSyncSchedule,
   readInstalledConsoleVersion,
   rebuildRetrievalIndex,
   reimportNutrition,
@@ -45,6 +47,7 @@ import {
   connectStrava,
   connectStravaWithCallback,
   unlinkActivity,
+  updateAutoSyncSchedule,
   type CatalogPaths,
   type CatencePaths,
   type ProviderChoice,
@@ -211,6 +214,31 @@ program.command('retry')
   .action(async (options: { run: string }) => {
     const { paths } = await currentAthlete();
     process.stdout.write(`${JSON.stringify(await retryDataSync(paths, options.run), null, 2)}\n`);
+  });
+
+const autoSyncCommand = program.command('auto-sync').description('Manage the automatic sync schedule for one athlete. The scheduler runs inside the Catence server (default: enabled, every 2 hours).');
+
+autoSyncCommand.command('status')
+  .description('Report the athlete’s automatic sync schedule: enabled flag, interval, and next run.')
+  .action(async () => {
+    const { athlete, paths } = await currentAthlete();
+    process.stdout.write(`${JSON.stringify(await readAutoSyncSchedule(paths, athlete.id), null, 2)}\n`);
+  });
+
+autoSyncCommand.command('enable')
+  .description('Turn automatic syncing on, optionally changing the interval (15m, 30m, 1h, 2h, 6h, 12h, 24h).')
+  .option('--interval <interval>', 'sync interval label or minutes', '2h')
+  .action(async (options: { interval: string }) => {
+    const { athlete, paths } = await currentAthlete();
+    const intervalMinutes = parseAutoSyncInterval(options.interval);
+    process.stdout.write(`${JSON.stringify(await updateAutoSyncSchedule(paths, athlete.id, { enabled: true, intervalMinutes }), null, 2)}\n`);
+  });
+
+autoSyncCommand.command('disable')
+  .description('Turn automatic syncing off. Manual sync keeps working.')
+  .action(async () => {
+    const { athlete, paths } = await currentAthlete();
+    process.stdout.write(`${JSON.stringify(await updateAutoSyncSchedule(paths, athlete.id, { enabled: false }), null, 2)}\n`);
   });
 
 program.command('auth').description('Connect a source account using one athlete’s local credentials.')

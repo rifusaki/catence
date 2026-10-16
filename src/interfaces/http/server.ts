@@ -20,6 +20,8 @@ import {
   loadCatalog,
   mergeOpenCodeGoConsoleProfiles,
   openReadOnlyRepository,
+  parseAutoSyncInterval,
+  readAutoSyncSchedule,
   readAthleteFile,
   readAthleteFileRevision,
   resolveAthlete,
@@ -28,7 +30,9 @@ import {
   startDetachedSync,
   syncProgress,
   updateAthleteFile,
+  updateAutoSyncSchedule,
   type AthleteFileOperation,
+  type AutoSyncIntervalMinutes,
   type CatalogPaths,
   type CatencePaths,
   type SecretProvider,
@@ -169,6 +173,36 @@ type SyncRequestBody = {
   refresh?: boolean;
   refreshModels?: boolean;
 };
+
+type SyncScheduleBody = {
+  athleteId?: string;
+  enabled?: boolean;
+  intervalMinutes?: AutoSyncIntervalMinutes;
+};
+
+function parseSyncScheduleBody(body: unknown): SyncScheduleBody {
+  if (body === undefined) return {};
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new Error('Request body must be a JSON object.');
+  const raw = body as Record<string, unknown>;
+  for (const key of Object.keys(raw)) {
+    if (!['athleteId', 'enabled', 'intervalMinutes'].includes(key)) {
+      throw new Error(`Unknown auto-sync field: ${key}.`);
+    }
+  }
+  if (raw.athleteId !== undefined && typeof raw.athleteId !== 'string') throw new Error('athleteId must be a string.');
+  if (raw.enabled !== undefined && typeof raw.enabled !== 'boolean') throw new Error('enabled must be a boolean.');
+  if (raw.intervalMinutes !== undefined) {
+    if (typeof raw.intervalMinutes === 'string') {
+      raw.intervalMinutes = parseAutoSyncInterval(raw.intervalMinutes);
+    } else if (typeof raw.intervalMinutes !== 'number') {
+      throw new Error('intervalMinutes must be a number or a label like 15m, 2h, 24h.');
+    }
+  }
+  if (raw.enabled === undefined && raw.intervalMinutes === undefined) {
+    throw new Error('Provide enabled, intervalMinutes, or both.');
+  }
+  return raw as SyncScheduleBody;
+}
 
 function parseSyncBody(body: unknown): SyncRequestBody {
   if (body === undefined) return {};
@@ -619,6 +653,34 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
               message: error instanceof Error ? error.message : String(error),
             },
           });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/sync/schedule' && request.method === 'GET') {
+        try {
+          const url = new URL(request.url ?? '/', 'http://localhost');
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          const athleteId = catalogPaths ? (url.searchParams.get('athleteId') ?? '') : 'local';
+          json(response, 200, await readAutoSyncSchedule(paths, athleteId));
+        } catch (error) {
+          json(response, 400, { error: { code: 'schedule_unavailable', message: error instanceof Error ? error.message : String(error) } });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/sync/schedule' && request.method === 'PUT') {
+        try {
+          const body = parseSyncScheduleBody(await readJsonBody(request));
+          const url = new URL(request.url ?? '/', 'http://localhost');
+          const paths = await resolveSyncPaths(catalogPaths, staticPaths, { athleteId: body.athleteId });
+          const athleteId = catalogPaths ? (body.athleteId ?? '') : 'local';
+          json(response, 200, await updateAutoSyncSchedule(paths, athleteId, {
+            enabled: body.enabled,
+            ...(body.intervalMinutes === undefined ? {} : { intervalMinutes: parseAutoSyncInterval(String(body.intervalMinutes)) }),
+          }));
+        } catch (error) {
+          json(response, 400, { error: { code: 'schedule_update_failed', message: error instanceof Error ? error.message : String(error) } });
         }
         return;
       }

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { existsSync } from 'node:fs';
-import { addAthlete, athleteStorePaths, CatenceDatabase, createDemoStore, defaultCatalogHome, initializeCatalog, loadCatalog, resolveCatalogPaths } from '../../runtime/index.js';
+import { addAthlete, athleteStorePaths, CatenceDatabase, createDemoStore, defaultCatalogHome, initializeCatalog, loadCatalog, resolveCatalogPaths, startAutoSyncScheduler } from '../../runtime/index.js';
 import { defaultBearerTokenPath, parseServeCliOptions, SERVE_USAGE } from '../http/cli-options.js';
 import { createCatenceHttpServer } from '../http/server.js';
 import { MCP_USAGE, parseMcpCliOptions } from './cli-options.js';
@@ -62,7 +62,14 @@ async function run(): Promise<void> {
     });
     console.error(`Catence Streamable HTTP server is listening at http://${options.host}:${options.port}/mcp`);
     console.error(`Bearer-token authentication is armed at ${options.authTokenFile ?? defaultBearerTokenPath(catalogPaths.root)}; enable it with 'catence-data mcp enable'. Health endpoints stay open for readiness probes.`);
+    // Auto-sync runs while the server is up: each athlete's autosync.json
+    // (default: enabled, every 2 hours) triggers a detached sync. The
+    // detached child and the single-writer DuckDB lock stay the only
+    // executors, so concurrent ticks are no-ops by design.
+    const scheduler = startAutoSyncScheduler({ catalogPaths });
+    console.error('Auto-sync scheduler started (default: enabled, every 2 hours per athlete; configure with auto-sync enable --interval or Console Settings).');
     const close = () => {
+      scheduler.stop();
       httpServer.close(() => process.exit(0));
     };
     process.once('SIGINT', close);

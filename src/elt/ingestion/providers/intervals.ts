@@ -248,14 +248,32 @@ export class IntervalsExtractor {
     }
   }
 
+  /**
+   * Intervals.icu enforces 2500 requests per rolling 15 minutes and 5000 per
+   * day; over-limit calls answer 429 with a Retry-After header. Back off
+   * cooperatively and retry a bounded number of times so one auto-sync run
+   * degrades instead of recording a wall of retryable errors.
+   */
+  private async request(route: string, accept: string | null): Promise<Response> {
+    for (let attempt = 0; ; attempt++) {
+      const headers: Record<string, string> = { Authorization: basicAuth(this.apiKey) };
+      if (accept) headers.Accept = accept;
+      const response = await fetch(`${apiBaseUrl}${route}`, { headers });
+      if (response.status !== 429 || attempt >= 2) return response;
+      const retryAfterSeconds = Math.min(Math.max(Number(response.headers.get('retry-after')) || 30, 1), 300);
+      this.log.warn('Intervals rate limit hit; backing off', { route, retryAfterSeconds, attempt: attempt + 1 });
+      await new Promise((resolve) => setTimeout(resolve, retryAfterSeconds * 1_000));
+    }
+  }
+
   private async getJson(route: string): Promise<unknown> {
-    const response = await fetch(`${apiBaseUrl}${route}`, { headers: { Authorization: basicAuth(this.apiKey), Accept: 'application/json' } });
+    const response = await this.request(route, 'application/json');
     if (!response.ok) throw new Error(`Intervals ${route} failed with HTTP ${response.status}`);
     return response.json();
   }
 
   private async getBinary(route: string): Promise<Uint8Array> {
-    const response = await fetch(`${apiBaseUrl}${route}`, { headers: { Authorization: basicAuth(this.apiKey) } });
+    const response = await this.request(route, null);
     if (!response.ok) throw new Error(`Intervals ${route} failed with HTTP ${response.status}`);
     return new Uint8Array(await response.arrayBuffer());
   }
