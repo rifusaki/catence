@@ -59,4 +59,33 @@ describe('swimming query service', () => {
       await database.close();
     }
   });
+
+  it('lists only swim activities that still lack per-length rows for the FIT backfill', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('garmin', '2026-08-04');
+    try {
+      // One swim with explicit lengths (already derived) and one without.
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity', remoteId: 'swim-done', parentRemoteId: null,
+        occurredOn: '2026-08-04', sourceUpdatedAt: null, rawObjectHash: 'done-summary', extension: {},
+        payload: { activityId: 'swim-done', startTimeGMT: '2026-08-04T10:00:00Z', activityType: 'lap_swimming', distance: 100, duration: 160, poolLength: 2500 },
+      });
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity_detail', remoteId: 'swim-done:detail', parentRemoteId: 'swim-done',
+        occurredOn: '2026-08-04', sourceUpdatedAt: null, rawObjectHash: 'done-detail', extension: {},
+        payload: { lengths: [{ lengthIndex: 0, duration: 24, distance: 25, strokeCount: 18 }] },
+      });
+      await importRecord(database, runId, {
+        kind: 'source_entity', schemaVersion: 1, provider: 'garmin', entityType: 'activity', remoteId: 'swim-pending', parentRemoteId: null,
+        occurredOn: '2026-08-05', sourceUpdatedAt: null, rawObjectHash: 'pending-summary', extension: {},
+        payload: { activityId: 'swim-pending', startTimeGMT: '2026-08-05T10:00:00Z', activityType: 'lap_swimming', distance: 200, duration: 320, poolLength: 2500 },
+      });
+
+      const pending = await database.garminSwimActivitySourcesWithoutLengths();
+      expect(pending).toEqual([expect.objectContaining({ remote_activity_id: 'swim-pending' })]);
+      expect(String(pending[0]?.started_on ?? '')).toMatch(/^2026-08-05/);
+    } finally {
+      await database.close();
+    }
+  });
 });

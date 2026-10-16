@@ -145,9 +145,16 @@ async function backfillGarminSwimLengths(
   }
   // The swim list is queried here and handed to the Python worker as a file:
   // the child must never open DuckDB itself because the parent holds the
-  // write lock for the whole run.
+  // write lock for the whole run. Only activities without per-length rows are
+  // handed over: re-parsing every archived FIT on every sync cost ~23s/run
+  // with nothing new to stage.
   const activitiesFile = path.join(paths.staging, 'garmin', `${parentRunId}.swim_activities.json`);
-  await writeFile(activitiesFile, JSON.stringify(await database.garminSwimActivitySources()));
+  const pendingSwims = await database.garminSwimActivitySourcesWithoutLengths();
+  if (pendingSwims.length === 0) {
+    log.info('Garmin swim backfill skipped: every swim activity already has lengths', { parentRunId });
+    return;
+  }
+  await writeFile(activitiesFile, JSON.stringify(pendingSwims));
   const arguments_ = [
     'run',
     'python',

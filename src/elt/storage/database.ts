@@ -393,7 +393,12 @@ export class CatenceDatabase implements WriteDataStore {
     return toIsoDate(rows[0]?.earliest ?? null);
   }
 
-  async garminSwimActivitySources(): Promise<Array<{ remote_activity_id: string; started_on: string | null }>> {
+  /**
+   * Swim activities that still lack per-length rows: the FIT backfill only
+   * has work to do for these, so syncs skip re-parsing already-derived
+   * archives entirely.
+   */
+  async garminSwimActivitySourcesWithoutLengths(): Promise<Array<{ remote_activity_id: string; started_on: string | null }>> {
     const sports = ['lap_swimming', 'swimming', 'open_water_swimming', 'openwaterswimming'];
     return this.rows(
       `SELECT source.remote_activity_id, cast(activity.started_at_utc AS VARCHAR) AS started_on
@@ -401,6 +406,7 @@ export class CatenceDatabase implements WriteDataStore {
          JOIN activities AS activity USING (activity_id)
         WHERE source.provider = 'garmin'
           AND lower(coalesce(activity.sport, '')) IN (${sports.map((sport) => `'${sport}'`).join(', ')})
+          AND NOT EXISTS (SELECT 1 FROM swim_lengths WHERE swim_lengths.activity_source_id = source.activity_source_id)
         ORDER BY activity.started_at_utc`,
     );
   }

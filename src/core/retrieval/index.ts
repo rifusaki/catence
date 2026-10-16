@@ -139,12 +139,30 @@ export async function buildRetrievalIndex(database: WriteDataStore): Promise<{ d
   await database.run('BEGIN TRANSACTION');
   try {
     await database.run('DELETE FROM retrieval_documents');
-    for (const document of deduplicated.values()) {
-      const id = documentId(document);
-      await database.run(`INSERT INTO retrieval_documents (document_id, entity_type, entity_id, activity_source_id, provider, occurred_on, document_text, metadata_json, content_hash)
-        VALUES ($id, $entityType, $entityId, $activitySourceId, $provider, $occurredOn, $text, $metadata, $hash)`, {
-        id, entityType: document.entityType, entityId: document.entityId, activitySourceId: document.activitySourceId ?? null, provider: document.provider ?? null, occurredOn: document.occurredOn || null, text: document.text, metadata: JSON.stringify(document.metadata), hash: id,
+    // Multi-row INSERT batches: one statement per 500 documents instead of
+    // one round trip per document keeps a full 125k-document rebuild from
+    // being dominated by per-statement overhead.
+    const BATCH_SIZE = 500;
+    const allDocuments = [...deduplicated.values()];
+    for (let offset = 0; offset < allDocuments.length; offset += BATCH_SIZE) {
+      const batch = allDocuments.slice(offset, offset + BATCH_SIZE);
+      const values: Record<string, unknown> = {};
+      const tuples = batch.map((document, index) => {
+        const id = documentId(document);
+        const prefix = `d${index}`;
+        values[`${prefix}id`] = id;
+        values[`${prefix}entityType`] = document.entityType;
+        values[`${prefix}entityId`] = document.entityId;
+        values[`${prefix}activitySourceId`] = document.activitySourceId ?? null;
+        values[`${prefix}provider`] = document.provider ?? null;
+        values[`${prefix}occurredOn`] = document.occurredOn || null;
+        values[`${prefix}text`] = document.text;
+        values[`${prefix}metadata`] = JSON.stringify(document.metadata);
+        values[`${prefix}hash`] = id;
+        return `($${prefix}id, $${prefix}entityType, $${prefix}entityId, $${prefix}activitySourceId, $${prefix}provider, $${prefix}occurredOn, $${prefix}text, $${prefix}metadata, $${prefix}hash)`;
       });
+      await database.run(`INSERT INTO retrieval_documents (document_id, entity_type, entity_id, activity_source_id, provider, occurred_on, document_text, metadata_json, content_hash)
+        VALUES ${tuples.join(', ')}`, values);
     }
     await database.run(`INSERT INTO retrieval_index_state (index_name, status, mode, source_watermark, built_at, detail_json)
       VALUES ('context', 'ready', $mode, $watermark, now(), $detail)
