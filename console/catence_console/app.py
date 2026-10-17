@@ -33,6 +33,7 @@ from catence_console.accounts import (
     account_can_access,
     add_account,
     env_account,
+    find_account,
     load_accounts,
     remove_account,
     update_account,
@@ -258,6 +259,29 @@ async def _proxy_mcp_get(request: Request, path: str, query: str | None = None) 
     return Response(content=body, status_code=status, media_type=content_type)
 
 
+async def _proxy_mcp_delete(request: Request, path: str, query: str | None = None) -> Response:
+    """Forward an authenticated DELETE to the runtime's JSON API."""
+
+    if not _authenticated(request):
+        return JSONResponse({"error": {"code": "unauthorized", "message": "Console login is required."}}, status_code=401)
+    target = _mcp_http_url(path)
+    effective_query = request.url.query if query is None else query
+    if effective_query:
+        target = f"{target}?{effective_query}"
+
+    def fetch() -> tuple[int, bytes, str]:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(target, method="DELETE", headers=runtime_authorization_headers()), timeout=10) as upstream:
+                return upstream.status, upstream.read(), upstream.headers.get_content_type()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), error.headers.get_content_type()
+        except urllib.error.URLError as error:
+            return 502, json.dumps({"error": {"code": "mcp_unavailable", "message": str(error)}}).encode("utf-8"), "application/json"
+
+    status, body, content_type = await asyncio.to_thread(fetch)
+    return Response(content=body, status_code=status, media_type=content_type)
+
+
 async def dashboard_proxy(request: Request) -> Response:
     return await _athlete_scoped_get(request, "/api/v1/dashboard")
 
@@ -343,6 +367,157 @@ async def mcp_exposure_update(request: Request) -> Response:
     if account.role != "admin":
         return _admin_required("Your Console account must be an admin to manage MCP exposure.")
     return await _proxy_mcp_post(request, "/api/v1/mcp-exposure", payload=await request.body())
+
+
+async def mcp_keys_overview(request: Request) -> Response:
+    """List per-account MCP API keys through the runtime (admins only)."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to manage MCP API keys.")
+    return await _proxy_mcp_get(request, "/api/v1/mcp-keys")
+
+
+def _mcp_key_account_error(username: object) -> JSONResponse | None:
+    """A 400/500 response when a key mutation names an unusable account, else None.
+
+    The runtime resolves a key's scope from accounts.json alone, so a key bound
+    to a username that is not stored there can never authenticate; the Console
+    fails fast instead of forwarding a credential that is dead on arrival. An
+    unusable accounts store also fails closed rather than forwarding unverified.
+    """
+
+    if not isinstance(username, str) or not username.strip():
+        return JSONResponse(
+            {"error": {"code": "invalid_request", "message": "account is required."}},
+            status_code=400,
+        )
+    try:
+        known = find_account(_auth.accounts_path(), username.strip()) is not None
+    except AccountsStoreError as error:
+        logger.exception("Could not validate an MCP key account: %s", error)
+        return _accounts_error("accounts_store_error", "The Console accounts store is unusable.", 500)
+    if known:
+        return None
+    return _accounts_error("account_not_found", f"Console account {username.strip()!r} was not found.", 400)
+
+
+async def mcp_keys_create(request: Request) -> Response:
+    """Create a per-account MCP API key through the runtime (admins only).
+
+    The runtime returns the raw token exactly once; the response passes through
+    untouched and the Console never logs it.
+    """
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to manage MCP API keys.")
+    payload = await request.body()
+    body = _parsed_json_object(payload)
+    if body is None:
+        return JSONResponse(
+            {"error": {"code": "invalid_request", "message": "Request body must be a JSON object."}},
+            status_code=400,
+        )
+    account_error = _mcp_key_account_error(body.get("account"))
+    if account_error is not None:
+        return account_error
+    return await _proxy_mcp_post(request, "/api/v1/mcp-keys", payload=payload)
+
+
+async def mcp_keys_revoke(request: Request) -> Response:
+    """Revoke one MCP API key through the runtime (admins only)."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to manage MCP API keys.")
+    return await _proxy_mcp_delete(request, "/api/v1/mcp-keys")
+
+
+async def mcp_keys_roll(request: Request) -> Response:
+    """Rotate one MCP API key's token through the runtime (admins only).
+
+    The Console-facing body carries the key's ``account`` alongside ``id`` so a
+    key whose account was deleted is refused before the runtime mints a token
+    that could never authenticate; only ``id`` is forwarded, matching the
+    runtime's strict roll body.
+    """
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to manage MCP API keys.")
+    body = _parsed_json_object(await request.body())
+    if body is None:
+        return JSONResponse(
+            {"error": {"code": "invalid_request", "message": "Request body must be a JSON object."}},
+            status_code=400,
+        )
+    key_id = body.get("id")
+    if not isinstance(key_id, str) or not key_id.strip():
+        return JSONResponse(
+            {"error": {"code": "invalid_request", "message": "id is required."}},
+            status_code=400,
+        )
+    account_error = _mcp_key_account_error(body.get("account"))
+    if account_error is not None:
+        return account_error
+    payload = json.dumps({"id": key_id.strip()}).encode("utf-8")
+    return await _proxy_mcp_post(request, "/api/v1/mcp-keys/roll", payload=payload)
+
+
+async def mcp_oauth_settings_overview(request: Request) -> Response:
+    """Read the OAuth 2.1 exposure settings through the runtime (admins only)."""
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to manage MCP OAuth settings.")
+    return await _proxy_mcp_get(request, "/api/v1/mcp-oauth-settings")
+
+
+async def mcp_oauth_settings_update(request: Request) -> Response:
+    """Write the OAuth 2.1 exposure settings through the runtime (admins only).
+
+    The runtime validates the public URL and the enabled/URL pairing and is the
+    authority on what takes effect; the Console checks the body shape here so
+    malformed requests fail before the proxy hop. The stored settings override
+    the CATENCE_OAUTH_ENABLED/CATENCE_PUBLIC_URL startup values at runtime.
+    """
+
+    account = _request_identity(request)
+    if account is None:
+        return _unauthorized()
+    if account.role != "admin":
+        return _admin_required("Your Console account must be an admin to manage MCP OAuth settings.")
+    payload = await request.body()
+    body = _parsed_json_object(payload)
+    if body is None:
+        return JSONResponse(
+            {"error": {"code": "invalid_request", "message": "Request body must be a JSON object."}},
+            status_code=400,
+        )
+    if not isinstance(body.get("enabled"), bool):
+        return JSONResponse(
+            {"error": {"code": "invalid_request", "message": "enabled is required and must be a boolean."}},
+            status_code=400,
+        )
+    public_url = body.get("publicUrl")
+    if public_url is not None and not isinstance(public_url, str):
+        return JSONResponse(
+            {"error": {"code": "invalid_request", "message": "publicUrl must be a string."}},
+            status_code=400,
+        )
+    return await _proxy_mcp_post(request, "/api/v1/mcp-oauth-settings", payload=payload)
+
 
 async def athlete_file_proxy(request: Request) -> Response:
     """Read or write the athlete file through the runtime's hash-guarded route."""
@@ -486,6 +661,24 @@ async def authenticated_dashboard_proxy(request: Request, call_next: Any) -> Res
         if request.method == "POST":
             return await mcp_exposure_update(request)
         return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use GET or POST for /api/v1/mcp-exposure."}}, status_code=405)
+    if request.url.path == "/api/v1/mcp-keys":
+        if request.method == "GET":
+            return await mcp_keys_overview(request)
+        if request.method == "POST":
+            return await mcp_keys_create(request)
+        if request.method == "DELETE":
+            return await mcp_keys_revoke(request)
+        return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use GET, POST, or DELETE for /api/v1/mcp-keys."}}, status_code=405)
+    if request.url.path == "/api/v1/mcp-keys/roll":
+        if request.method == "POST":
+            return await mcp_keys_roll(request)
+        return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use POST for /api/v1/mcp-keys/roll."}}, status_code=405)
+    if request.url.path == "/api/v1/mcp-oauth-settings":
+        if request.method == "GET":
+            return await mcp_oauth_settings_overview(request)
+        if request.method == "POST":
+            return await mcp_oauth_settings_update(request)
+        return JSONResponse({"error": {"code": "method_not_allowed", "message": "Use GET or POST for /api/v1/mcp-oauth-settings."}}, status_code=405)
     return await call_next(request)
 
 
