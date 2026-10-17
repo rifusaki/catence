@@ -41,6 +41,17 @@ MCP_PORT="${CATENCE_MCP_PORT:-8787}"
 # location inside the data volume (/data/mcp-token), which the runtime and the
 # Console manage via 'catence-data mcp enable' or the Console Settings.
 MCP_TOKEN_FILE="${CATENCE_MCP_TOKEN_FILE:-}"
+# Optional OAuth 2.1 authorization server (ChatGPT/Codex connect flow). Accepts
+# 1/true; empty disables it. When enabled, CATENCE_PUBLIC_URL is required and
+# must be an https URL without a query string or fragment (it becomes the
+# advertised issuer). These are startup defaults: the Console (Settings ->
+# MCP Exposure -> OAuth 2.1 sign-in) overrides them at runtime.
+OAUTH_ENABLED="${CATENCE_OAUTH_ENABLED:-}"
+PUBLIC_URL="${CATENCE_PUBLIC_URL:-}"
+# Optional custom per-account MCP key registry path (a container path). The
+# default registry lives at /data/mcp-keys.json inside the data volume and is
+# managed by the runtime ('catence-data mcp key'), so no host mount is needed.
+MCP_KEYS_FILE="${CATENCE_MCP_KEYS_FILE:-}"
 DEPLOY_DIR="${CATENCE_DEPLOY_DIR:-catence-deploy}"
 USERNAME="${CATENCE_CONSOLE_USERNAME:-}"
 NPM_VERSION="${CATENCE_NPM_VERSION:-}"           # optional pin
@@ -180,6 +191,31 @@ if [ -f "$DEPLOY_DIR/.env" ]; then
   [ -n "${OPENCODE_GO_MESSAGES_API_BASE:-}" ] || OPENCODE_GO_MESSAGES_API_BASE="$(dotenv_get OPENCODE_GO_MESSAGES_API_BASE "$DEPLOY_DIR/.env")"
   [ -n "${MCP_BIND:-}" ]            || MCP_BIND="$(dotenv_get CATENCE_MCP_BIND "$DEPLOY_DIR/.env")"
   [ -n "${MCP_TOKEN_FILE:-}" ]      || MCP_TOKEN_FILE="$(dotenv_get CATENCE_MCP_TOKEN_FILE "$DEPLOY_DIR/.env")"
+  [ -n "${OAUTH_ENABLED:-}" ]       || OAUTH_ENABLED="$(dotenv_get CATENCE_OAUTH_ENABLED "$DEPLOY_DIR/.env")"
+  [ -n "${PUBLIC_URL:-}" ]          || PUBLIC_URL="$(dotenv_get CATENCE_PUBLIC_URL "$DEPLOY_DIR/.env")"
+  [ -n "${MCP_KEYS_FILE:-}" ]       || MCP_KEYS_FILE="$(dotenv_get CATENCE_MCP_KEYS_FILE "$DEPLOY_DIR/.env")"
+fi
+
+# ---------------------------------------------------------------------------
+# Validate the MCP credential configuration early, mirroring the runtime's
+# `catence serve` rules (src/interfaces/http/cli-options.ts): the OAuth switch
+# accepts 1/true, and the public URL — whenever set — must be an absolute
+# https URL with no query string or fragment.
+# ---------------------------------------------------------------------------
+oauth_is_enabled() { [ "$1" = "1" ] || [ "$1" = "true" ]; }
+
+if [ -n "$PUBLIC_URL" ]; then
+  case "$PUBLIC_URL" in
+    https://*) ;;
+    *) die "CATENCE_PUBLIC_URL must use https: the OAuth issuer is advertised publicly (got '$PUBLIC_URL')." ;;
+  esac
+  case "$PUBLIC_URL" in
+    *"?"*|*"#"*) die "CATENCE_PUBLIC_URL must not contain a query string or fragment (got '$PUBLIC_URL')." ;;
+  esac
+fi
+
+if oauth_is_enabled "$OAUTH_ENABLED" && [ -z "$PUBLIC_URL" ]; then
+  die "CATENCE_OAUTH_ENABLED is set but CATENCE_PUBLIC_URL is missing: the OAuth issuer is the public https URL of this server (for example the tunnel URL)."
 fi
 
 # The environment break-glass account is a pair: remember the username as
@@ -381,6 +417,13 @@ write_compose() {
   else
     token_env="CATENCE_MCP_TOKEN_FILE: \"/data/mcp-token\""
   fi
+  # The per-account key registry defaults to /data/mcp-keys.json inside the
+  # data volume (runtime-managed, no host mount). CATENCE_MCP_KEYS_FILE is a
+  # container path and is passed through only when set.
+  local keys_env=""
+  if [ -n "$MCP_KEYS_FILE" ]; then
+    keys_env="      CATENCE_MCP_KEYS_FILE: \"\${CATENCE_MCP_KEYS_FILE:-${MCP_KEYS_FILE}}\""
+  fi
 
   cat > "$DEPLOY_DIR/docker-compose.yml" <<EOF
 name: ${PROJECT}
@@ -403,6 +446,9 @@ services:
       CATENCE_HOME: /data
       CATENCE_MCP_BIND: "\${CATENCE_MCP_BIND:-${MCP_BIND}}"
       ${token_env}
+      CATENCE_OAUTH_ENABLED: "\${CATENCE_OAUTH_ENABLED:-${OAUTH_ENABLED}}"
+      CATENCE_PUBLIC_URL: "\${CATENCE_PUBLIC_URL:-${PUBLIC_URL}}"
+${keys_env}
       CATENCE_CONSOLE_USERNAME: "\${CATENCE_CONSOLE_USERNAME:-}"
       CATENCE_CONSOLE_PASSWORD_HASH: "\${CATENCE_CONSOLE_PASSWORD_HASH:-}"
       CHAINLIT_AUTH_SECRET: "\${CHAINLIT_AUTH_SECRET:-}"
@@ -437,6 +483,9 @@ CATENCE_CONSOLE_PASSWORD_HASH=${PASSWORD_HASH}
 CHAINLIT_AUTH_SECRET=${AUTH_SECRET}
 CATENCE_MCP_BIND=${MCP_BIND}
 CATENCE_MCP_TOKEN_FILE=${MCP_TOKEN_FILE}
+CATENCE_OAUTH_ENABLED=${OAUTH_ENABLED}
+CATENCE_PUBLIC_URL=${PUBLIC_URL}
+CATENCE_MCP_KEYS_FILE=${MCP_KEYS_FILE}
 OPENAI_API_KEY=${OPENAI_API_KEY:-}
 OPENAI_API_BASE=${OPENAI_API_BASE:-}
 ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -754,6 +803,9 @@ info "  Manage Console logins and athlete access:"
 info "    $DEPLOY_DIR/users.sh list"
 info "    $DEPLOY_DIR/users.sh add martina --athlete martina   (prompts for a password)"
 info "    $DEPLOY_DIR/users.sh add coach --admin"
+info "  Secure remote MCP access per Console account (keys) or for ChatGPT/Codex (OAuth):"
+info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env exec console catence-data --home /data mcp key add --account coach"
+info "    (list/roll/revoke: catence-data mcp key ...; OAuth: enable in the Console (Settings -> MCP Exposure -> OAuth 2.1 sign-in), or set CATENCE_OAUTH_ENABLED=1 and CATENCE_PUBLIC_URL in .env as startup defaults, then re-run this script)"
 info "  Discover OpenCode Go models into the config:"
 info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml --env-file $DEPLOY_DIR/.env run --rm --entrypoint node console /usr/local/lib/node_modules/catence/scripts/discover-opencode-go.mjs --write /data/config.json"
 info "  Check status / logs:"
@@ -762,7 +814,7 @@ info "    $COMPOSE -f $DEPLOY_DIR/docker-compose.yml logs -f"
 info ""
 if [ "${MCP_BIND}" != "127.0.0.1" ]; then
   info "MCP server is exposed on ${MCP_BIND}:${MCP_PORT}. Restrict access via Tailscale ACLs or firewall."
-  info "The MCP server has no authentication — it trusts the caller's athleteId parameter."
+  info "Without the bearer gate, per-account keys, or OAuth, the MCP server has no authentication — it trusts the caller's athleteId parameter."
 else
   info "Keep the Console on loopback and front it with Cloudflare Tunnel (or a reverse"
   info "proxy); do not expose Catence port 8787 to the internet."

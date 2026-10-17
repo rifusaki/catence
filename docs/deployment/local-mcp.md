@@ -90,8 +90,10 @@ implicitly; the MCP server does not authenticate callers — it trusts the
 Catence serves several athlete stores from one server. Each store has its own
 DuckDB, raw data, and tokens; a call acts on the single store it names and
 never merges athletes implicitly. That is a tool contract, not an access
-boundary: the MCP server does not authenticate callers and trusts the
-`athleteId` they pass — see [MCP clients and HTTP](#streamable-http-server).
+boundary: the stdio server does not authenticate callers and trusts the
+`athleteId` they pass — over Streamable HTTP the bearer gate, per-account
+keys, or OAuth authenticate and scope callers; see
+[MCP clients and HTTP](#streamable-http-server).
 
 ### MCP behavior
 
@@ -310,7 +312,10 @@ Mistral Work), switch on the bearer-token gate. The gate is armed at a token
 file — `<catalog-home>/mcp-token` by default, or the path given by
 `--auth-token-file` (environment equivalent: `CATENCE_MCP_TOKEN_FILE`) — and
 the **file's presence is the switch**: create it to enable, remove it to
-disable, no restart needed.
+disable, no restart needed. The gate is also armed when the per-account key
+registry holds at least one active key or when OAuth is enabled (see the next
+sections); only with no token file, no keys, and no OAuth configured is the
+server open.
 
 Catence generates the token itself; never hand-craft one:
 
@@ -325,7 +330,9 @@ catence-data mcp disable   # remove the file; remote access is refused again
   probes) answers `401` without an exact `Authorization: Bearer <token>`
   header while the gate is on. The `401` deliberately carries no
   `WWW-Authenticate`, so MCP clients with auth auto-detection (Mistral Work)
-  classify the server as bearer-auth rather than OAuth.
+  classify the server as bearer-auth rather than OAuth. With OAuth enabled the
+  `401` instead gains a `WWW-Authenticate: Bearer resource_metadata="<public-url>/.well-known/oauth-protected-resource/mcp"`
+  challenge — see [OAuth 2.1 (ChatGPT/Codex)](#oauth-21-chatgptcodex).
 - CORS preflights (`OPTIONS`) pass through without a token.
 - An existing but unreadable or empty token file fails closed: the gate
   rejects everything except the health probes until the file is fixed or
@@ -369,7 +376,108 @@ catence-data mcp disable   # remove the file; remote access is refused again
   packaged Console instead proxies the dashboard through its authenticated
   same-origin route.
 
-Connect HTTP-based clients to `http://127.0.0.1:8787/mcp`. There is **no
-authentication on the MCP server itself** — it trusts the caller's `athleteId`
-parameter — so keep it on loopback or restrict it at the network layer. For
-remote access over SSH: `ssh -L 8787:127.0.0.1:8787 server`.
+#### Per-account API keys
+
+The shared bearer token is a single admin credential. For per-account access,
+create API keys bound to Console accounts (`console/accounts.json`). A key acts
+as its account: an admin account's key sees every athlete, a member account's
+key sees only that account's granted athletes.
+
+The key registry lives at `<catalog-home>/mcp-keys.json` — override with
+`--mcp-keys-file` or `CATENCE_MCP_KEYS_FILE`. In the Docker deployment the
+default is `/data/mcp-keys.json` inside the data volume: runtime-managed, no
+host mount needed. The file is written atomically with mode 0600 and stores
+only SHA-256 token hashes. Any active key in the registry arms the gate,
+exactly like the token file's presence does.
+
+```sh
+catence-data mcp status                                    # gate, token, key counts, OAuth state
+catence-data mcp key add --account coach --label "vibe"   # prints the raw token exactly once
+catence-data mcp key list                                  # ids, labels, accounts — never hashes
+catence-data mcp key roll <id>                             # new raw token, printed exactly once
+catence-data mcp key revoke <id>                           # stops working immediately
+```
+
+All four accept `--file <path>` for a non-default registry. Admins manage the
+same registry in the Console under Settings → MCP Exposure → API keys (create
+with an account picker and a label — the raw token is shown once — and revoke
+by id), backed by the admin-only HTTP API `GET`/`POST`/`DELETE
+/api/v1/mcp-keys` and `POST /api/v1/mcp-keys/roll`.
+
+Scope semantics:
+
+- A key is bound to a Console account; its athlete scope is the account's
+  grant list, resolved live from `console/accounts.json` on every request.
+- Scope is enforced in the runtime for both MCP tools and the HTTP APIs: an
+  out-of-scope `athleteId` is refused with `403 athlete_forbidden` over HTTP
+  (`athlete_forbidden` tool error over MCP), and `list_athletes`,
+  `catence://athletes`, and `GET /api/v1/athletes` are filtered to the scope.
+- Admin-only APIs (`POST /api/v1/athletes`, `/api/v1/mcp-exposure`,
+  `/api/v1/mcp-keys`, `/api/v1/models/discover`) require an admin principal:
+  the legacy token is always admin, an account key is admin only when its
+  account is.
+- Fail closed: a revoked key, a deleted account, or an unreadable registry or
+  accounts file rejects the request (`401`) — never an anonymous fallback.
+- The raw token is shown exactly once (on `add` and `roll`); only its hash is
+  stored. Keep it in a password manager, out of `.env`, `config.json`, shell
+  history, and repositories.
+- `mcp disable` only closes the shared-token path: while keys or OAuth are
+  configured, exposure stays armed through them.
+
+#### OAuth 2.1 (ChatGPT/Codex)
+
+`catence serve --oauth --public-url <url>` runs an OAuth 2.1 authorization
+server inside the runtime so ChatGPT and Codex can connect with their native
+OAuth flow. The environment equivalents are `CATENCE_OAUTH_ENABLED=1|true` and
+`CATENCE_PUBLIC_URL=<url>`.
+
+From the Console, open Settings → MCP exposure → **OAuth 2.1 sign-in**: set the
+public URL and flip the switch. The Console writes
+`<catalog-home>/oauth/settings.json`, which the runtime reads on every request —
+the change applies immediately, without a restart. Once a valid settings file
+exists it alone decides whether OAuth is enabled and overrides the
+`CATENCE_OAUTH_ENABLED`/`CATENCE_PUBLIC_URL` (or `--oauth`/`--public-url`)
+startup values; a malformed file fails closed to disabled until the Console
+saves a valid one. `catence-data mcp status` reports the effective state and
+its `source` (`console`, `environment`, or `disabled`).
+
+- The issuer is the public URL: it must be an absolute `https` URL with no
+  query string or fragment (typically the tunnel URL), and it is required when
+  OAuth is enabled — the server refuses to start without it (startup values)
+  and the Console write rejects it (settings values).
+- Clients discover the server through RFC 8414/RFC 9728 metadata served at
+  `/.well-known/oauth-authorization-server` and
+  `/.well-known/oauth-protected-resource[/mcp]`. Dynamic client registration
+  (`POST /oauth/register`, RFC 7591) and client ID metadata documents (CIMD)
+  are enabled; PKCE with S256 is enforced.
+- The browser consent page lives at `<public-url>/oauth/consent`: it logs in
+  with a Console account (username + password, verified against
+  `console/accounts.json`) and asks to approve or deny the client. The access
+  token carries the account username, and the athlete scope is that account's
+  live grants — scoped exactly like an account key.
+- While OAuth is enabled, the `401` for a missing or invalid bearer token
+  gains an RFC 9728 challenge —
+  `WWW-Authenticate: Bearer resource_metadata="<public-url>/.well-known/oauth-protected-resource/mcp"`
+  — so OAuth clients can discover the authorization server. Without `--oauth`
+  the `401` stays plain on purpose (Mistral connector auto-detection).
+- Authorization-server state (registered clients, authorization codes, tokens)
+  lives in `<catalog-home>/oauth/` (directory mode 0700, files 0600).
+
+Note: the added `WWW-Authenticate` challenge can flip a client with auth
+auto-detection (Mistral Work) from bearer to OAuth — smoke-test the Mistral
+connector after enabling OAuth.
+
+#### Client matrix
+
+| Client | Setup | Credential |
+| --- | --- | --- |
+| Mistral Vibe (Work custom connector) | Connectors → Add Connector → Custom MCP Connector, URL `https://<host>/mcp` | Bearer credential (the shared token) — unchanged |
+| Claude (custom connector) | Authentication: "No sign in"; Request headers: `Authorization: Bearer <key>` | Per-account API key |
+| Claude Code (CLI) | `claude mcp add --transport http --header "Authorization: Bearer <key>" <url>` | Per-account API key |
+| ChatGPT / Codex | Connector OAuth connect flow | OAuth 2.1 (Console: MCP exposure → OAuth 2.1 sign-in, or `--oauth`) |
+
+Connect HTTP-based clients to `http://127.0.0.1:8787/mcp`. Without the bearer
+gate, per-account keys, or OAuth there is **no authentication on the MCP
+server itself** — it trusts the caller's `athleteId` parameter — so keep it on
+loopback or restrict it at the network layer. For remote access over SSH:
+`ssh -L 8787:127.0.0.1:8787 server`.

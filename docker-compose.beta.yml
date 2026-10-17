@@ -20,6 +20,13 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_API_BASE: ${OPENAI_API_BASE:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Opt-in OAuth 2.1 authorization server for ChatGPT/Codex MCP clients
+      # (empty = disabled). CATENCE_PUBLIC_URL is the public https URL of this
+      # server (the tunnel URL) and is required when OAuth is enabled. These
+      # are startup defaults; the Console (Settings -> MCP Exposure ->
+      # OAuth 2.1 sign-in) overrides them at runtime.
+      CATENCE_OAUTH_ENABLED: ${CATENCE_OAUTH_ENABLED:-}
+      CATENCE_PUBLIC_URL: ${CATENCE_PUBLIC_URL:-}
       # Opt-in verbose LLM wire logging (LiteLLM + OpenAI SDK), e.g. LITELLM_LOG=DEBUG.
       LITELLM_LOG: ${LITELLM_LOG:-}
       OPENAI_LOG: ${OPENAI_LOG:-}

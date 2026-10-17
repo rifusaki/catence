@@ -27,6 +27,7 @@ explained in the [beta release notes](../../README.md#beta-releases).
 | API keys | process environment only | `.env` |
 | Chat history + preferences | data home | `console/chat-history.sqlite3` |
 | Console logins + athlete grants | data home (mode 0600, bcrypt hashes) | `console/accounts.json` |
+| Per-account MCP keys + OAuth state | data home (registry 0600; `oauth/` dir 0700) | `mcp-keys.json`, `oauth/` |
 
 Credentials never land in `config.json`; profiles reference environment
 variable *names* (`apiKeyEnv`, `apiBaseEnv`, `apiVersionEnv`). See
@@ -165,9 +166,10 @@ to scope a chat to. The environment pair is a never-persisted break-glass
 admin: it keeps working when the accounts file is lost or the last admin is
 locked out, and unsetting the two variables revokes it.
 
-Accounts gate the Console only. The MCP server keeps its own contract — no
-authentication, the caller's `athleteId` is trusted — so port 8787 still needs
-loopback or network-layer restriction (see
+Accounts gate the Console only. The MCP server has no authentication by
+default — the caller's `athleteId` is trusted — so port 8787 still needs
+loopback or network-layer restriction unless you switch on the bearer gate,
+per-account keys, or OAuth (see
 [Connecting to the Docker-based MCP from outside](#connecting-to-the-docker-based-mcp-from-outside)).
 
 The accounts file is the only copy of your stored logins: keep it in backups
@@ -468,11 +470,12 @@ CATENCE_MCP_BIND=0.0.0.0 ./scripts/deploy-console.sh beta
 After deployment, the MCP server is available at
 `http://<tailscale-ip>:8787/mcp` from any device on your tailnet.
 
-**Security note:** The MCP server has **no authentication** — it trusts the
-caller's `athleteId` parameter. When exposing on `0.0.0.0`, you **must**
-restrict access at the network layer (Tailscale ACLs, firewall rules, etc.).
-The Console UI remains on loopback (`127.0.0.1:8000`) and should still be
-fronted by Cloudflare Tunnel or a reverse proxy.
+**Security note:** Without the bearer gate, per-account keys, or OAuth, the MCP
+server has **no authentication** — it trusts the caller's `athleteId`
+parameter. When exposing on `0.0.0.0`, you **must** restrict access at the
+network layer (Tailscale ACLs, firewall rules, etc.). The Console UI remains
+on loopback (`127.0.0.1:8000`) and should still be fronted by Cloudflare
+Tunnel or a reverse proxy.
 
 **Examples: common MCP clients**
 
@@ -498,8 +501,8 @@ claude mcp add --transport http catence -- http://<tailscale-ip>:8787/mcp
 
 ### Why not expose port 8787 directly?
 
-- The MCP server has **no authentication** — it trusts the caller's
-  `athleteId` parameter.
+- Without the bearer gate, per-account keys, or OAuth, the MCP server has
+  **no authentication** — it trusts the caller's `athleteId` parameter.
 - Exposing it would allow any network caller to read all athlete data in the
   catalog.
 - The Console proxies dashboard requests through its **authenticated**
@@ -546,6 +549,41 @@ A custom host-side token file is still possible: set
 `CATENCE_MCP_TOKEN_FILE=<host path>` in `.env`. The file is then bind-mounted
 read-only at the same path, so it must already exist on the host — enabling
 from the Console cannot create it.
+
+#### Per-account MCP keys and OAuth 2.1 (Docker)
+
+The runtime reads three more environment variables. The deploy script passes
+them into the container, writes them into `catence-deploy/.env`, and validates
+them before rendering the compose file:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CATENCE_OAUTH_ENABLED` | empty (disabled) | `1` or `true` runs the OAuth 2.1 authorization server so ChatGPT/Codex connect with their OAuth flow. Startup default — the Console (Settings → MCP Exposure → OAuth 2.1 sign-in) overrides it at runtime. Requires `CATENCE_PUBLIC_URL` when enabled. |
+| `CATENCE_PUBLIC_URL` | empty | Public `https` URL of this server (the tunnel URL; no query string or fragment). It becomes the advertised OAuth issuer. Startup default — overridable in the Console. |
+| `CATENCE_MCP_KEYS_FILE` | `/data/mcp-keys.json` | Per-account MCP key registry, a container path — no host mount needed. Managed with `catence-data mcp key` or the Console (Settings → MCP Exposure → API keys). |
+
+```sh
+# Per-account key for a Console account (the raw token is printed exactly once):
+docker compose -f catence-deploy/docker-compose.yml --env-file catence-deploy/.env \
+  exec console catence-data --home /data mcp key add --account coach
+
+# OAuth for ChatGPT/Codex — preferred: enable in the Console
+#   (Settings → MCP Exposure → OAuth 2.1 sign-in; applies without a restart).
+# Startup defaults, set in catence-deploy/.env and re-run the script:
+#   CATENCE_OAUTH_ENABLED=1
+#   CATENCE_PUBLIC_URL=https://catence-mcp.example.com
+./scripts/deploy-console.sh beta
+```
+
+The script refuses to deploy when `CATENCE_OAUTH_ENABLED` is set without a
+valid https `CATENCE_PUBLIC_URL`. Once a valid Console settings file exists
+(`<catalog-home>/oauth/settings.json`, inside the data volume), it overrides
+these startup values at runtime. The checked-in dev compose
+(`docker-compose.beta.yml`) accepts `CATENCE_OAUTH_ENABLED` and
+`CATENCE_PUBLIC_URL` the same way (empty default = disabled). See
+[local-mcp.md](local-mcp.md#per-account-api-keys) and
+[local-mcp.md](local-mcp.md#oauth-21-chatgptcodex) for the full semantics and
+the client matrix.
 
 ## Exposing the Console safely
 
