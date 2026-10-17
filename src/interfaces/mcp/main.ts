@@ -2,7 +2,7 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { existsSync } from 'node:fs';
 import { addAthlete, athleteStorePaths, CatenceDatabase, createDemoStore, defaultCatalogHome, initializeCatalog, loadCatalog, resolveCatalogPaths, startAutoSyncScheduler } from '../../runtime/index.js';
-import { defaultBearerTokenPath, parseServeCliOptions, SERVE_USAGE } from '../http/cli-options.js';
+import { defaultBearerTokenPath, defaultMcpKeysPath, defaultOauthSettingsPath, oauthStatusFromSettings, parseServeCliOptions, SERVE_USAGE } from '../http/cli-options.js';
 import { createCatenceHttpServer } from '../http/server.js';
 import { MCP_USAGE, parseMcpCliOptions } from './cli-options.js';
 import { createCatenceMcpServer } from './server.js';
@@ -46,12 +46,24 @@ async function run(): Promise<void> {
     }
     await migrateCatalogStores(options.home);
     const catalogPaths = resolveCatalogPaths(options.home);
+    const mcpKeysFile = options.mcpKeysFile ?? defaultMcpKeysPath(catalogPaths.root);
+    const oauthSettingsFile = options.oauthSettingsFile ?? defaultOauthSettingsPath(catalogPaths.root);
     const httpServer = createCatenceHttpServer({
       catalogPaths,
       allowedOrigins: options.allowedOrigins,
       // The token file's presence switches authentication on; enable it with
       // `catence-data mcp enable` (or the Console Settings / exposure API).
       bearerTokenFile: options.authTokenFile ?? defaultBearerTokenPath(catalogPaths.root),
+      // Any active per-account key in the registry arms the gate too; manage
+      // keys with `catence-data mcp key`.
+      mcpKeysFile,
+      // The Console-managed settings file overrides the startup --oauth flag at
+      // runtime; the Express sub-app builds lazily on first effective use.
+      oauthSettingsFile,
+      // The OAuth authorization server (express is loaded lazily inside the
+      // server) serves /.well-known/oauth-* and /oauth/* and verifies tokens
+      // at the gate; requires the https --public-url validated at parse time.
+      ...(options.oauth && options.publicUrl ? { oauth: { publicUrl: options.publicUrl } } : {}),
     });
     await new Promise<void>((resolve, reject) => {
       httpServer.once('error', reject);
@@ -62,6 +74,13 @@ async function run(): Promise<void> {
     });
     console.error(`Catence Streamable HTTP server is listening at http://${options.host}:${options.port}/mcp`);
     console.error(`Bearer-token authentication is armed at ${options.authTokenFile ?? defaultBearerTokenPath(catalogPaths.root)}; enable it with 'catence-data mcp enable'. Health endpoints stay open for readiness probes.`);
+    console.error(`Per-account MCP keys are read from ${mcpKeysFile}; manage them with 'catence-data mcp key'.`);
+    const oauthStatus = oauthStatusFromSettings(oauthSettingsFile);
+    if (oauthStatus.enabled && oauthStatus.publicUrl) {
+      console.error(`OAuth 2.1 authorization server is enabled (${oauthStatus.source}); issuer ${oauthStatus.publicUrl}, consent at ${oauthStatus.publicUrl}/oauth/consent.`);
+    } else {
+      console.error('OAuth 2.1 authorization server is disabled; enable it from the Console (Settings, MCP exposure tab) or with CATENCE_OAUTH_ENABLED=1 and CATENCE_PUBLIC_URL.');
+    }
     // Auto-sync runs while the server is up: each athlete's autosync.json
     // (default: enabled, every 2 hours) triggers a detached sync. The
     // detached child and the single-writer DuckDB lock stay the only

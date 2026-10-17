@@ -4,13 +4,17 @@ import { stdin as input, stdout as output } from 'node:process';
 import { Command } from 'commander';
 import {
   defaultBearerTokenPath,
+  defaultMcpKeysPath,
+  defaultOauthSettingsPath,
   disableBearerToken,
   ensureBearerToken,
   mcpExposureStatus,
+  oauthStatusFromSettings,
   readBearerToken,
 } from '../http/cli-options.js';
 import {
   addAthlete,
+  addMcpKey,
   athleteStorePaths,
   CATENCE_RUNTIME_VERSION,
   CatenceDatabase,
@@ -27,6 +31,7 @@ import {
   initializeCatalog,
   isGlobalNpmInstall,
   linkActivity,
+  listMcpKeys,
   loadCatalog,
   npmGlobalPrefix,
   parseAutoSyncInterval,
@@ -40,6 +45,8 @@ import {
   resolveAthlete,
   resolveCatalogPaths,
   retryDataSync,
+  revokeMcpKey,
+  rollMcpKey,
   runSelfUpdateCommand,
   setAthleteSecret,
   syncData,
@@ -85,15 +92,27 @@ async function stdinSecret(): Promise<string> {
   return value;
 }
 
-const mcpCommand = program.command('mcp').description('Manage Streamable HTTP MCP exposure: the bearer-token gate, its token, and endpoint URLs.');
+const mcpCommand = program.command('mcp').description('Manage Streamable HTTP MCP exposure: the bearer-token gate, its token, per-account keys, and endpoint URLs.');
 const mcpLocalEndpoint = (): string => `http://127.0.0.1:${process.env.CATENCE_HTTP_PORT ?? '8787'}`;
+// The keys registry resolves like the serve option: --file, then the
+// environment, then the catalog home default.
+const mcpKeysFile = (file?: string): string => file ?? process.env.CATENCE_MCP_KEYS_FILE ?? defaultMcpKeysPath(currentCatalog().root);
+// The OAuth settings file resolves like the serve option: the environment,
+// then the catalog home default.
+const mcpOauthSettingsFile = (): string => process.env.CATENCE_OAUTH_SETTINGS_FILE ?? defaultOauthSettingsPath(currentCatalog().root);
 
 mcpCommand.command('status')
-  .description('Report whether the bearer-token gate is enabled, the token, and the endpoint URLs.')
+  .description('Report whether the bearer-token gate is enabled, the token, the per-account key counts, and the endpoint URLs.')
   .option('--file <path>', 'non-default token file path')
   .action(async (options: { file?: string }) => {
     const tokenFile = options.file ?? defaultBearerTokenPath(currentCatalog().root);
-    process.stdout.write(`${JSON.stringify(mcpExposureStatus(tokenFile, mcpLocalEndpoint()), null, 2)}\n`);
+    const keys = await listMcpKeys(mcpKeysFile());
+    const status = {
+      ...mcpExposureStatus(tokenFile, mcpLocalEndpoint()),
+      keys: { total: keys.length, active: keys.filter((key) => key.revokedAt === undefined).length },
+      oauth: oauthStatusFromSettings(mcpOauthSettingsFile()),
+    };
+    process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
   });
 
 mcpCommand.command('enable')
@@ -122,6 +141,43 @@ mcpCommand.command('token')
     const token = readBearerToken(tokenFile);
     if (token === null) throw new Error(`MCP exposure is not enabled; run 'catence-data mcp enable' first.`);
     process.stdout.write(`${token}\n`);
+  });
+
+const mcpKeyCommand = mcpCommand.command('key').description('Manage per-account MCP bearer keys; raw tokens are printed exactly once and stored only as hashes.');
+
+mcpKeyCommand.command('add')
+  .description('Create a per-account MCP key and print its raw token exactly once.')
+  .requiredOption('--account <username>', 'Console account username the key acts for')
+  .option('--label <label>', 'human-readable key label')
+  .option('--file <path>', 'non-default MCP keys file path')
+  .action(async (options: { account: string; label?: string; file?: string }) => {
+    const { record, token } = await addMcpKey(mcpKeysFile(options.file), { account: options.account, label: options.label });
+    process.stdout.write(`${JSON.stringify({ id: record.id, label: record.label, account: record.account, createdAt: record.createdAt, token }, null, 2)}\n`);
+  });
+
+mcpKeyCommand.command('list')
+  .description('List MCP keys without their token hashes.')
+  .option('--file <path>', 'non-default MCP keys file path')
+  .action(async (options: { file?: string }) => {
+    process.stdout.write(`${JSON.stringify({ keys: await listMcpKeys(mcpKeysFile(options.file)) }, null, 2)}\n`);
+  });
+
+mcpKeyCommand.command('revoke')
+  .description('Revoke an MCP key by id; its token stops working immediately.')
+  .argument('<id>', 'key id')
+  .option('--file <path>', 'non-default MCP keys file path')
+  .action(async (id: string, options: { file?: string }) => {
+    await revokeMcpKey(mcpKeysFile(options.file), id);
+    process.stdout.write(`${JSON.stringify({ revoked: id }, null, 2)}\n`);
+  });
+
+mcpKeyCommand.command('roll')
+  .description('Replace an MCP key’s token and print the new raw token exactly once.')
+  .argument('<id>', 'key id')
+  .option('--file <path>', 'non-default MCP keys file path')
+  .action(async (id: string, options: { file?: string }) => {
+    const { record, token } = await rollMcpKey(mcpKeysFile(options.file), id);
+    process.stdout.write(`${JSON.stringify({ id: record.id, label: record.label, account: record.account, createdAt: record.createdAt, token }, null, 2)}\n`);
   });
 
 program.command('setup')

@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { readMcpOauthSettings } from '../../runtime/index.js';
 
 export type ServeCliOptions = {
   home?: string;
@@ -7,6 +8,10 @@ export type ServeCliOptions = {
   port: number;
   allowedOrigins: string[];
   authTokenFile?: string;
+  mcpKeysFile?: string;
+  oauthSettingsFile?: string;
+  oauth: boolean;
+  publicUrl?: string;
   help: boolean;
 };
 
@@ -22,11 +27,35 @@ Options:
   --auth-token-file <path>   Bearer-token file for the HTTP gate. Its presence switches authentication on;
                              generate/inspect it with 'catence-data mcp enable|token'.
                              Defaults to CATENCE_MCP_TOKEN_FILE or <catalog-home>/mcp-token.
+  --mcp-keys-file <path>     Per-account MCP key registry for the HTTP gate. Any active key in it
+                             switches authentication on; manage keys with 'catence-data mcp key'.
+                             Defaults to CATENCE_MCP_KEYS_FILE or <catalog-home>/mcp-keys.json.
+  --oauth                    Run the OAuth 2.1 authorization server (issuer = --public-url) so
+                             ChatGPT/Codex-style MCP clients connect with a per-account consent
+                             login. Requires --public-url. Defaults to CATENCE_OAUTH_ENABLED=1/true.
+                             The Console settings file overrides this at runtime.
+  --public-url <url>         Public https URL of this server (no query string or fragment), e.g.
+                             the tunnel URL. Required when --oauth is enabled.
+                             Defaults to CATENCE_PUBLIC_URL.
+  --oauth-settings-file <path>
+                             Console-managed OAuth settings that override --oauth/--public-url
+                             at runtime. Defaults to CATENCE_OAUTH_SETTINGS_FILE or
+                             <catalog-home>/oauth/settings.json.
   -h, --help                 Show this help text.`;
 
 /** The canonical token location inside a catalog home. */
 export function defaultBearerTokenPath(catalogRoot: string): string {
   return `${catalogRoot.replace(/[/\\]+$/, '')}/mcp-token`;
+}
+
+/** The canonical per-account MCP key registry location inside a catalog home. */
+export function defaultMcpKeysPath(catalogRoot: string): string {
+  return `${catalogRoot.replace(/[/\\]+$/, '')}/mcp-keys.json`;
+}
+
+/** The canonical Console-managed OAuth settings location inside a catalog home. */
+export function defaultOauthSettingsPath(catalogRoot: string): string {
+  return `${catalogRoot.replace(/[/\\]+$/, '')}/oauth/settings.json`;
 }
 
 /** Read and validate a stored bearer token: trimmed, non-empty, or fail loudly. */
@@ -100,9 +129,10 @@ export type McpExposureStatus = {
   endpoint: string;
   healthEndpoint: string;
   token?: string;
+  oauth?: { enabled: boolean; publicUrl?: string };
 };
 
-export function mcpExposureStatus(filePath: string, endpointBase: string): McpExposureStatus {
+export function mcpExposureStatus(filePath: string, endpointBase: string, oauth?: { enabled: boolean; publicUrl?: string }): McpExposureStatus {
   const token = readBearerToken(filePath);
   const base = endpointBase.replace(/\/+$/, '');
   return {
@@ -111,7 +141,56 @@ export function mcpExposureStatus(filePath: string, endpointBase: string): McpEx
     endpoint: `${base}/mcp`,
     healthEndpoint: `${base}/health`,
     ...(token !== null ? { token } : {}),
+    ...(oauth !== undefined ? { oauth } : {}),
   };
+}
+
+/** True when CATENCE_OAUTH_ENABLED is 1/true. */
+export function oauthEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.CATENCE_OAUTH_ENABLED;
+  return value === '1' || value === 'true';
+}
+
+/** The OAuth exposure reported by `catence-data mcp status`, read from the environment. */
+export function oauthStatusFromEnv(env: NodeJS.ProcessEnv = process.env): { enabled: boolean; publicUrl?: string } {
+  const publicUrl = env.CATENCE_PUBLIC_URL || undefined;
+  return { enabled: oauthEnabledFromEnv(env), ...(publicUrl !== undefined ? { publicUrl } : {}) };
+}
+
+export type McpOauthStatusSource = 'console' | 'environment' | 'disabled';
+
+/**
+ * The effective OAuth exposure: the Console settings file when a valid one
+ * exists (a malformed one fails closed to disabled), else the environment.
+ * `source` records where the effective values come from.
+ */
+export function oauthStatusFromSettings(
+  settingsFile: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { enabled: boolean; publicUrl?: string; source: McpOauthStatusSource } {
+  const { state, settings } = readMcpOauthSettings(settingsFile);
+  if (state === 'ok' && settings !== null) {
+    return { enabled: settings.enabled, ...(settings.publicUrl ? { publicUrl: settings.publicUrl } : {}), source: 'console' };
+  }
+  if (state === 'invalid') return { enabled: false, source: 'disabled' };
+  const fromEnv = oauthStatusFromEnv(env);
+  return { ...fromEnv, source: fromEnv.enabled ? 'environment' : 'disabled' };
+}
+
+/**
+ * Validate the public URL: an absolute https URL with no query string or
+ * fragment (it becomes the advertised OAuth issuer), trailing slashes stripped.
+ */
+function parsePublicUrl(value: string, option: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${option} must be a valid absolute URL.`);
+  }
+  if (url.protocol !== 'https:') throw new Error(`${option} must use https: the OAuth issuer is advertised publicly.`);
+  if (url.search || url.hash) throw new Error(`${option} must not contain a query string or fragment.`);
+  return value.replace(/\/+$/, '');
 }
 
 function requiredValue(arguments_: readonly string[], index: number, option: string): string {
@@ -133,10 +212,15 @@ export function parseServeCliOptions(arguments_: readonly string[]): ServeCliOpt
   let port = process.env.CATENCE_HTTP_PORT ? parsePort(process.env.CATENCE_HTTP_PORT) : 8787;
   const allowedOrigins: string[] = [];
   let authTokenFile: string | undefined = process.env.CATENCE_MCP_TOKEN_FILE || undefined;
+  let mcpKeysFile: string | undefined = process.env.CATENCE_MCP_KEYS_FILE || undefined;
+  let oauthSettingsFile: string | undefined = process.env.CATENCE_OAUTH_SETTINGS_FILE || undefined;
+  let oauth = oauthEnabledFromEnv();
+  let publicUrl: string | undefined = process.env.CATENCE_PUBLIC_URL || undefined;
+  let publicUrlSource = 'CATENCE_PUBLIC_URL';
 
   for (let index = 0; index < arguments_.length; index++) {
     const argument = arguments_[index];
-    if (argument === '-h' || argument === '--help') return { home, host, port, allowedOrigins, authTokenFile, help: true };
+    if (argument === '-h' || argument === '--help') return { home, host, port, allowedOrigins, authTokenFile, mcpKeysFile, oauthSettingsFile, oauth, publicUrl, help: true };
     if (argument === '--home') {
       home = requiredValue(arguments_, index, '--home');
       index++;
@@ -155,6 +239,26 @@ export function parseServeCliOptions(arguments_: readonly string[]): ServeCliOpt
     if (argument.startsWith('--auth-token-file=')) {
       authTokenFile = argument.slice('--auth-token-file='.length);
       if (!authTokenFile) throw new Error('--auth-token-file requires a value.');
+      continue;
+    }
+    if (argument === '--mcp-keys-file') {
+      mcpKeysFile = requiredValue(arguments_, index, '--mcp-keys-file');
+      index++;
+      continue;
+    }
+    if (argument.startsWith('--mcp-keys-file=')) {
+      mcpKeysFile = argument.slice('--mcp-keys-file='.length);
+      if (!mcpKeysFile) throw new Error('--mcp-keys-file requires a value.');
+      continue;
+    }
+    if (argument === '--oauth-settings-file') {
+      oauthSettingsFile = requiredValue(arguments_, index, '--oauth-settings-file');
+      index++;
+      continue;
+    }
+    if (argument.startsWith('--oauth-settings-file=')) {
+      oauthSettingsFile = argument.slice('--oauth-settings-file='.length);
+      if (!oauthSettingsFile) throw new Error('--oauth-settings-file requires a value.');
       continue;
     }
     if (argument === '--host') {
@@ -187,8 +291,29 @@ export function parseServeCliOptions(arguments_: readonly string[]): ServeCliOpt
       allowedOrigins.push(origin);
       continue;
     }
+    if (argument === '--oauth') {
+      oauth = true;
+      continue;
+    }
+    if (argument === '--public-url') {
+      publicUrl = requiredValue(arguments_, index, '--public-url');
+      publicUrlSource = '--public-url';
+      index++;
+      continue;
+    }
+    if (argument.startsWith('--public-url=')) {
+      publicUrl = argument.slice('--public-url='.length);
+      if (!publicUrl) throw new Error('--public-url requires a value.');
+      publicUrlSource = '--public-url';
+      continue;
+    }
     throw new Error(`Unknown option: ${argument}`);
   }
 
-  return { home, host, port, allowedOrigins, authTokenFile, help: false };
+  if (publicUrl !== undefined) publicUrl = parsePublicUrl(publicUrl, publicUrlSource);
+  if (oauth && publicUrl === undefined) {
+    throw new Error('--oauth requires --public-url (or CATENCE_PUBLIC_URL): the OAuth issuer is the public URL of this server.');
+  }
+
+  return { home, host, port, allowedOrigins, authTokenFile, mcpKeysFile, oauthSettingsFile, oauth, publicUrl, help: false };
 }

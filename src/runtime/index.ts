@@ -36,6 +36,38 @@ export {
   resolveCatalogPaths,
 } from '../core/runtime/catalog.js';
 export type { Athlete, CatalogPaths, CatenceCatalog } from '../core/runtime/catalog.js';
+export {
+  addMcpKey,
+  countActiveMcpKeys,
+  listMcpKeys,
+  McpKeyNotFoundError,
+  resolveKeyPrincipal,
+  revokeMcpKey,
+  rollMcpKey,
+} from '../core/runtime/mcp-keys.js';
+export type { McpKeyPrincipal, McpKeyRecord, McpKeySummary } from '../core/runtime/mcp-keys.js';
+export {
+  consoleAccountsPath,
+  filterRosterToScope,
+  loadConsoleAccounts,
+  resolveAccountScope,
+  scopeAllowsAthlete,
+  verifyAccountPassword,
+} from '../core/runtime/console-accounts.js';
+export type { ConsoleAccount, ConsoleAccountRole, ConsoleAccountScope } from '../core/runtime/console-accounts.js';
+export { createFileOAuthServerModel, FileOAuthServerModel } from '../core/runtime/oauth/model.js';
+export {
+  normalizeMcpOauthSettings,
+  readMcpOauthSettings,
+  validateOauthPublicUrl,
+  writeMcpOauthSettings,
+} from '../core/runtime/oauth/settings.js';
+export type {
+  McpOauthSettings,
+  McpOauthSettingsInput,
+  McpOauthSettingsRead,
+  McpOauthSettingsState,
+} from '../core/runtime/oauth/settings.js';
 export { athleteProviderEnvironment, deleteAthleteSecret, describeAthleteSecrets, providerSecretPath, readAthleteSecrets, secretProviderLabels, setAthleteSecret } from '../core/runtime/secrets.js';
 export type { AthleteSecrets, SecretFieldDescription, SecretProvider, SecretProviderDescription } from '../core/runtime/secrets.js';
 export {

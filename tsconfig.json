@@ -10,7 +10,10 @@
     "outDir": "dist",
     "declaration": true,
     "sourceMap": true,
-    "types": ["node"]
+    "types": ["node"],
+    "paths": {
+      "mcp-oauth-server": ["./src/types/mcp-oauth-server.d.ts"]
+    }
   },
   "include": ["src/**/*.ts", "test/**/*.ts"]
 }

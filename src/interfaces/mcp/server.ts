@@ -15,6 +15,7 @@ import {
   demoStoreMetadata,
   DetachedSyncBusyError,
   EventsService,
+  filterRosterToScope,
   FitnessService,
   getDataset,
   hydrateStravaActivity,
@@ -30,6 +31,7 @@ import {
   ReadOnlyRepository,
   resolveAthlete,
   resolveCatalogPaths,
+  scopeAllowsAthlete,
   searchContext,
   SlidingWindowLimiter,
   startDetachedSync,
@@ -194,12 +196,23 @@ async function activitySegments(repository: ReadOnlyRepository, activityId: stri
   `, values);
 }
 
-export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = resolveCatalogPaths(), dependencies: McpDependencies = {}): McpServer {
+export type CatenceMcpServerOptions = {
+  /**
+   * Athlete scope enforced on every tool that selects an athlete, and applied
+   * to the list_athletes tool and the catence://athletes resource. "all" (or no
+   * scope at all, as on the stdio path) means the caller may reach every
+   * athlete.
+   */
+  scope?: { athleteIds: string[] | 'all' };
+};
+
+export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = resolveCatalogPaths(), dependencies: McpDependencies = {}, options: CatenceMcpServerOptions = {}): McpServer {
   const server = new McpServer({ name: 'catence', version: '0.1.0' }, { instructions: MCP_INSTRUCTIONS });
   const hydrateActivity = dependencies.hydrateStravaActivity ?? hydrateStravaActivity;
   const startSync = dependencies.startDetachedSync ?? startDetachedSync;
   const catalogPaths = isCatalogPaths(paths) ? paths : null;
   const staticPaths: CatencePaths | null = isCatalogPaths(paths) ? null : paths;
+  const athleteScope = options.scope?.athleteIds;
   const scope = new AsyncLocalStorage<AthleteResolution>();
   const activePaths = (): CatencePaths => scope.getStore()?.paths ?? staticPaths ?? (() => { throw new Error('athleteId is required. Call list_athletes to inspect the configured catalog.'); })();
   const activeAthlete = () => scope.getStore()?.athlete;
@@ -240,7 +253,9 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     }, async (): Promise<ToolResult> => {
       try {
         const catalog = await loadCatalog(catalogPaths);
-        return textResult({ data: { defaultAthleteId: catalog.defaultAthleteId, athletes: catalog.athletes } });
+        // The roster is narrowed to the caller's athlete scope, if any.
+        const roster = filterRosterToScope(catalog.athletes, catalog.defaultAthleteId, athleteScope ?? 'all');
+        return textResult({ data: { defaultAthleteId: roster.defaultAthleteId, athletes: roster.athletes } });
       } catch (error) { return errorResult(error); }
     });
     const originalRegister = server.registerTool.bind(server) as unknown as (name: string, configuration: Record<string, unknown>, handler: unknown) => unknown;
@@ -276,6 +291,15 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
       const selected = catalogPaths
         ? await resolveAthlete(catalogPaths, rawInput.athleteId ?? '')
         : null;
+      // A scoped caller may only reach athletes inside its scope; the HTTP gate
+      // applies the same rule to its JSON APIs.
+      if (selected && athleteScope !== undefined && !scopeAllowsAthlete(athleteScope, selected.athlete.id)) {
+        const message = `This credential is not allowed to access athlete ${selected.athlete.id}.`;
+        return {
+          ...textResult({ data: null, provenance: {}, query: { athleteId: selected.athlete.id }, caveats: [message], error: { code: 'athlete_forbidden', message } }),
+          isError: true,
+        };
+      }
       const run = async (): Promise<ToolResult> => {
         const currentPaths = activePaths();
         const config = await loadCatenceConfig(currentPaths);
@@ -819,7 +843,12 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
 
   if (catalogPaths) {
     server.registerResource('athletes', 'catence://athletes', { title: 'Configured athlete roster', mimeType: 'application/json' }, async (uri) => {
-      try { const catalog = await loadCatalog(catalogPaths); return resource(uri, { defaultAthleteId: catalog.defaultAthleteId, athletes: catalog.athletes }); } catch (error) { return resource(uri, { error: errorResult(error).content[0].text }); }
+      try {
+        const catalog = await loadCatalog(catalogPaths);
+        // The roster is narrowed to the caller's athlete scope, if any.
+        const roster = filterRosterToScope(catalog.athletes, catalog.defaultAthleteId, athleteScope ?? 'all');
+        return resource(uri, { defaultAthleteId: roster.defaultAthleteId, athletes: roster.athletes });
+      } catch (error) { return resource(uri, { error: errorResult(error).content[0].text }); }
     });
   } else {
     server.registerResource('status', 'catence://status', { title: 'Catence status', mimeType: 'application/json' }, async (uri) => {

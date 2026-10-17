@@ -5,39 +5,54 @@ import path from 'node:path';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   addAthlete,
+  addMcpKey,
   AthleteFileConflictError,
   AthleteFileTooLargeError,
   AthleteFileValidationError,
   catenceRuntimeHealth,
+  countActiveMcpKeys,
   DashboardSnapshotService,
   deleteAthleteSecret,
   describeAthleteSecrets,
   DetachedSyncBusyError,
   type DetachedSyncSpawner,
   DETACHED_SYNC_PROVIDERS,
+  filterRosterToScope,
   jsonSafe,
   listAthleteFileRevisions,
+  listMcpKeys,
   loadCatalog,
+  McpKeyNotFoundError,
   mergeOpenCodeGoConsoleProfiles,
   openReadOnlyRepository,
   parseAutoSyncInterval,
   readAutoSyncSchedule,
   readAthleteFile,
   readAthleteFileRevision,
+  readMcpOauthSettings,
+  resolveAccountScope,
   resolveAthlete,
   resolveCatalogPaths,
+  resolveKeyPrincipal,
+  revokeMcpKey,
+  rollMcpKey,
+  scopeAllowsAthlete,
   setAthleteSecret,
   startDetachedSync,
   syncProgress,
   updateAthleteFile,
   updateAutoSyncSchedule,
+  writeMcpOauthSettings,
   type AthleteFileOperation,
   type AutoSyncIntervalMinutes,
   type CatalogPaths,
   type CatencePaths,
+  type ConsoleAccountRole,
+  type ConsoleAccountScope,
   type SecretProvider,
 } from '../../runtime/index.js';
 import { activeBearerToken, ensureBearerToken, disableBearerToken, mcpExposureStatus } from './cli-options.js';
+import type { OAuthAppHandle } from './oauth.js';
 import { createCatenceMcpServer } from '../mcp/server.js';
 import { generationStatus } from './generation-status.js';
 
@@ -64,6 +79,39 @@ export type CatenceHttpServerOptions = {
    * exposure such as a Cloudflare Tunnel to an MCP client.
    */
   bearerTokenFile?: string;
+  /**
+   * Per-account MCP key registry for the gate. Any active key in it arms
+   * authentication and resolves to that account's athlete scope; keys are
+   * managed with `catence-data mcp key` and the /api/v1/mcp-keys routes.
+   */
+  mcpKeysFile?: string;
+  /**
+   * OAuth bearer-token verifier (Task B plugs in the MCP OAuth server). Its
+   * presence arms the gate when oauthEnabled() is unset or true; verified
+   * usernames resolve through the same Console accounts as MCP keys.
+   */
+  oauthVerifier?: (token: string) => Promise<{ username: string } | null>;
+  /**
+   * Live check whether the OAuth 2.1 server is effectively enabled. Wired by
+   * the server itself when OAuth is configurable (the `oauth` startup option
+   * or an oauthSettingsFile); its truth arms the gate together with the
+   * oauthVerifier.
+   */
+  oauthEnabled?: () => boolean;
+  /**
+   * Run the OAuth 2.1 authorization server (issuer = publicUrl) for
+   * ChatGPT/Codex-style clients. The Express sub-app is built lazily on first
+   * effective use and serves /.well-known/oauth-* and /oauth/* ahead of the
+   * gate; its verifyAccessToken is wired in as the oauthVerifier. The
+   * oauthSettingsFile overrides this at runtime.
+   */
+  oauth?: { publicUrl: string };
+  /**
+   * Console-managed OAuth settings file for the gate and the
+   * /api/v1/mcp-oauth-settings routes. A valid file overrides the `oauth`
+   * startup option at runtime; a malformed one fails closed to disabled.
+   */
+  oauthSettingsFile?: string;
   /** Internal compatibility hook for tests: override the detached sync spawner. */
   startSync?: typeof startDetachedSync;
   /** Internal compatibility hook for tests: passed into the default startDetachedSync. */
@@ -76,15 +124,85 @@ export type CatenceHttpServerOptions = {
  * no personal data and must answer unauthenticated readiness probes. */
 const UNAUTHENTICATED_PATHS = new Set(['/health', '/api/v1/health']);
 
-function isAuthorized(request: IncomingMessage, options: CatenceHttpServerOptions): boolean {
-  const bearerToken =
-    options.bearerToken !== undefined ? options.bearerToken : options.bearerTokenFile !== undefined ? activeBearerToken(options.bearerTokenFile) : undefined;
-  if (bearerToken === undefined || bearerToken === null) return true;
-  if (bearerToken === 'invalid') return false;
-  const received = Buffer.from(request.headers.authorization ?? '');
-  const expected = Buffer.from(`Bearer ${bearerToken}`);
+/** The authenticated identity behind one request and the athletes it may touch. */
+export type CatencePrincipal = {
+  kind: 'admin-token' | 'key' | 'oauth';
+  username?: string;
+  role: ConsoleAccountRole;
+  athleteIds: string[] | 'all';
+};
+
+/** Thrown when a principal resolves an athlete outside its scope; routes map it to 403 athlete_forbidden. */
+class AthleteForbiddenError extends Error {}
+
+/** Full-access principal: unarmed loopback dev mode and the legacy shared token both mean "local admin". */
+const FULL_ACCESS_PRINCIPAL: CatencePrincipal = { kind: 'admin-token', role: 'admin', athleteIds: 'all' };
+
+function bearerTokenFrom(request: IncomingMessage): string | null {
+  const header = request.headers.authorization;
+  if (typeof header !== 'string' || !header.startsWith('Bearer ')) return null;
+  return header.slice('Bearer '.length);
+}
+
+function matchesLegacyToken(rawToken: string, expected: string): boolean {
+  const received = Buffer.from(rawToken);
+  const expectedBuffer = Buffer.from(expected);
   // timingSafeEqual throws on length mismatch, so compare sizes first.
-  return received.length === expected.length && timingSafeEqual(received, expected);
+  return received.length === expectedBuffer.length && timingSafeEqual(received, expectedBuffer);
+}
+
+function scopeAllows(principal: CatencePrincipal, athleteId: string): boolean {
+  return scopeAllowsAthlete(principal.athleteIds, athleteId);
+}
+
+function requireAdmin(principal: CatencePrincipal, response: ServerResponse): boolean {
+  if (principal.role === 'admin') return true;
+  json(response, 403, { error: { code: 'admin_required', message: 'An admin account is required for this action.' } });
+  return false;
+}
+
+/**
+ * Resolve the request's principal: the legacy shared token first, then a
+ * per-account MCP key, then an OAuth bearer token. The gate is armed when the
+ * legacy token is active, the key registry holds at least one active key, or
+ * the OAuth 2.1 server is effectively enabled; an unarmed server stays open
+ * for loopback dev. Resolution fails closed: a malformed registry or accounts
+ * store, a revoked key, or an unknown account never yields a principal.
+ */
+async function resolvePrincipal(request: IncomingMessage, options: CatenceHttpServerOptions, accountPaths: CatalogPaths): Promise<CatencePrincipal | null> {
+  const legacyToken =
+    options.bearerToken !== undefined ? options.bearerToken : options.bearerTokenFile !== undefined ? activeBearerToken(options.bearerTokenFile) : undefined;
+  const keysArmed = options.mcpKeysFile !== undefined && countActiveMcpKeys(options.mcpKeysFile) > 0;
+  const oauthArmed = options.oauthVerifier !== undefined && (options.oauthEnabled === undefined || options.oauthEnabled());
+  const armed = (legacyToken !== undefined && legacyToken !== null) || keysArmed || oauthArmed;
+  if (!armed) return FULL_ACCESS_PRINCIPAL;
+  const rawToken = bearerTokenFrom(request);
+  if (rawToken === null) return null;
+  if (typeof legacyToken === 'string' && matchesLegacyToken(rawToken, legacyToken)) return FULL_ACCESS_PRINCIPAL;
+  if (options.mcpKeysFile !== undefined) {
+    // A malformed accounts store fails closed: the key resolves to no principal.
+    const keyPrincipal = resolveKeyPrincipal(options.mcpKeysFile, rawToken, (username) => {
+      try {
+        return resolveAccountScope(accountPaths, username);
+      } catch {
+        return null;
+      }
+    });
+    if (keyPrincipal) return { kind: 'key', username: keyPrincipal.account, role: keyPrincipal.role, athleteIds: keyPrincipal.athleteIds };
+  }
+  if (options.oauthVerifier !== undefined) {
+    const verified = await options.oauthVerifier(rawToken).catch(() => null);
+    if (verified) {
+      let scope: ConsoleAccountScope | null = null;
+      try {
+        scope = resolveAccountScope(accountPaths, verified.username);
+      } catch {
+        scope = null;
+      }
+      if (scope) return { kind: 'oauth', username: verified.username, role: scope.role, athleteIds: scope.athleteIds };
+    }
+  }
+  return null;
 }
 
 function json(response: ServerResponse, statusCode: number, value: unknown): void {
@@ -156,10 +274,55 @@ async function dashboardSnapshot(paths: CatencePaths, url: URL): Promise<Record<
   }
 }
 
-async function dashboardPaths(catalogPaths: CatalogPaths | null, staticPaths: CatencePaths | null, url: URL): Promise<CatencePaths> {
+type McpKeyCreateBody = {
+  account: string;
+  label?: string;
+};
+
+function parseMcpKeyCreateBody(body: unknown): McpKeyCreateBody {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new Error('Request body must be a JSON object.');
+  const raw = body as Record<string, unknown>;
+  for (const key of Object.keys(raw)) {
+    if (!['account', 'label'].includes(key)) throw new Error(`Unknown MCP key field: ${key}.`);
+  }
+  if (typeof raw.account !== 'string' || !raw.account.trim()) throw new Error('account is required.');
+  if (raw.label !== undefined && (typeof raw.label !== 'string' || raw.label.trim().length > 120)) {
+    throw new Error('label must be a string of at most 120 characters.');
+  }
+  return { account: raw.account.trim(), label: raw.label as string | undefined };
+}
+
+function parseMcpKeyRollBody(body: unknown): { id: string } {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new Error('Request body must be a JSON object.');
+  const raw = body as Record<string, unknown>;
+  for (const key of Object.keys(raw)) {
+    if (key !== 'id') throw new Error(`Unknown MCP key field: ${key}.`);
+  }
+  if (typeof raw.id !== 'string' || !raw.id.trim()) throw new Error('id is required.');
+  return { id: raw.id.trim() };
+}
+
+type McpOauthSettingsBody = {
+  enabled: boolean;
+  publicUrl?: string;
+};
+
+function parseMcpOauthSettingsBody(body: unknown): McpOauthSettingsBody {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new Error('Request body must be a JSON object.');
+  const raw = body as Record<string, unknown>;
+  for (const key of Object.keys(raw)) {
+    if (!['enabled', 'publicUrl'].includes(key)) throw new Error(`Unknown OAuth settings field: ${key}.`);
+  }
+  if (typeof raw.enabled !== 'boolean') throw new Error('enabled is required and must be a boolean.');
+  if (raw.publicUrl !== undefined && typeof raw.publicUrl !== 'string') throw new Error('publicUrl must be a string.');
+  return { enabled: raw.enabled, publicUrl: raw.publicUrl };
+}
+
+async function dashboardPaths(catalogPaths: CatalogPaths | null, staticPaths: CatencePaths | null, url: URL, principal: CatencePrincipal): Promise<CatencePaths> {
   if (catalogPaths) {
     const athleteId = url.searchParams.get('athleteId');
     if (!athleteId) throw new Error('athleteId is required. Call /api/v1/athletes to inspect the configured catalog.');
+    if (!scopeAllows(principal, athleteId)) throw new AthleteForbiddenError(`This credential is not allowed to access athlete ${athleteId}.`);
     return (await resolveAthlete(catalogPaths, athleteId)).paths;
   }
   if (staticPaths) return staticPaths;
@@ -314,9 +477,10 @@ function parseAthleteSecretRemovalBody(body: unknown): AthleteSecretRemovalBody 
   return { athleteId: raw.athleteId as string | undefined, provider: raw.provider.trim() as SecretProvider, field: raw.field.trim() };
 }
 
-async function resolveSyncPaths(catalogPaths: CatalogPaths | null, staticPaths: CatencePaths | null, body: SyncRequestBody): Promise<CatencePaths> {
+async function resolveSyncPaths(catalogPaths: CatalogPaths | null, staticPaths: CatencePaths | null, body: SyncRequestBody, principal: CatencePrincipal): Promise<CatencePaths> {
   if (catalogPaths) {
     if (!body.athleteId) throw new Error('athleteId is required. Call /api/v1/athletes to inspect the configured catalog.');
+    if (!scopeAllows(principal, body.athleteId)) throw new AthleteForbiddenError(`This credential is not allowed to access athlete ${body.athleteId}.`);
     return (await resolveAthlete(catalogPaths, body.athleteId)).paths;
   }
   if (staticPaths) return staticPaths;
@@ -367,7 +531,7 @@ async function lastSyncSummary(paths: CatencePaths): Promise<LastSyncSummary | n
   }
 }
 
-async function handleMcpRequest(request: IncomingMessage, response: ServerResponse, paths: CatencePaths | CatalogPaths): Promise<void> {
+async function handleMcpRequest(request: IncomingMessage, response: ServerResponse, paths: CatencePaths | CatalogPaths, principal: CatencePrincipal): Promise<void> {
   if (request.method !== 'POST') {
     methodNotAllowed(response);
     return;
@@ -385,7 +549,9 @@ async function handleMcpRequest(request: IncomingMessage, response: ServerRespon
     return;
   }
 
-  const server = createCatenceMcpServer(paths);
+  // The HTTP gate has already authenticated this request; the MCP server
+  // re-enforces the principal's athlete scope on every tool and roster.
+  const server = createCatenceMcpServer(paths, {}, { scope: { athleteIds: principal.athleteIds } });
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   let cleanedUp = false;
   const cleanup = async () => {
@@ -422,26 +588,108 @@ async function handleMcpRequest(request: IncomingMessage, response: ServerRespon
 export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}): Server {
   const catalogPaths = options.catalogPaths ?? (options.paths ? null : resolveCatalogPaths());
   const staticPaths = options.paths ?? null;
+  // Key and OAuth principals resolve their athlete scope through the Console
+  // accounts that live next to the catalog.
+  const accountPaths = catalogPaths ?? resolveCatalogPaths();
   const allowedOrigins = options.allowedOrigins ?? [];
   const startSync = options.startSync ?? startDetachedSync;
   const mergeModels = options.mergeModels ?? mergeOpenCodeGoConsoleProfiles;
 
+  // OAuth 2.1 is configured by a Console-managed settings file
+  // (--oauth-settings-file / <catalog-home>/oauth/settings.json), which
+  // overrides the startup `oauth` option (env/flags) at runtime; a malformed
+  // file fails closed to disabled. The Express sub-app (express,
+  // mcp-oauth-server) builds lazily on first effective use, keyed by the
+  // public URL (the issuer), so the stdio path and a never-enabled serve never
+  // import express. Its verifier is wired into the gate as oauthVerifier;
+  // resolvePrincipal then maps the verified username to the live account scope.
+  const oauthSettingsFile = options.oauthSettingsFile;
+  const bootstrapOauth = options.oauth !== undefined ? { publicUrl: options.oauth.publicUrl.replace(/\/+$/, '') } : null;
+  const oauthConfigurable = options.oauth !== undefined || oauthSettingsFile !== undefined;
+  const effectiveOauth = (): { enabled: boolean; publicUrl?: string; source: 'console' | 'environment' | 'disabled'; settingsState: 'ok' | 'missing' | 'invalid' } => {
+    if (oauthSettingsFile !== undefined) {
+      const { state, settings } = readMcpOauthSettings(oauthSettingsFile);
+      if (state === 'ok' && settings !== null) {
+        return { enabled: settings.enabled, ...(settings.publicUrl ? { publicUrl: settings.publicUrl } : {}), source: 'console', settingsState: state };
+      }
+      if (state === 'invalid') return { enabled: false, source: 'disabled', settingsState: state };
+    }
+    if (bootstrapOauth !== null) return { enabled: true, publicUrl: bootstrapOauth.publicUrl, source: 'environment', settingsState: 'missing' };
+    return { enabled: false, source: 'disabled', settingsState: 'missing' };
+  };
+  let oauthApp: { publicUrl: string; ready: Promise<OAuthAppHandle> } | null = null;
+  const getOauthApp = (publicUrl: string): Promise<OAuthAppHandle> => {
+    if (oauthApp === null || oauthApp.publicUrl !== publicUrl) {
+      const ready = import('./oauth.js').then(({ createOAuthApp }) => createOAuthApp({ catalogRoot: accountPaths.root, publicUrl }));
+      // Surface a build failure per request (the outer catch answers 500); this
+      // no-op branch only marks the rejection handled when no request ever comes.
+      void ready.catch(() => {});
+      oauthApp = { publicUrl, ready };
+    }
+    return oauthApp.ready;
+  };
+  let effectiveOptions = options;
+  if (oauthConfigurable) {
+    const verifier: NonNullable<CatenceHttpServerOptions['oauthVerifier']> = async (token) => {
+      const config = effectiveOauth();
+      if (!config.enabled || config.publicUrl === undefined) return null;
+      const verified = await (await getOauthApp(config.publicUrl)).verifyAccessToken(token);
+      if (!verified?.userId) return null;
+      return { username: verified.userId };
+    };
+    effectiveOptions = { ...options, oauthVerifier: verifier, oauthEnabled: () => effectiveOauth().enabled };
+  }
+  // The status shape mcpExposureStatus reports; present whenever OAuth is
+  // configurable so the Console can read and change it.
+  const oauthStatus = (): { enabled: boolean; publicUrl?: string } | undefined => {
+    if (!oauthConfigurable) return undefined;
+    const config = effectiveOauth();
+    return { enabled: config.enabled, ...(config.publicUrl ? { publicUrl: config.publicUrl } : {}) };
+  };
+
   return createServer((request, response) => {
     void (async () => {
+      const pathname = new URL(request.url ?? '/', 'http://localhost').pathname;
+
+      // The OAuth endpoints are the auth surface itself: they bypass the gate
+      // and CORS entirely and are delegated to the Express sub-app. When OAuth
+      // is effectively disabled they answer 404 — no metadata is advertised.
+      if (pathname.startsWith('/.well-known/oauth-') || pathname.startsWith('/oauth/')) {
+        const config = effectiveOauth();
+        if (config.enabled && config.publicUrl !== undefined) {
+          const handle = await getOauthApp(config.publicUrl);
+          handle.app(request, response);
+          return;
+        }
+        json(response, 404, { error: { code: 'not_found', message: 'No Catence endpoint matches this request.' } });
+        return;
+      }
+
       if (!addCorsHeaders(request, response, allowedOrigins)) {
         json(response, 403, { error: { code: 'origin_not_allowed', message: 'This browser origin is not allowed to access Catence.' } });
         return;
       }
 
-      const pathname = new URL(request.url ?? '/', 'http://localhost').pathname;
       if (request.method === 'OPTIONS') {
         response.writeHead(204).end();
         return;
       }
 
-      if (!UNAUTHENTICATED_PATHS.has(pathname) && !isAuthorized(request, options)) {
-        // No WWW-Authenticate on purpose: MCP connector auto-detection treats a
-        // plain 401 as a bearer gate rather than an OAuth server.
+      // Health probes stay open even when the gate is armed; they resolve no
+      // principal because nothing downstream consumes one.
+      const principal = UNAUTHENTICATED_PATHS.has(pathname)
+        ? FULL_ACCESS_PRINCIPAL
+        : await resolvePrincipal(request, effectiveOptions, accountPaths);
+      if (principal === null) {
+        // RFC 9728: point OAuth clients at the protected-resource metadata so
+        // they discover the authorization server. Without OAuth the 401 stays
+        // plain on purpose: MCP connector auto-detection treats it as a bearer
+        // gate rather than an OAuth server.
+        const config = effectiveOauth();
+        if (config.enabled && config.publicUrl !== undefined) {
+          const handle = await getOauthApp(config.publicUrl).catch(() => null);
+          if (handle !== null) response.setHeader('www-authenticate', `Bearer resource_metadata="${handle.protectedResourceMetadataUrl}"`);
+        }
         json(response, 401, { error: { code: 'unauthorized', message: 'A valid Authorization: Bearer token is required.' } });
         return;
       }
@@ -463,7 +711,9 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
         }
         try {
           const catalog = await loadCatalog(catalogPaths);
-          json(response, 200, { defaultAthleteId: catalog.defaultAthleteId, athletes: catalog.athletes });
+          // The roster is narrowed to the principal's athlete scope.
+          const roster = filterRosterToScope(catalog.athletes, catalog.defaultAthleteId, principal.athleteIds);
+          json(response, 200, { defaultAthleteId: roster.defaultAthleteId, athletes: roster.athletes });
         } catch (error) {
           json(response, 400, { error: { code: 'catalog_unavailable', message: error instanceof Error ? error.message : String(error) } });
         }
@@ -471,6 +721,7 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       }
 
       if (pathname === '/api/v1/athletes' && request.method === 'POST') {
+        if (!requireAdmin(principal, response)) return;
         if (!catalogPaths) {
           json(response, 400, {
             error: {
@@ -500,8 +751,12 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       if (pathname === '/api/v1/dashboard' && request.method === 'GET') {
         try {
           const url = new URL(request.url ?? '/', 'http://localhost');
-          json(response, 200, await dashboardSnapshot(await dashboardPaths(catalogPaths, staticPaths, url), url));
+          json(response, 200, await dashboardSnapshot(await dashboardPaths(catalogPaths, staticPaths, url, principal), url));
         } catch (error) {
+          if (error instanceof AthleteForbiddenError) {
+            json(response, 403, { error: { code: 'athlete_forbidden', message: error.message } });
+            return;
+          }
           json(response, 400, { error: { code: 'dashboard_unavailable', message: error instanceof Error ? error.message : String(error) } });
         }
         return;
@@ -510,7 +765,7 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       if (pathname === '/api/v1/athlete-file' && request.method === 'GET') {
         try {
           const url = new URL(request.url ?? '/', 'http://localhost');
-          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url, principal);
           const revisionId = url.searchParams.get('revision');
           if (revisionId) {
             let content: string | null;
@@ -530,6 +785,10 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           const snapshot = await readAthleteFile(paths);
           json(response, 200, { ...snapshot, revisions: await listAthleteFileRevisions(paths) });
         } catch (error) {
+          if (error instanceof AthleteForbiddenError) {
+            json(response, 403, { error: { code: 'athlete_forbidden', message: error.message } });
+            return;
+          }
           json(response, 400, { error: { code: 'athlete_file_unavailable', message: error instanceof Error ? error.message : String(error) } });
         }
         return;
@@ -538,7 +797,7 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       if (pathname === '/api/v1/athlete-file' && request.method === 'PUT') {
         try {
           const url = new URL(request.url ?? '/', 'http://localhost');
-          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url, principal);
           const parsed = parseAthleteFileBody(await readJsonBody(request));
           const header = request.headers['if-match'];
           const headerHash = typeof header === 'string' && header.trim() ? header.trim() : undefined;
@@ -553,6 +812,10 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           });
           json(response, 200, snapshot);
         } catch (error) {
+          if (error instanceof AthleteForbiddenError) {
+            json(response, 403, { error: { code: 'athlete_forbidden', message: error.message } });
+            return;
+          }
           if (error instanceof AthleteFileConflictError) {
             json(response, 409, {
               error: {
@@ -574,9 +837,13 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       if (pathname === '/api/v1/athlete-secrets' && request.method === 'GET') {
         try {
           const url = new URL(request.url ?? '/', 'http://localhost');
-          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url, principal);
           json(response, 200, { athleteId: url.searchParams.get('athleteId') ?? 'local', providers: await describeAthleteSecrets(paths) });
         } catch (error) {
+          if (error instanceof AthleteForbiddenError) {
+            json(response, 403, { error: { code: 'athlete_forbidden', message: error.message } });
+            return;
+          }
           const message = error instanceof Error ? error.message : String(error);
           json(response, 400, { error: { code: 'athlete_secrets_unavailable', message } });
         }
@@ -588,10 +855,14 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           const parsed = parseAthleteSecretBody(await readJsonBody(request));
           const url = new URL(request.url ?? '/', 'http://localhost');
           if (!url.searchParams.get('athleteId') && parsed.athleteId) url.searchParams.set('athleteId', parsed.athleteId);
-          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url, principal);
           await setAthleteSecret(paths, parsed.provider, parsed.field, parsed.value);
           json(response, 200, { athleteId: url.searchParams.get('athleteId') ?? 'local', providers: await describeAthleteSecrets(paths) });
         } catch (error) {
+          if (error instanceof AthleteForbiddenError) {
+            json(response, 403, { error: { code: 'athlete_forbidden', message: error.message } });
+            return;
+          }
           const message = error instanceof Error ? error.message : String(error);
           json(response, 400, { error: { code: 'athlete_secret_write_failed', message } });
         }
@@ -603,10 +874,14 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           const parsed = parseAthleteSecretRemovalBody(await readJsonBody(request));
           const url = new URL(request.url ?? '/', 'http://localhost');
           if (!url.searchParams.get('athleteId') && parsed.athleteId) url.searchParams.set('athleteId', parsed.athleteId);
-          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url, principal);
           await deleteAthleteSecret(paths, parsed.provider, parsed.field);
           json(response, 200, { athleteId: url.searchParams.get('athleteId') ?? 'local', providers: await describeAthleteSecrets(paths) });
         } catch (error) {
+          if (error instanceof AthleteForbiddenError) {
+            json(response, 403, { error: { code: 'athlete_forbidden', message: error.message } });
+            return;
+          }
           const message = error instanceof Error ? error.message : String(error);
           json(response, 400, { error: { code: 'athlete_secret_remove_failed', message } });
         }
@@ -617,7 +892,7 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
         let body: SyncRequestBody;
         try {
           body = parseSyncBody(await readJsonBody(request));
-          const paths = await resolveSyncPaths(catalogPaths, staticPaths, body);
+          const paths = await resolveSyncPaths(catalogPaths, staticPaths, body, principal);
           // Optional model self-discovery runs before the data sync so new
           // OpenCode Go models appear without a manual script run. Failure is
           // non-fatal: it must never block or fail a data sync. The Console
@@ -647,6 +922,10 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           );
           json(response, 202, { ...handle, ...(discoveryWarning ? { warning: discoveryWarning } : {}), progressEndpoint: '/api/v1/sync/status' });
         } catch (error) {
+          if (error instanceof AthleteForbiddenError) {
+            json(response, 403, { error: { code: 'athlete_forbidden', message: error.message } });
+            return;
+          }
           json(response, error instanceof DetachedSyncBusyError ? 409 : 400, {
             error: {
               code: error instanceof DetachedSyncBusyError ? 'sync_in_progress' : 'sync_start_failed',
@@ -660,10 +939,14 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       if (pathname === '/api/v1/sync/schedule' && request.method === 'GET') {
         try {
           const url = new URL(request.url ?? '/', 'http://localhost');
-          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url, principal);
           const athleteId = catalogPaths ? (url.searchParams.get('athleteId') ?? '') : 'local';
           json(response, 200, await readAutoSyncSchedule(paths, athleteId));
         } catch (error) {
+          if (error instanceof AthleteForbiddenError) {
+            json(response, 403, { error: { code: 'athlete_forbidden', message: error.message } });
+            return;
+          }
           json(response, 400, { error: { code: 'schedule_unavailable', message: error instanceof Error ? error.message : String(error) } });
         }
         return;
@@ -673,19 +956,24 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
         try {
           const body = parseSyncScheduleBody(await readJsonBody(request));
           const url = new URL(request.url ?? '/', 'http://localhost');
-          const paths = await resolveSyncPaths(catalogPaths, staticPaths, { athleteId: body.athleteId });
+          const paths = await resolveSyncPaths(catalogPaths, staticPaths, { athleteId: body.athleteId }, principal);
           const athleteId = catalogPaths ? (body.athleteId ?? '') : 'local';
           json(response, 200, await updateAutoSyncSchedule(paths, athleteId, {
             enabled: body.enabled,
             ...(body.intervalMinutes === undefined ? {} : { intervalMinutes: parseAutoSyncInterval(String(body.intervalMinutes)) }),
           }));
         } catch (error) {
+          if (error instanceof AthleteForbiddenError) {
+            json(response, 403, { error: { code: 'athlete_forbidden', message: error.message } });
+            return;
+          }
           json(response, 400, { error: { code: 'schedule_update_failed', message: error instanceof Error ? error.message : String(error) } });
         }
         return;
       }
 
       if (pathname === '/api/v1/models/discover' && request.method === 'POST') {
+        if (!requireAdmin(principal, response)) return;
         // Refresh the OpenCode Go profiles without starting a data sync. The
         // Console's Models page calls this behind its authenticated proxy.
         try {
@@ -704,10 +992,14 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       if (pathname === '/api/v1/sync/status' && request.method === 'GET') {
         try {
           const url = new URL(request.url ?? '/', 'http://localhost');
-          const paths = await dashboardPaths(catalogPaths, staticPaths, url);
+          const paths = await dashboardPaths(catalogPaths, staticPaths, url, principal);
           const athleteId = catalogPaths ? (await resolveAthlete(catalogPaths, url.searchParams.get('athleteId') ?? '')).athlete.id : 'local';
           json(response, 200, { athleteId, progress: await syncProgress(paths), lastSync: await lastSyncSummary(paths) });
         } catch (error) {
+          if (error instanceof AthleteForbiddenError) {
+            json(response, 403, { error: { code: 'athlete_forbidden', message: error.message } });
+            return;
+          }
           json(response, 400, { error: { code: 'sync_status_unavailable', message: error instanceof Error ? error.message : String(error) } });
         }
         return;
@@ -742,15 +1034,17 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       }
 
       if (pathname === '/api/v1/mcp-exposure' && request.method === 'GET') {
+        if (!requireAdmin(principal, response)) return;
         if (!options.bearerTokenFile) {
           json(response, 400, { error: { code: 'exposure_not_configured', message: 'This server was started without a bearer-token file; restart it with --auth-token-file to manage MCP exposure.' } });
           return;
         }
-        json(response, 200, mcpExposureStatus(options.bearerTokenFile, `http://${request.headers.host ?? '127.0.0.1:8787'}`));
+        json(response, 200, mcpExposureStatus(options.bearerTokenFile, `http://${request.headers.host ?? '127.0.0.1:8787'}`, oauthStatus()));
         return;
       }
 
       if (pathname === '/api/v1/mcp-exposure' && request.method === 'POST') {
+        if (!requireAdmin(principal, response)) return;
         if (!options.bearerTokenFile) {
           json(response, 400, { error: { code: 'exposure_not_configured', message: 'This server was started without a bearer-token file; restart it with --auth-token-file to manage MCP exposure.' } });
           return;
@@ -762,15 +1056,132 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           }
           if ((body as Record<string, unknown>).enabled) ensureBearerToken(options.bearerTokenFile);
           else disableBearerToken(options.bearerTokenFile);
-          json(response, 200, mcpExposureStatus(options.bearerTokenFile, `http://${request.headers.host ?? '127.0.0.1:8787'}`));
+          json(response, 200, mcpExposureStatus(options.bearerTokenFile, `http://${request.headers.host ?? '127.0.0.1:8787'}`, oauthStatus()));
         } catch (error) {
           json(response, 400, { error: { code: 'exposure_update_failed', message: error instanceof Error ? error.message : String(error) } });
         }
         return;
       }
 
+      if (pathname === '/api/v1/mcp-keys' && request.method === 'GET') {
+        if (!requireAdmin(principal, response)) return;
+        if (!options.mcpKeysFile) {
+          json(response, 400, { error: { code: 'mcp_keys_not_configured', message: 'This server was started without an MCP keys file; restart it with --mcp-keys-file to manage per-account keys.' } });
+          return;
+        }
+        try {
+          // Listing never exposes token hashes.
+          json(response, 200, { keys: await listMcpKeys(options.mcpKeysFile) });
+        } catch (error) {
+          json(response, 400, { error: { code: 'mcp_keys_unavailable', message: error instanceof Error ? error.message : String(error) } });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/mcp-keys' && request.method === 'POST') {
+        if (!requireAdmin(principal, response)) return;
+        if (!options.mcpKeysFile) {
+          json(response, 400, { error: { code: 'mcp_keys_not_configured', message: 'This server was started without an MCP keys file; restart it with --mcp-keys-file to manage per-account keys.' } });
+          return;
+        }
+        try {
+          const body = parseMcpKeyCreateBody(await readJsonBody(request));
+          const { record, token } = await addMcpKey(options.mcpKeysFile, body);
+          // The raw token is returned exactly once; only its hash is stored.
+          json(response, 201, { id: record.id, label: record.label, account: record.account, createdAt: record.createdAt, token });
+        } catch (error) {
+          json(response, 400, { error: { code: 'mcp_key_create_failed', message: error instanceof Error ? error.message : String(error) } });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/mcp-keys' && request.method === 'DELETE') {
+        if (!requireAdmin(principal, response)) return;
+        if (!options.mcpKeysFile) {
+          json(response, 400, { error: { code: 'mcp_keys_not_configured', message: 'This server was started without an MCP keys file; restart it with --mcp-keys-file to manage per-account keys.' } });
+          return;
+        }
+        const id = new URL(request.url ?? '/', 'http://localhost').searchParams.get('id');
+        if (!id) {
+          json(response, 400, { error: { code: 'invalid_request', message: 'id is required.' } });
+          return;
+        }
+        try {
+          await revokeMcpKey(options.mcpKeysFile, id);
+          json(response, 200, { revoked: id });
+        } catch (error) {
+          if (error instanceof McpKeyNotFoundError) {
+            json(response, 404, { error: { code: 'mcp_key_not_found', message: error.message } });
+            return;
+          }
+          json(response, 400, { error: { code: 'mcp_key_revoke_failed', message: error instanceof Error ? error.message : String(error) } });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/mcp-keys/roll' && request.method === 'POST') {
+        if (!requireAdmin(principal, response)) return;
+        if (!options.mcpKeysFile) {
+          json(response, 400, { error: { code: 'mcp_keys_not_configured', message: 'This server was started without an MCP keys file; restart it with --mcp-keys-file to manage per-account keys.' } });
+          return;
+        }
+        try {
+          const body = parseMcpKeyRollBody(await readJsonBody(request));
+          const { record, token } = await rollMcpKey(options.mcpKeysFile, body.id);
+          // The new raw token is returned exactly once; only its hash is stored.
+          json(response, 200, { id: record.id, label: record.label, account: record.account, createdAt: record.createdAt, token });
+        } catch (error) {
+          if (error instanceof McpKeyNotFoundError) {
+            json(response, 404, { error: { code: 'mcp_key_not_found', message: error.message } });
+            return;
+          }
+          json(response, 400, { error: { code: 'mcp_key_roll_failed', message: error instanceof Error ? error.message : String(error) } });
+        }
+        return;
+      }
+
+      if (pathname === '/api/v1/mcp-oauth-settings' && request.method === 'GET') {
+        if (!requireAdmin(principal, response)) return;
+        if (!oauthSettingsFile) {
+          json(response, 400, { error: { code: 'mcp_oauth_not_configured', message: 'This server was started without an OAuth settings file; restart it with --oauth-settings-file to manage OAuth from the Console.' } });
+          return;
+        }
+        const status = effectiveOauth();
+        json(response, 200, {
+          enabled: status.enabled,
+          publicUrl: status.publicUrl ?? null,
+          source: status.source,
+          settingsFile: oauthSettingsFile,
+          settingsState: status.settingsState,
+        });
+        return;
+      }
+
+      if (pathname === '/api/v1/mcp-oauth-settings' && request.method === 'POST') {
+        if (!requireAdmin(principal, response)) return;
+        if (!oauthSettingsFile) {
+          json(response, 400, { error: { code: 'mcp_oauth_not_configured', message: 'This server was started without an OAuth settings file; restart it with --oauth-settings-file to manage OAuth from the Console.' } });
+          return;
+        }
+        try {
+          const body = parseMcpOauthSettingsBody(await readJsonBody(request));
+          await writeMcpOauthSettings(oauthSettingsFile, body);
+          const status = effectiveOauth();
+          json(response, 200, {
+            enabled: status.enabled,
+            publicUrl: status.publicUrl ?? null,
+            source: status.source,
+            settingsFile: oauthSettingsFile,
+            settingsState: status.settingsState,
+          });
+        } catch (error) {
+          json(response, 400, { error: { code: 'mcp_oauth_settings_update_failed', message: error instanceof Error ? error.message : String(error) } });
+        }
+        return;
+      }
+
       if (pathname === '/mcp') {
-        await handleMcpRequest(request, response, catalogPaths ?? staticPaths ?? resolveCatalogPaths());
+        await handleMcpRequest(request, response, catalogPaths ?? staticPaths ?? resolveCatalogPaths(), principal);
         return;
       }
 
