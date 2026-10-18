@@ -516,6 +516,67 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
     }
   });
 
+  it('answers the ChatGPT discovery probe and bridges the 2026-07-28 protocol header', { timeout: 90_000 }, async () => {
+    // ChatGPT's hosted connector probes server/discover (MCP 2026-07-28)
+    // before any initialize, then sends stateless requests carrying that
+    // protocol header. The SDK predates the revision and rejects the header
+    // value, so the server answers discovery locally and bridges the header
+    // down; both responses must agree with what initialize reports.
+    const { origin, publicUrl } = await oauthFixture();
+    const { tokens } = await runFlow(origin, publicUrl, { username: 'martina', password: MARTINA_PASSWORD });
+    const session = await mcpSession(origin, tokens.access_token);
+    try {
+      const modernHeaders = {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'mcp-protocol-version': '2026-07-28',
+        ...bearer(tokens.access_token),
+      };
+
+      const discover = await fetch(`${origin}/mcp`, {
+        method: 'POST',
+        headers: modernHeaders,
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 'probe-1',
+          method: 'server/discover',
+          params: { _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } },
+        }),
+      });
+      expect(discover.status).toBe(200);
+      const discovered = (await discover.json()) as { id: unknown; result: Record<string, any> };
+      expect(discovered.id).toBe('probe-1');
+      expect(discovered.result.resultType).toBe('complete');
+      expect(discovered.result.supportedVersions[0]).toBe('2026-07-28');
+      expect(discovered.result.supportedVersions).toContain('2025-11-25');
+      expect(discovered.result.capabilities).toEqual(session.client.getServerCapabilities());
+      expect(discovered.result._meta['io.modelcontextprotocol/serverInfo']).toEqual(session.client.getServerVersion());
+      expect(typeof discovered.result.instructions).toBe('string');
+      expect(discovered.result.instructions.length).toBeGreaterThan(0);
+      expect(discovered.result.ttlMs).toBe(3_600_000);
+      expect(discovered.result.cacheScope).toBe('public');
+
+      // A stateless tools/list with the modern header is bridged and answered.
+      const list = await fetch(`${origin}/mcp`, {
+        method: 'POST',
+        headers: modernHeaders,
+        body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+      });
+      expect(list.status).toBe(200);
+      expect(await list.text()).toContain('list_athletes');
+
+      // Versions outside the bridge keep failing closed.
+      const unsupported = await fetch(`${origin}/mcp`, {
+        method: 'POST',
+        headers: { ...modernHeaders, 'mcp-protocol-version': '2099-01-01' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} }),
+      });
+      expect(unsupported.status).toBe(400);
+    } finally {
+      await session.close();
+    }
+  });
+
   it('runs the full flow — register, authorize, consent login, code, token — and enforces the account scope at the gate', { timeout: 90_000 }, async () => {
     const { origin, publicUrl } = await oauthFixture();
     const { tokens } = await runFlow(origin, publicUrl, { username: 'martina', password: MARTINA_PASSWORD });

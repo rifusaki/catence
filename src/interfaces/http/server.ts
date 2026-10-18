@@ -3,6 +3,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from '@modelcontextprotocol/sdk/types.js';
 import {
   addAthlete,
   addMcpKey,
@@ -53,7 +54,7 @@ import {
 } from '../../runtime/index.js';
 import { activeBearerToken, ensureBearerToken, disableBearerToken, mcpExposureStatus } from './cli-options.js';
 import type { OAuthAppHandle } from './oauth.js';
-import { createCatenceMcpServer } from '../mcp/server.js';
+import { CATENCE_MCP_SERVER_INFO, createCatenceMcpServer, MCP_INSTRUCTIONS } from '../mcp/server.js';
 import { generationStatus } from './generation-status.js';
 
 const MAX_REQUEST_BYTES = 1_000_000;
@@ -552,10 +553,47 @@ async function lastSyncSummary(paths: CatencePaths): Promise<LastSyncSummary | n
   }
 }
 
+/**
+ * The MCP revision ChatGPT's hosted connector speaks during setup. The bundled
+ * SDK predates it, but the request shapes the revision uses — server/discover,
+ * then stateless tools/list and tools/call without initialize — are already
+ * handled. Only the protocol header value is rejected, so it is bridged down
+ * and server/discover is answered from the same descriptor initialize reports.
+ */
+const MODERN_MCP_PROTOCOL_VERSION = '2026-07-28';
+
+/** A single JSON-RPC request (batches are left to the transport). */
+function singleJsonRpcRequest(body: unknown): { id?: unknown; method: string } | null {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return null;
+  const method = (body as { method?: unknown }).method;
+  return typeof method === 'string' ? (body as { id?: unknown; method: string }) : null;
+}
+
+/**
+ * Server capabilities exactly as the SDK's initialize response reports them.
+ * getCapabilities() is the runtime accessor that builds that response; the
+ * typings mark it private.
+ */
+function mcpServerCapabilities(server: ReturnType<typeof createCatenceMcpServer>): Record<string, unknown> {
+  return (server.server as unknown as { getCapabilities(): Record<string, unknown> }).getCapabilities();
+}
+
 async function handleMcpRequest(request: IncomingMessage, response: ServerResponse, paths: CatencePaths | CatalogPaths, principal: CatencePrincipal): Promise<void> {
   if (request.method !== 'POST') {
     methodNotAllowed(response);
     return;
+  }
+
+  // ChatGPT's discovery probe and the requests that follow it carry the
+  // 2026-07-28 revision; the transport understands only the older list. The
+  // Node adapter rebuilds the web-standard headers from rawHeaders (not the
+  // parsed headers object), so both views are rewritten.
+  if (request.headers['mcp-protocol-version'] === MODERN_MCP_PROTOCOL_VERSION) {
+    request.headers['mcp-protocol-version'] = LATEST_PROTOCOL_VERSION;
+    const rawHeaders = request.rawHeaders;
+    for (let index = 0; index < rawHeaders.length; index += 2) {
+      if (rawHeaders[index]?.toLowerCase() === 'mcp-protocol-version') rawHeaders[index + 1] = LATEST_PROTOCOL_VERSION;
+    }
   }
 
   let body: unknown;
@@ -567,6 +605,31 @@ async function handleMcpRequest(request: IncomingMessage, response: ServerRespon
       error: { code: -32700, message: error instanceof Error ? error.message : String(error) },
       id: null,
     });
+    return;
+  }
+
+  const jsonRpc = singleJsonRpcRequest(body);
+  if (jsonRpc?.method === 'server/discover') {
+    // Modern clients probe discovery before anything else; answer from the
+    // same descriptor the initialize response reports so the two never drift.
+    const server = createCatenceMcpServer(paths, {}, { scope: { athleteIds: principal.athleteIds } });
+    try {
+      json(response, 200, {
+        jsonrpc: '2.0',
+        id: jsonRpc.id ?? null,
+        result: {
+          resultType: 'complete',
+          supportedVersions: [MODERN_MCP_PROTOCOL_VERSION, ...SUPPORTED_PROTOCOL_VERSIONS],
+          capabilities: mcpServerCapabilities(server),
+          _meta: { 'io.modelcontextprotocol/serverInfo': CATENCE_MCP_SERVER_INFO },
+          instructions: MCP_INSTRUCTIONS,
+          ttlMs: 3_600_000,
+          cacheScope: 'public',
+        },
+      });
+    } finally {
+      await server.close();
+    }
     return;
   }
 

@@ -79,7 +79,7 @@ function isCatalogPaths(value: CatencePaths | CatalogPaths): value is CatalogPat
   return 'catalog' in value;
 }
 
-const MCP_INSTRUCTIONS = [
+export const MCP_INSTRUCTIONS = [
   'For a selected activity\'s Strava segments, climb segments, grade by segment, KOM/PR, or per-segment analysis, call get_activity_segments after identifying the activity.',
   'That tool performs the targeted Strava hydration itself. Base segment answers only on what it returns.',
   'For Garmin running VO₂max, call get_vo2max_history with sport: running. Garmin stores the source value as generic; returned rows preserve that source label.',
@@ -96,6 +96,12 @@ const MCP_INSTRUCTIONS = [
   'For running dynamics or running form, use the run_dynamics dataset (vertical_oscillation_cm, ground_contact_time_ms, flight_time_ms, stride_length_cm, vertical_ratio_pct, cadence_spm); values are provider-normalized and a null means the provider did not report that metric.',
   'For durable athlete facts shared between the athlete and the agent, use the athlete file: get_athlete_file before personalizing advice, and update_athlete_file for lasting goals, constraints, preferences, or profile facts. Always pass the hash you read as expectedHash (null when the file does not exist yet); a changed file is rejected so it is never silently overwritten. Never store credentials or provider configuration in it.',
 ].join(' ');
+
+/**
+ * Server identity shared by the MCP initialize response (stdio and HTTP) and
+ * the HTTP server/discover probe; clients compare the two for consistency.
+ */
+export const CATENCE_MCP_SERVER_INFO = { name: 'catence', version: '0.1.0' };
 
 function textResult(value: unknown): ToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(jsonSafe(value), null, 2) }] };
@@ -207,7 +213,7 @@ export type CatenceMcpServerOptions = {
 };
 
 export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = resolveCatalogPaths(), dependencies: McpDependencies = {}, options: CatenceMcpServerOptions = {}): McpServer {
-  const server = new McpServer({ name: 'catence', version: '0.1.0' }, { instructions: MCP_INSTRUCTIONS });
+  const server = new McpServer({ ...CATENCE_MCP_SERVER_INFO }, { instructions: MCP_INSTRUCTIONS });
   const hydrateActivity = dependencies.hydrateStravaActivity ?? hydrateStravaActivity;
   const startSync = dependencies.startDetachedSync ?? startDetachedSync;
   const catalogPaths = isCatalogPaths(paths) ? paths : null;
