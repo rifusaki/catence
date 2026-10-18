@@ -745,10 +745,38 @@ async function handleUnauthenticatedDiscovery(request: IncomingMessage, response
  * tool definitions drop the SDK's `execution` field — neither the per-result
  * `_meta.serverInfo` nor `execution` appeared in the revision's schemas for
  * earlier SDKs, but the revision asks for the former and omits the latter.
+ * Tool schemas also drop `propertyNames`, which strict validators reject and
+ * whose only instance merely restates JSON's string-key rule.
  * Errors and notifications carry no result and pass through.
  */
 const MODERN_CACHEABLE_METHODS = new Set(['server/discover', 'tools/list', 'prompts/list', 'resources/list', 'resources/templates/list', 'resources/read']);
 const MODERN_RESULT_TTL_MS = 300_000;
+
+/** Copy a JSON schema without `propertyNames` keywords; returns the original when nothing was removed. */
+function stripPropertyNames(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    let changed = false;
+    const copy = value.map((item) => {
+      const next = stripPropertyNames(item);
+      if (next !== item) changed = true;
+      return next;
+    });
+    return changed ? copy : value;
+  }
+  if (typeof value !== 'object' || value === null) return value;
+  let changed = false;
+  const copy: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (key === 'propertyNames') {
+      changed = true;
+      continue;
+    }
+    const next = stripPropertyNames(item);
+    if (next !== item) changed = true;
+    copy[key] = next;
+  }
+  return changed ? copy : value;
+}
 
 /** Rewrite one JSON-RPC payload; null when it carries nothing to change. */
 function frameModernRpcPayload(payload: string, method: string | undefined): string | null {
@@ -775,9 +803,21 @@ function frameModernRpcPayload(payload: string, method: string | undefined): str
   if (method === 'tools/list' && Array.isArray(framed.tools)) {
     let stripped = false;
     const tools = framed.tools.map((tool) => {
-      if (typeof tool !== 'object' || tool === null || Array.isArray(tool) || !('execution' in tool)) return tool;
+      if (typeof tool !== 'object' || tool === null || Array.isArray(tool)) return tool;
       const copy: Record<string, unknown> = { ...(tool as Record<string, unknown>) };
-      delete copy.execution;
+      let edited = false;
+      if ('execution' in copy) {
+        delete copy.execution;
+        edited = true;
+      }
+      if ('inputSchema' in copy) {
+        const schema = stripPropertyNames(copy.inputSchema);
+        if (schema !== copy.inputSchema) {
+          copy.inputSchema = schema;
+          edited = true;
+        }
+      }
+      if (!edited) return tool;
       stripped = true;
       return copy;
     });
