@@ -159,6 +159,7 @@ function logRequestCompletion(request: IncomingMessage, response: ServerResponse
     const status = response.statusCode;
     const interesting =
       pathname === '/mcp' ||
+      pathname === '/' ||
       pathname.startsWith('/oauth/') ||
       pathname.startsWith('/.well-known/oauth-') ||
       status >= 400;
@@ -170,7 +171,7 @@ function logRequestCompletion(request: IncomingMessage, response: ServerResponse
     if (typeof protocolVersion === 'string' && protocolVersion) parts.push(`mcp-protocol-version=${protocolVersion}`);
     const mcpMethod = request.headers['mcp-method'];
     if (typeof mcpMethod === 'string' && mcpMethod) parts.push(`mcp-method=${mcpMethod}`);
-    if (pathname === '/mcp') parts.push(`auth=${bearerTokenFrom(request) !== null ? 'bearer' : 'none'}`);
+    if (pathname === '/mcp' || pathname === '/') parts.push(`auth=${bearerTokenFrom(request) !== null ? 'bearer' : 'none'}`);
     console.log(parts.join(' '));
   });
 }
@@ -831,8 +832,9 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
         // A hosted connector may probe server/discover before attaching the
         // bearer token. The discovery result exposes nothing athlete-scoped,
         // so that one probe is answered ahead of the 401; every other
-        // unauthenticated /mcp request stays behind the gate.
-        if (pathname === '/mcp' && request.method === 'POST' && await handleUnauthenticatedDiscovery(request, response, catalogPaths ?? staticPaths ?? resolveCatalogPaths())) {
+        // unauthenticated MCP request stays behind the gate. The root alias
+        // mirrors /mcp here too so bare-domain connectors see the same gate.
+        if ((pathname === '/mcp' || pathname === '/') && request.method === 'POST' && await handleUnauthenticatedDiscovery(request, response, catalogPaths ?? staticPaths ?? resolveCatalogPaths())) {
           return;
         }
         // A presented-but-rejected token is a bearer problem, not an OAuth
@@ -1357,7 +1359,11 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
         return;
       }
 
-      if (pathname === '/mcp') {
+      // Hosted connectors probe the URL exactly as the operator typed it, and
+      // a bare-domain connector has no /mcp path to append. Root requests are
+      // served exactly like /mcp; the protected-resource metadata still
+      // advertises /mcp, so issued tokens keep their /mcp audience.
+      if (pathname === '/mcp' || pathname === '/') {
         await handleMcpRequest(request, response, catalogPaths ?? staticPaths ?? resolveCatalogPaths(), principal);
         return;
       }

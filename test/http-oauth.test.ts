@@ -580,6 +580,17 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
         body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} }),
       });
       expect(unsupported.status).toBe(400);
+
+      // The domain root serves the same surface: hosted connectors probing a
+      // bare-domain URL must not hit the 404 that reports "action discovery
+      // failed" in the connector UI.
+      const rootList = await fetch(`${origin}/`, {
+        method: 'POST',
+        headers: modernHeaders,
+        body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/list', params: {} }),
+      });
+      expect(rootList.status).toBe(200);
+      expect(await rootList.text()).toContain('list_athletes');
     } finally {
       await session.close();
     }
@@ -622,6 +633,37 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
       body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
     });
     expect(gated.status).toBe(401);
+
+    // The root alias answers the same anonymous discovery probe (bare-domain
+    // connectors) while other root MCP calls stay behind the gate too.
+    const rootProbe = await fetch(`${origin}/`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'mcp-protocol-version': '2026-07-28',
+        'mcp-method': 'server/discover',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'openai-mcp-discover-root',
+        method: 'server/discover',
+        params: { _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } },
+      }),
+    });
+    expect(rootProbe.status).toBe(200);
+    expect(((await rootProbe.json()) as { id: unknown }).id).toBe('openai-mcp-discover-root');
+
+    const rootGated = await fetch(`${origin}/`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'mcp-protocol-version': '2026-07-28',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+    });
+    expect(rootGated.status).toBe(401);
   });
 
   it('runs the full flow — register, authorize, consent login, code, token — and enforces the account scope at the gate', { timeout: 90_000 }, async () => {
