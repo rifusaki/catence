@@ -702,6 +702,53 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
     expect(rootGated.status).toBe(401);
   });
 
+  it('captures MCP exchange bodies in the access log', { timeout: 90_000 }, async () => {
+    const { origin, publicUrl } = await oauthFixture();
+    const { tokens } = await runFlow(origin, publicUrl, { username: 'martina', password: MARTINA_PASSWORD });
+
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map(String).join(' '));
+    };
+    try {
+      const response = await fetch(`${origin}/mcp`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          'mcp-protocol-version': '2026-07-28',
+          authorization: `Bearer ${tokens.access_token}`,
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/list', params: {} }),
+      });
+      expect(response.status).toBe(200);
+      await response.text();
+      // The finish-time log line lands just after the response is flushed.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      console.log = originalLog;
+    }
+
+    const bodyLine = logs.find((line) => line.startsWith('[mcp-body]'));
+    expect(bodyLine).toBeDefined();
+    if (bodyLine === undefined) return;
+    expect(bodyLine).toContain('rid=');
+    // The inbound JSON-RPC request and the final framed response are both captured.
+    expect(bodyLine).toContain('"method":"tools/list"');
+    expect(bodyLine).toContain('in={');
+    expect(bodyLine).toContain('out={');
+    expect(bodyLine).toContain('"resultType":"complete"');
+    // The multi-tool list exceeds the capture budget, so head and tail are kept —
+    // the trailing framing fields must survive the cut.
+    expect(bodyLine).toContain('truncated');
+    const httpLine = logs.find((line) => line.startsWith('[http]'));
+    expect(httpLine).toBeDefined();
+    const rid = httpLine === undefined ? undefined : /rid=([a-z0-9]+)/.exec(httpLine)?.[1];
+    expect(rid).toBeDefined();
+    expect(bodyLine).toContain(`rid=${rid}`);
+  });
+
   it('runs the full flow — register, authorize, consent login, code, token — and enforces the account scope at the gate', { timeout: 90_000 }, async () => {
     const { origin, publicUrl } = await oauthFixture();
     const { tokens } = await runFlow(origin, publicUrl, { username: 'martina', password: MARTINA_PASSWORD });

@@ -150,11 +150,14 @@ function bearerTokenFrom(request: IncomingMessage): string | null {
  * /mcp or /oauth exchange are otherwise invisible in container logs. Routine
  * dashboard polling stays quiet; set CATENCE_HTTP_ACCESS_LOG=0 to disable.
  * Logs method, path, status, latency, user agent, and the MCP protocol hints —
- * never headers carrying credentials.
+ * never headers carrying credentials. When a body tap is supplied, a second
+ * `[mcp-body]` line shows the exchange bodies (set CATENCE_HTTP_BODY_LOG=0 to
+ * keep the access lines but drop bodies).
  */
-function logRequestCompletion(request: IncomingMessage, response: ServerResponse, pathname: string): void {
+function logRequestCompletion(request: IncomingMessage, response: ServerResponse, pathname: string, bodyTap?: () => string): void {
   if (process.env.CATENCE_HTTP_ACCESS_LOG === '0') return;
   const startedAt = Date.now();
+  const requestId = Math.random().toString(36).slice(2, 8);
   // Captured before the compatibility bridge rewrites the header so the log
   // always shows the value the client actually sent.
   const rawProtocolVersion = request.headers['mcp-protocol-version'];
@@ -167,16 +170,88 @@ function logRequestCompletion(request: IncomingMessage, response: ServerResponse
       pathname.startsWith('/.well-known/oauth-') ||
       status >= 400;
     if (!interesting) return;
-    const parts = [`[http] ${new Date().toISOString()}`, `${request.method} ${pathname}`, String(status), `${Date.now() - startedAt}ms`];
+    const parts = [`[http] ${new Date().toISOString()}`, `rid=${requestId}`, `${request.method} ${pathname}`, String(status), `${Date.now() - startedAt}ms`];
     const userAgent = request.headers['user-agent'];
     if (typeof userAgent === 'string' && userAgent) parts.push(`ua="${userAgent.slice(0, 120)}"`);
     const protocolVersion = rawProtocolVersion;
     if (typeof protocolVersion === 'string' && protocolVersion) parts.push(`mcp-protocol-version=${protocolVersion}`);
     const mcpMethod = request.headers['mcp-method'];
     if (typeof mcpMethod === 'string' && mcpMethod) parts.push(`mcp-method=${mcpMethod}`);
+    const mcpName = request.headers['mcp-name'];
+    if (typeof mcpName === 'string' && mcpName) parts.push(`mcp-name=${mcpName}`);
+    const logged = request as LoggedRequest;
+    if (logged.mcpFraming !== undefined) parts.push(`framing=${logged.mcpFraming}`);
+    if (logged.mcpPrincipal !== undefined) parts.push(`principal=${logged.mcpPrincipal}`);
     if (pathname === '/mcp' || pathname === '/') parts.push(`auth=${bearerTokenFrom(request) !== null ? 'bearer' : 'none'}`);
     console.log(parts.join(' '));
+    if (bodyTap === undefined || process.env.CATENCE_HTTP_BODY_LOG === '0') return;
+    // MCP exchanges always, OAuth only when something failed: error bodies
+    // carry no credentials, but token-pair responses do and stay unlogged.
+    const logBodies = pathname === '/mcp' || pathname === '/' || (status >= 400 && pathname.startsWith('/oauth/'));
+    if (!logBodies) return;
+    const inbound = logged.mcpRequestBody;
+    const outbound = bodyTap();
+    if (inbound === undefined && outbound === '') return;
+    const fields = [`[mcp-body] ${new Date().toISOString()}`, `rid=${requestId}`, `${request.method} ${pathname}`, String(status)];
+    if (inbound !== undefined) fields.push(`in=${summarizeBody(inbound)}`);
+    if (outbound !== '') fields.push(`out=${summarizeBody(outbound)}`);
+    console.log(fields.join(' '));
   });
+}
+
+/** Diagnostics fields the MCP handlers stitch onto the request for the access log. */
+type LoggedRequest = IncomingMessage & { mcpRequestBody?: string; mcpFraming?: string; mcpPrincipal?: string };
+
+/** Cap for the request body retained for logging. */
+const MCP_REQUEST_BODY_STASH_CHARS = 8_000;
+/** Cap for the response bytes buffered by the body tap before summarization. */
+const MCP_BODY_CAPTURE_LIMIT = 262_144;
+/** Head and tail kept when a captured body is logged. */
+const MCP_BODY_EDGE_CHARS = 2_000;
+
+/**
+ * Bodies are logged on one line: whitespace is flattened, and an oversized
+ * body keeps its head and tail (the trailing fields — resultType, cacheScope,
+ * nextCursor — matter for protocol forensics and never fit a head-only cut).
+ */
+function summarizeBody(body: string): string {
+  const flattened = body.replace(/[\r\n\t]+/g, ' ');
+  const budget = MCP_BODY_EDGE_CHARS * 2;
+  if (flattened.length <= budget) return flattened;
+  const omitted = flattened.length - budget;
+  return `${flattened.slice(0, MCP_BODY_EDGE_CHARS)}…(truncated ${omitted} chars)…${flattened.slice(-MCP_BODY_EDGE_CHARS)}`;
+}
+
+/**
+ * Buffers the bytes a response writes (bounded) so the access log can show the
+ * exact body an MCP or failed-OAuth exchange returned; never alters the
+ * payload. Installed before the request is handled, so the modern framing
+ * layer wraps this tap and the capture always reflects the final bytes.
+ */
+function tapResponseBody(response: ServerResponse): () => string {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  const append = (chunk: unknown, encoding?: unknown): void => {
+    if (size >= MCP_BODY_CAPTURE_LIMIT) return;
+    let buffer: Buffer;
+    if (typeof chunk === 'string') buffer = Buffer.from(chunk, typeof encoding === 'string' ? (encoding as BufferEncoding) : 'utf8');
+    else if (Buffer.isBuffer(chunk)) buffer = chunk;
+    else if (chunk instanceof Uint8Array) buffer = Buffer.from(chunk);
+    else return;
+    chunks.push(buffer);
+    size += buffer.length;
+  };
+  const originalWrite = response.write.bind(response);
+  const originalEnd = response.end.bind(response);
+  response.write = ((chunk: unknown, encodingOrCallback?: unknown, callback?: unknown): boolean => {
+    append(chunk, encodingOrCallback);
+    return (originalWrite as (...args: unknown[]) => boolean)(chunk, encodingOrCallback, callback);
+  }) as typeof response.write;
+  response.end = ((chunk?: unknown, encodingOrCallback?: unknown, callback?: unknown): ServerResponse => {
+    append(chunk, encodingOrCallback);
+    return (originalEnd as (...args: unknown[]) => ServerResponse)(chunk, encodingOrCallback, callback);
+  }) as typeof response.end;
+  return () => Buffer.concat(chunks).toString('utf8');
 }
 
 function matchesLegacyToken(rawToken: string, expected: string): boolean {
@@ -652,6 +727,8 @@ async function handleUnauthenticatedDiscovery(request: IncomingMessage, response
     return false;
   }
   const jsonRpc = singleJsonRpcRequest(body);
+  const serializedBody = JSON.stringify(body);
+  if (serializedBody !== undefined) (request as LoggedRequest).mcpRequestBody = serializedBody.slice(0, MCP_REQUEST_BODY_STASH_CHARS);
   if (jsonRpc?.method !== 'server/discover') return false;
   await writeDiscoveryResult(response, paths, { athleteIds: 'all' }, jsonRpc.id);
   return true;
@@ -839,6 +916,9 @@ async function handleMcpRequest(request: IncomingMessage, response: ServerRespon
   }
 
   const jsonRpc = singleJsonRpcRequest(body);
+  const serializedBody = JSON.stringify(body);
+  if (serializedBody !== undefined) (request as LoggedRequest).mcpRequestBody = serializedBody.slice(0, MCP_REQUEST_BODY_STASH_CHARS);
+  (request as LoggedRequest).mcpFraming = modernRequest ? (jsonRpc?.method ?? 'modern') : 'legacy';
   if (jsonRpc?.method === 'server/discover') {
     // Modern clients probe discovery before anything else; answer from the
     // same descriptor the initialize response reports so the two never drift.
@@ -955,7 +1035,10 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
   return createServer((request, response) => {
     void (async () => {
       const pathname = new URL(request.url ?? '/', 'http://localhost').pathname;
-      logRequestCompletion(request, response, pathname);
+      // Body capture covers the MCP surface and OAuth failures; every other
+      // route keeps the plain access line.
+      const tapped = pathname === '/mcp' || pathname === '/' || pathname.startsWith('/oauth/');
+      logRequestCompletion(request, response, pathname, tapped ? tapResponseBody(response) : undefined);
 
       // The OAuth endpoints are the auth surface itself: they bypass the gate
       // and CORS entirely and are delegated to the Express sub-app. When OAuth
@@ -986,6 +1069,9 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       const principal = UNAUTHENTICATED_PATHS.has(pathname)
         ? FULL_ACCESS_PRINCIPAL
         : await resolvePrincipal(request, effectiveOptions, accountPaths);
+      if (principal !== null && (pathname === '/mcp' || pathname === '/')) {
+        (request as LoggedRequest).mcpPrincipal = `${principal.kind}${principal.username === undefined ? '' : `:${principal.username}`}`;
+      }
       if (principal === null) {
         // A hosted connector may probe server/discover before attaching the
         // bearer token. The discovery result exposes nothing athlete-scoped,
