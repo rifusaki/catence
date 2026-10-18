@@ -8,7 +8,7 @@ import {
   OAuthServer,
   redirectUriMatches,
 } from 'mcp-oauth-server';
-import { createFileOAuthServerModel, resolveCatalogPaths, verifyAccountPassword } from '../../runtime/index.js';
+import { asPublicClientMetadata, createFileOAuthServerModel, declaresPrivateKeyJwt, resolveCatalogPaths, verifyAccountPassword } from '../../runtime/index.js';
 
 /** What the HTTP gate needs from the lazily built OAuth sub-app. */
 export type OAuthAppHandle = {
@@ -41,6 +41,49 @@ export type OAuthAppHandle = {
  * username/password inputs. Credentials and tokens are never logged.
  */
 
+/**
+ * Fetch wrapper for client ID metadata documents (CIMD): clients such as
+ * OpenAI's connector declare `token_endpoint_auth_method: "private_key_jwt"`
+ * in their document. The server cannot verify a client JWT assertion, so the
+ * declaration is downgraded to a public client ("none") before the library
+ * validates and caches the document — PKCE still protects the flow. The
+ * rewritten body drops content-length; the library's size guard reads the
+ * actual stream anyway.
+ */
+function sanitizingMetadataFetch(fetchImpl: typeof fetch): typeof fetch {
+  return async (input, init) => {
+    const response = await fetchImpl(input, init);
+    if (!response.ok) return response;
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!contentType.includes('application/json')) return response;
+    let document: unknown;
+    try {
+      document = JSON.parse(await response.text());
+    } catch {
+      return response;
+    }
+    if (!declaresPrivateKeyJwt(document)) return response;
+    const rewritten = JSON.stringify(asPublicClientMetadata(document));
+    const headers = new Headers(response.headers);
+    headers.delete('content-length');
+    return new Response(rewritten, { status: response.status, statusText: response.statusText, headers });
+  };
+}
+
+/**
+ * DCR body sanitizer for POST /oauth/register. Mounted ahead of the library's
+ * router: it parses the JSON body and downgrades private_key_jwt to "none";
+ * the library's own express.json() then skips the already-consumed stream
+ * (body-parser returns early once the request is finished) and validates the
+ * sanitized metadata, issuing no client secret for the downgraded client.
+ */
+function sanitizeRegisterBody(request: Request, _response: Response, next: () => void): void {
+  if (declaresPrivateKeyJwt(request.body)) {
+    request.body = asPublicClientMetadata(request.body as Record<string, unknown>);
+  }
+  next();
+}
+
 export async function createOAuthApp(options: { catalogRoot: string; publicUrl: string }): Promise<OAuthAppHandle> {
   const publicUrl = options.publicUrl.replace(/\/+$/, '');
   const issuerUrl = new URL(publicUrl);
@@ -52,7 +95,7 @@ export async function createOAuthApp(options: { catalogRoot: string; publicUrl: 
     authorizationUrl: new URL(`${publicUrl}/oauth/consent`),
     resourceServerUrl,
     scopesSupported: ['mcp:tools'],
-    clientIdMetadataDocuments: true,
+    clientIdMetadataDocuments: { fetch: sanitizingMetadataFetch(fetch) },
     model: createFileOAuthServerModel(path.join(options.catalogRoot, 'oauth')),
   });
   const oauthMetadata = createOAuthMetadata({ provider, baseUrl: oauthBaseUrl });
@@ -82,6 +125,11 @@ export async function createOAuthApp(options: { catalogRoot: string; publicUrl: 
   app.get('/.well-known/oauth-authorization-server', serveMetadata(oauthMetadata));
   app.get('/.well-known/oauth-protected-resource', serveMetadata(protectedResourceMetadata));
   app.get('/.well-known/oauth-protected-resource/mcp', serveMetadata(protectedResourceMetadata));
+
+  // DCR runs through the library's router, whose own express.json() would
+  // re-parse (and reject) an already-consumed stream; parsing here first
+  // leaves the sanitized body in place for it.
+  app.use('/oauth/register', express.json(), sanitizeRegisterBody);
 
   app.use(mcpAuthRouter({
     provider,

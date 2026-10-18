@@ -56,6 +56,7 @@ export {
 } from '../core/runtime/console-accounts.js';
 export type { ConsoleAccount, ConsoleAccountRole, ConsoleAccountScope } from '../core/runtime/console-accounts.js';
 export { createFileOAuthServerModel, FileOAuthServerModel } from '../core/runtime/oauth/model.js';
+export { asPublicClientMetadata, declaresPrivateKeyJwt, PRIVATE_KEY_JWT } from '../core/runtime/oauth/public-client.js';
 export {
   normalizeMcpOauthSettings,
   readMcpOauthSettings,

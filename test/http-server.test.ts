@@ -324,6 +324,32 @@ describe('Catence Streamable HTTP server', () => {
     // The discovery merge receives the store's config path.
     expect((requested as unknown as DetachedSyncRequest | null)).toMatchObject({ athleteId: 'local', provider: 'garmin', refresh: true });
 
+    // A backfill passes through with its from date; the flag validates as a
+    // boolean and a backfill without from is refused before any spawn.
+    const backfill = await fetch(`${origin}/api/v1/sync`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'garmin', backfill: true, from: '2026-07-01' }),
+    });
+    expect(backfill.status).toBe(202);
+    expect(requested).toMatchObject({ athleteId: 'local', provider: 'garmin', backfill: true, from: '2026-07-01' });
+
+    const missingFrom = await fetch(`${origin}/api/v1/sync`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ backfill: true }),
+    });
+    expect(missingFrom.status).toBe(400);
+    await expect(missingFrom.json()).resolves.toMatchObject({ error: { code: 'sync_start_failed', message: 'from is required for a backfill.' } });
+
+    const badFlag = await fetch(`${origin}/api/v1/sync`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ backfill: 'yes' }),
+    });
+    expect(badFlag.status).toBe(400);
+    await expect(badFlag.json()).resolves.toMatchObject({ error: { code: 'sync_start_failed', message: 'backfill must be a boolean.' } });
+
     const status = await fetch(`${origin}/api/v1/sync/status`);
     expect(status.status).toBe(200);
     // An empty readable store reports a null last-completion timestamp; while

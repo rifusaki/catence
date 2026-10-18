@@ -143,18 +143,61 @@ describe('HTTP gate with per-account MCP keys', () => {
     // Admin-only routes reject a member key with 403 admin_required.
     for (const request of [
       postJson(`${origin}/api/v1/athletes`, { id: 'kim', label: 'Kim' }, member.token),
-      postJson(`${origin}/api/v1/mcp-keys`, { account: 'martina' }, member.token),
       postJson(`${origin}/api/v1/models/discover`, {}, member.token),
-      fetch(`${origin}/api/v1/mcp-keys`, { headers: bearer(member.token) }),
       fetch(`${origin}/api/v1/mcp-exposure`, { headers: bearer(member.token) }),
       postJson(`${origin}/api/v1/mcp-exposure`, { enabled: true }, member.token),
-      fetch(`${origin}/api/v1/mcp-keys?id=${member.record.id}`, { method: 'DELETE', headers: bearer(member.token) }),
-      postJson(`${origin}/api/v1/mcp-keys/roll`, { id: member.record.id }, member.token),
     ]) {
       const response = await request;
       expect(response.status).toBe(403);
       await expect(response.json()).resolves.toMatchObject({ error: { code: 'admin_required' } });
     }
+
+    // Key management is self-service within the account: a member key lists,
+    // creates, rolls, and revokes its own account's keys — and nothing else.
+    const ownList = await fetch(`${origin}/api/v1/mcp-keys`, { headers: bearer(member.token) });
+    expect(ownList.status).toBe(200);
+    const ownKeys = (await ownList.json() as { keys: Array<{ id: string; account: string }> }).keys;
+    expect(ownKeys.map((key) => key.id)).toEqual([member.record.id]);
+    expect(ownKeys.every((key) => key.account === 'martina')).toBe(true);
+
+    // Keying another account is an admin operation.
+    const foreignCreate = await postJson(`${origin}/api/v1/mcp-keys`, { account: 'boss', label: 'nope' }, member.token);
+    expect(foreignCreate.status).toBe(403);
+    await expect(foreignCreate.json()).resolves.toMatchObject({ error: { code: 'admin_required' } });
+
+    // Creating a key for the member's own account succeeds; the raw token is
+    // returned once and authorizes within the member scope.
+    const selfCreate = await postJson(`${origin}/api/v1/mcp-keys`, { account: 'martina', label: 'self-service' }, member.token);
+    expect(selfCreate.status).toBe(201);
+    const selfKey = await selfCreate.json() as { id: string; account: string; token: string };
+    expect(selfKey).toMatchObject({ account: 'martina' });
+    expect((await fetch(`${origin}/api/v1/athletes`, { headers: bearer(selfKey.token) })).status).toBe(200);
+    expect((await fetch(`${origin}/api/v1/dashboard?athleteId=sam`, { headers: bearer(selfKey.token) })).status).toBe(403);
+
+    // Rolling or revoking another account's key is refused; an unknown id
+    // keeps the runtime's 404.
+    const foreignRoll = await postJson(`${origin}/api/v1/mcp-keys/roll`, { id: admin.record.id }, member.token);
+    expect(foreignRoll.status).toBe(403);
+    await expect(foreignRoll.json()).resolves.toMatchObject({ error: { code: 'admin_required' } });
+    const foreignDelete = await fetch(`${origin}/api/v1/mcp-keys?id=${admin.record.id}`, { method: 'DELETE', headers: bearer(member.token) });
+    expect(foreignDelete.status).toBe(403);
+    await expect(foreignDelete.json()).resolves.toMatchObject({ error: { code: 'admin_required' } });
+    expect((await fetch(`${origin}/api/v1/mcp-keys?id=${'e'.repeat(32)}`, { method: 'DELETE', headers: bearer(member.token) })).status).toBe(404);
+
+    // Revoking the member's own key works; its token dies immediately.
+    const selfDelete = await fetch(`${origin}/api/v1/mcp-keys?id=${selfKey.id}`, { method: 'DELETE', headers: bearer(member.token) });
+    expect(selfDelete.status).toBe(200);
+    await expect(selfDelete.json()).resolves.toEqual({ revoked: selfKey.id });
+    expect((await fetch(`${origin}/api/v1/athletes`, { headers: bearer(selfKey.token) })).status).toBe(401);
+
+    // Rolling the member's own key rotates it: the old token dies, the new one works.
+    const selfRoll = await postJson(`${origin}/api/v1/mcp-keys/roll`, { id: member.record.id }, member.token);
+    expect(selfRoll.status).toBe(200);
+    const rolledKey = await selfRoll.json() as { id: string; token: string };
+    expect(rolledKey.id).toBe(member.record.id);
+    expect(rolledKey.token).not.toBe(member.token);
+    expect((await fetch(`${origin}/api/v1/athletes`, { headers: bearer(member.token) })).status).toBe(401);
+    expect((await fetch(`${origin}/api/v1/athletes`, { headers: bearer(rolledKey.token) })).status).toBe(200);
 
     // The admin key passes the same gates.
     expect((await fetch(`${origin}/api/v1/mcp-keys`, { headers: bearer(admin.token) })).status).toBe(200);

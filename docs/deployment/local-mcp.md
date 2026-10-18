@@ -109,7 +109,9 @@ keys, or OAuth authenticate and scope callers; see
   Strava hydration tools: it spawns a detached `catence-data sync` child for
   the selected athlete and returns immediately with the run handle and log
   file. It refuses to start while another sync run is active (`sync_in_progress`);
-  follow the run with `catence_sync_progress`.
+  follow the run with `catence_sync_progress`. Pass `backfill: true` with a
+  `from` date to spawn `catence-data backfill` instead — history is re-imported
+  backwards from that date without advancing the incremental sync cursors.
 
 ### Adding another athlete
 
@@ -328,11 +330,16 @@ catence-data mcp disable   # remove the file; remote access is refused again
 
 - Every endpoint except `/health` and `/api/v1/health` (kept open for readiness
   probes) answers `401` without an exact `Authorization: Bearer <token>`
-  header while the gate is on. The `401` deliberately carries no
-  `WWW-Authenticate`, so MCP clients with auth auto-detection (Mistral Work)
-  classify the server as bearer-auth rather than OAuth. With OAuth enabled the
-  `401` instead gains a `WWW-Authenticate: Bearer resource_metadata="<public-url>/.well-known/oauth-protected-resource/mcp"`
-  challenge — see [OAuth 2.1 (ChatGPT/Codex)](#oauth-21-chatgptcodex).
+  header while the gate is on. A request with no token gets no
+  `WWW-Authenticate` at all, so MCP clients with auth auto-detection (Mistral
+  Work) classify the server as bearer-auth rather than OAuth; with OAuth
+  enabled a token-less `401` instead gains a
+  `WWW-Authenticate: Bearer resource_metadata="<public-url>/.well-known/oauth-protected-resource/mcp"`
+  challenge — see [OAuth 2.1 (ChatGPT/Codex)](#oauth-21-chatgptcodex). A request
+  that presents a wrong or expired token gets
+  `WWW-Authenticate: Bearer error="invalid_token", error_description="The access token is invalid or expired."`
+  with no `resource_metadata`: the client already holds a credential, so it is
+  told the token is bad instead of being steered into the OAuth flow.
 - CORS preflights (`OPTIONS`) pass through without a token.
 - An existing but unreadable or empty token file fails closed: the gate
   rejects everything except the health probes until the file is fixed or
@@ -362,7 +369,11 @@ catence-data mcp disable   # remove the file; remote access is refused again
   returns `202` with the run handle immediately; an already-active run is
   refused with `409 sync_in_progress`. Pass `"refreshModels": true` to also
   refresh OpenCode Go model profiles first (failure is a non-fatal warning in
-  the response).
+  the response). Pass `"backfill": true` with a required `"from"` date
+  (`YYYY-MM-DD`) to run `catence-data backfill` instead: history is re-imported
+  backwards from that date without advancing the incremental cursors. The
+  Console's Status tab exposes the same control (date picker + "Backfill
+  history").
 - `GET /api/v1/sync/status?athleteId=alex` reports live progress heartbeats,
   recent runs, and best-effort last-completion timestamps per provider. It
   keeps working while a sync holds the write lock (`lastSync` becomes `null`
@@ -398,11 +409,15 @@ catence-data mcp key roll <id>                             # new raw token, prin
 catence-data mcp key revoke <id>                           # stops working immediately
 ```
 
-All four accept `--file <path>` for a non-default registry. Admins manage the
-same registry in the Console under Settings → MCP Exposure → API keys (create
-with an account picker and a label — the raw token is shown once — and revoke
-by id), backed by the admin-only HTTP API `GET`/`POST`/`DELETE
-/api/v1/mcp-keys` and `POST /api/v1/mcp-keys/roll`.
+All four accept `--file <path>` for a non-default registry. Every Console
+account manages its own keys in Settings → API keys (create with a label — the
+raw token is shown once — plus roll and revoke); admins additionally see the
+whole registry in Settings → MCP Exposure → API keys with an account picker.
+The HTTP API `GET`/`POST`/`DELETE /api/v1/mcp-keys` and `POST
+/api/v1/mcp-keys/roll` enforce the same boundary for direct callers and for
+key- or OAuth-authenticated sessions: an admin principal may manage any
+account's keys, any other principal only its own (`403 admin_required`
+otherwise), and a non-admin's list shows only its own account's keys.
 
 Scope semantics:
 
@@ -413,9 +428,10 @@ Scope semantics:
   (`athlete_forbidden` tool error over MCP), and `list_athletes`,
   `catence://athletes`, and `GET /api/v1/athletes` are filtered to the scope.
 - Admin-only APIs (`POST /api/v1/athletes`, `/api/v1/mcp-exposure`,
-  `/api/v1/mcp-keys`, `/api/v1/models/discover`) require an admin principal:
-  the legacy token is always admin, an account key is admin only when its
-  account is.
+  `/api/v1/models/discover`) require an admin principal: the legacy token is
+  always admin, an account key is admin only when its account is. The key
+  registry APIs are account-scoped instead of admin-only — admins manage every
+  account's keys, any other principal only its own (see above).
 - Fail closed: a revoked key, a deleted account, or an unreadable registry or
   accounts file rejects the request (`401`) — never an anonymous fallback.
 - The raw token is shown exactly once (on `add` and `roll`); only its hash is
@@ -455,23 +471,32 @@ its `source` (`console`, `environment`, or `disabled`).
   `console/accounts.json`) and asks to approve or deny the client. The access
   token carries the account username, and the athlete scope is that account's
   live grants — scoped exactly like an account key.
-- While OAuth is enabled, the `401` for a missing or invalid bearer token
-  gains an RFC 9728 challenge —
+- While OAuth is enabled, the `401` for a request with no bearer token gains
+  an RFC 9728 challenge —
   `WWW-Authenticate: Bearer resource_metadata="<public-url>/.well-known/oauth-protected-resource/mcp"`
-  — so OAuth clients can discover the authorization server. Without `--oauth`
-  the `401` stays plain on purpose (Mistral connector auto-detection).
+  — so OAuth clients can discover the authorization server. A presented but
+  invalid token gets `invalid_token` without the challenge instead. Without
+  `--oauth` the `401` stays plain on purpose (Mistral connector
+  auto-detection).
+- Clients that register (DCR) or publish a client ID metadata document with
+  `token_endpoint_auth_method: "private_key_jwt"` — OpenAI's ChatGPT/Codex
+  connector does — are accepted as public clients: the declaration is
+  downgraded to `"none"`, no client secret is issued, and PKCE with S256
+  still protects the flow. Catence cannot verify client JWT assertions, so
+  the method is never honored as such.
 - Authorization-server state (registered clients, authorization codes, tokens)
   lives in `<catalog-home>/oauth/` (directory mode 0700, files 0600).
 
-Note: the added `WWW-Authenticate` challenge can flip a client with auth
-auto-detection (Mistral Work) from bearer to OAuth — smoke-test the Mistral
-connector after enabling OAuth.
+Note: the `resource_metadata` challenge on token-less `401`s can flip a client
+with auth auto-detection (Mistral Work) from bearer to OAuth — smoke-test the
+Mistral connector after enabling OAuth. A client that already sends a key
+never sees the challenge; it only gets `invalid_token` when the key is wrong.
 
 #### Client matrix
 
 | Client | Setup | Credential |
 | --- | --- | --- |
-| Mistral Vibe (Work custom connector) | Connectors → Add Connector → Custom MCP Connector, URL `https://<host>/mcp` | Bearer credential (the shared token) — unchanged |
+| Mistral Vibe (Work custom connector) | Connectors → Add Connector → Custom MCP Connector, URL `https://<host>/mcp` | Bearer credential (the shared token or a per-account API key) |
 | Claude (custom connector) | Authentication: "No sign in"; Request headers: `Authorization: Bearer <key>` | Per-account API key |
 | Claude Code (CLI) | `claude mcp add --transport http --header "Authorization: Bearer <key>" <url>` | Per-account API key |
 | ChatGPT / Codex | Connector OAuth connect flow | OAuth 2.1 (Console: MCP exposure → OAuth 2.1 sign-in, or `--oauth`) |

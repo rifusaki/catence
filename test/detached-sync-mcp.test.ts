@@ -43,6 +43,25 @@ describe('start_detached_sync MCP tool', () => {
     }
   });
 
+  it('passes backfill with its from date through to the detached sync', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'catence-mcp-sync-'));
+    const paths = resolvePaths(root);
+    let capturedArguments: Record<string, unknown> | null = null;
+    const { client, close } = await start(paths, {
+      startDetachedSync: async (request) => {
+        capturedArguments = request as unknown as Record<string, unknown>;
+        return { started: true, athleteId: request.athleteId, provider: request.provider ?? 'all', logFile: `${root}/logs/sync.log` };
+      },
+    });
+    try {
+      const response = await client.callTool({ name: 'start_detached_sync', arguments: { provider: 'garmin', backfill: true, from: '2026-07-01' } }) as ToolPayload;
+      expect(response.isError).toBeFalsy();
+      expect(capturedArguments).toMatchObject({ athleteId: 'local', provider: 'garmin', backfill: true, from: '2026-07-01' });
+    } finally {
+      await close();
+    }
+  });
+
   it('refuses concurrent runs through the shared busy guard', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'catence-mcp-sync-'));
     const paths = resolvePaths(root);

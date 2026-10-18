@@ -162,6 +162,21 @@ function requireAdmin(principal: CatencePrincipal, response: ServerResponse): bo
 }
 
 /**
+ * True when the principal may manage API keys bound to `account`: admins manage
+ * every account's keys; a key or OAuth principal manages only its own
+ * account's keys (self-service from the Console's account settings).
+ */
+function canManageKeysFor(principal: CatencePrincipal, account: string): boolean {
+  return principal.role === 'admin' || principal.username === account;
+}
+
+function requireKeyManagementFor(principal: CatencePrincipal, account: string, response: ServerResponse): boolean {
+  if (canManageKeysFor(principal, account)) return true;
+  json(response, 403, { error: { code: 'admin_required', message: 'An admin account is required to manage API keys for another account.' } });
+  return false;
+}
+
+/**
  * Resolve the request's principal: the legacy shared token first, then a
  * per-account MCP key, then an OAuth bearer token. The gate is armed when the
  * legacy token is active, the key registry holds at least one active key, or
@@ -335,6 +350,7 @@ type SyncRequestBody = {
   from?: string;
   refresh?: boolean;
   refreshModels?: boolean;
+  backfill?: boolean;
 };
 
 type SyncScheduleBody = {
@@ -372,7 +388,7 @@ function parseSyncBody(body: unknown): SyncRequestBody {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new Error('Request body must be a JSON object.');
   const raw = body as Record<string, unknown>;
   for (const key of Object.keys(raw)) {
-    if (!['athleteId', 'provider', 'from', 'refresh', 'refreshModels'].includes(key)) {
+    if (!['athleteId', 'provider', 'from', 'refresh', 'refreshModels', 'backfill'].includes(key)) {
       throw new Error(`Unknown sync field: ${key}.`);
     }
   }
@@ -383,8 +399,13 @@ function parseSyncBody(body: unknown): SyncRequestBody {
   if (raw.from !== undefined && (typeof raw.from !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(raw.from))) {
     throw new Error('from must use YYYY-MM-DD.');
   }
-  for (const flag of ['refresh', 'refreshModels'] as const) {
+  for (const flag of ['refresh', 'refreshModels', 'backfill'] as const) {
     if (raw[flag] !== undefined && typeof raw[flag] !== 'boolean') throw new Error(`${flag} must be a boolean.`);
+  }
+  // A backfill extends history backwards from an explicit date; the CLI's
+  // backfill subcommand requires --from, so the API does the same.
+  if (raw.backfill === true && raw.from === undefined) {
+    throw new Error('from is required for a backfill.');
   }
   return raw as SyncRequestBody;
 }
@@ -681,14 +702,22 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
         ? FULL_ACCESS_PRINCIPAL
         : await resolvePrincipal(request, effectiveOptions, accountPaths);
       if (principal === null) {
-        // RFC 9728: point OAuth clients at the protected-resource metadata so
-        // they discover the authorization server. Without OAuth the 401 stays
-        // plain on purpose: MCP connector auto-detection treats it as a bearer
-        // gate rather than an OAuth server.
-        const config = effectiveOauth();
-        if (config.enabled && config.publicUrl !== undefined) {
-          const handle = await getOauthApp(config.publicUrl).catch(() => null);
-          if (handle !== null) response.setHeader('www-authenticate', `Bearer resource_metadata="${handle.protectedResourceMetadataUrl}"`);
+        // A presented-but-rejected token is a bearer problem, not an OAuth
+        // discovery problem: answer RFC 6750 invalid_token without
+        // resource_metadata, so static-key clients get a clear "your token is
+        // wrong" instead of being steered into the OAuth flow. With no token,
+        // RFC 9728 points OAuth clients at the protected-resource metadata so
+        // they discover the authorization server; without OAuth the 401 stays
+        // plain on purpose: MCP connector auto-detection treats it as a
+        // bearer gate rather than an OAuth server.
+        if (bearerTokenFrom(request) !== null) {
+          response.setHeader('www-authenticate', 'Bearer error="invalid_token", error_description="The access token is invalid or expired."');
+        } else {
+          const config = effectiveOauth();
+          if (config.enabled && config.publicUrl !== undefined) {
+            const handle = await getOauthApp(config.publicUrl).catch(() => null);
+            if (handle !== null) response.setHeader('www-authenticate', `Bearer resource_metadata="${handle.protectedResourceMetadataUrl}"`);
+          }
         }
         json(response, 401, { error: { code: 'unauthorized', message: 'A valid Authorization: Bearer token is required.' } });
         return;
@@ -914,6 +943,7 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
               provider: body.provider as never,
               from: body.from,
               refresh: body.refresh,
+              backfill: body.backfill,
               // The child resolves the athlete within the catalog, not within
               // the athlete store this route resolved for locks and logs.
               cliHome: catalogPaths ? catalogPaths.root : undefined,
@@ -1064,14 +1094,15 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       }
 
       if (pathname === '/api/v1/mcp-keys' && request.method === 'GET') {
-        if (!requireAdmin(principal, response)) return;
         if (!options.mcpKeysFile) {
           json(response, 400, { error: { code: 'mcp_keys_not_configured', message: 'This server was started without an MCP keys file; restart it with --mcp-keys-file to manage per-account keys.' } });
           return;
         }
         try {
-          // Listing never exposes token hashes.
-          json(response, 200, { keys: await listMcpKeys(options.mcpKeysFile) });
+          // Listing never exposes token hashes. Admins see the whole registry;
+          // a key or OAuth principal sees only its own account's keys.
+          const keys = await listMcpKeys(options.mcpKeysFile);
+          json(response, 200, { keys: principal.role === 'admin' ? keys : keys.filter((key) => key.account === principal.username) });
         } catch (error) {
           json(response, 400, { error: { code: 'mcp_keys_unavailable', message: error instanceof Error ? error.message : String(error) } });
         }
@@ -1079,13 +1110,14 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       }
 
       if (pathname === '/api/v1/mcp-keys' && request.method === 'POST') {
-        if (!requireAdmin(principal, response)) return;
         if (!options.mcpKeysFile) {
           json(response, 400, { error: { code: 'mcp_keys_not_configured', message: 'This server was started without an MCP keys file; restart it with --mcp-keys-file to manage per-account keys.' } });
           return;
         }
         try {
           const body = parseMcpKeyCreateBody(await readJsonBody(request));
+          // Admins may key any account; a key or OAuth principal only its own.
+          if (!requireKeyManagementFor(principal, body.account, response)) return;
           const { record, token } = await addMcpKey(options.mcpKeysFile, body);
           // The raw token is returned exactly once; only its hash is stored.
           json(response, 201, { id: record.id, label: record.label, account: record.account, createdAt: record.createdAt, token });
@@ -1096,7 +1128,6 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       }
 
       if (pathname === '/api/v1/mcp-keys' && request.method === 'DELETE') {
-        if (!requireAdmin(principal, response)) return;
         if (!options.mcpKeysFile) {
           json(response, 400, { error: { code: 'mcp_keys_not_configured', message: 'This server was started without an MCP keys file; restart it with --mcp-keys-file to manage per-account keys.' } });
           return;
@@ -1107,6 +1138,13 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
           return;
         }
         try {
+          // Admins may revoke any key; a key or OAuth principal only its own.
+          // An unknown id falls through to the same 404 as the admin path.
+          if (principal.role !== 'admin') {
+            const keys = await listMcpKeys(options.mcpKeysFile);
+            const target = keys.find((key) => key.id === id);
+            if (target && !requireKeyManagementFor(principal, target.account, response)) return;
+          }
           await revokeMcpKey(options.mcpKeysFile, id);
           json(response, 200, { revoked: id });
         } catch (error) {
@@ -1120,13 +1158,19 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       }
 
       if (pathname === '/api/v1/mcp-keys/roll' && request.method === 'POST') {
-        if (!requireAdmin(principal, response)) return;
         if (!options.mcpKeysFile) {
           json(response, 400, { error: { code: 'mcp_keys_not_configured', message: 'This server was started without an MCP keys file; restart it with --mcp-keys-file to manage per-account keys.' } });
           return;
         }
         try {
           const body = parseMcpKeyRollBody(await readJsonBody(request));
+          // Admins may roll any key; a key or OAuth principal only its own.
+          // An unknown id falls through to the same 404 as the admin path.
+          if (principal.role !== 'admin') {
+            const keys = await listMcpKeys(options.mcpKeysFile);
+            const target = keys.find((key) => key.id === body.id);
+            if (target && !requireKeyManagementFor(principal, target.account, response)) return;
+          }
           const { record, token } = await rollMcpKey(options.mcpKeysFile, body.id);
           // The new raw token is returned exactly once; only its hash is stored.
           json(response, 200, { id: record.id, label: record.label, account: record.account, createdAt: record.createdAt, token });

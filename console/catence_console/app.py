@@ -369,15 +369,55 @@ async def mcp_exposure_update(request: Request) -> Response:
     return await _proxy_mcp_post(request, "/api/v1/mcp-exposure", payload=await request.body())
 
 
+async def _mcp_keys_visible_to(request: Request, account: ConsoleAccount) -> list[dict[str, Any]] | Response:
+    """The key list this session may see: admins get the whole registry, a
+    member only its own account's keys.
+
+    Returns the parsed key list, or the runtime's error response (or a 502 for
+    an unparseable one) for the caller to pass through.
+    """
+
+    proxy = await _proxy_mcp_get(request, "/api/v1/mcp-keys")
+    if proxy.status_code != 200:
+        return proxy
+    payload = json.loads(proxy.body)
+    keys = payload.get("keys") if isinstance(payload, dict) else None
+    if not isinstance(keys, list):
+        return JSONResponse(
+            {"error": {"code": "mcp_keys_unavailable", "message": "The runtime returned an unexpected MCP API key list."}},
+            status_code=502,
+        )
+    if account.role == "admin":
+        return [key for key in keys if isinstance(key, dict)]
+    return [key for key in keys if isinstance(key, dict) and key.get("account") == account.username]
+
+
+def _mcp_key_ownership_error(key_id: str, visible: list[dict[str, Any]]) -> JSONResponse | None:
+    """A 404 when the key is not among the session's own keys, else None.
+
+    Answering 404 for both unknown and foreign keys keeps the registry's other
+    accounts unenumerable; the runtime enforces the same boundary for callers
+    that authenticate with a key or OAuth token directly.
+    """
+
+    if any(key.get("id") == key_id for key in visible):
+        return None
+    return JSONResponse(
+        {"error": {"code": "mcp_key_not_found", "message": f"MCP API key {key_id!r} was not found."}},
+        status_code=404,
+    )
+
+
 async def mcp_keys_overview(request: Request) -> Response:
-    """List per-account MCP API keys through the runtime (admins only)."""
+    """List MCP API keys through the runtime: admins see all, members their own."""
 
     account = _request_identity(request)
     if account is None:
         return _unauthorized()
-    if account.role != "admin":
-        return _admin_required("Your Console account must be an admin to manage MCP API keys.")
-    return await _proxy_mcp_get(request, "/api/v1/mcp-keys")
+    visible = await _mcp_keys_visible_to(request, account)
+    if isinstance(visible, Response):
+        return visible
+    return JSONResponse({"keys": visible})
 
 
 def _mcp_key_account_error(username: object) -> JSONResponse | None:
@@ -405,17 +445,17 @@ def _mcp_key_account_error(username: object) -> JSONResponse | None:
 
 
 async def mcp_keys_create(request: Request) -> Response:
-    """Create a per-account MCP API key through the runtime (admins only).
+    """Create an MCP API key through the runtime.
 
-    The runtime returns the raw token exactly once; the response passes through
-    untouched and the Console never logs it.
+    Admins may key any account; a member may key only its own account
+    (self-service from the account settings). The runtime returns the raw
+    token exactly once; the response passes through untouched and the Console
+    never logs it.
     """
 
     account = _request_identity(request)
     if account is None:
         return _unauthorized()
-    if account.role != "admin":
-        return _admin_required("Your Console account must be an admin to manage MCP API keys.")
     payload = await request.body()
     body = _parsed_json_object(payload)
     if body is None:
@@ -423,6 +463,8 @@ async def mcp_keys_create(request: Request) -> Response:
             {"error": {"code": "invalid_request", "message": "Request body must be a JSON object."}},
             status_code=400,
         )
+    if account.role != "admin" and body.get("account") != account.username:
+        return _admin_required("Your Console account may only create API keys for itself.")
     account_error = _mcp_key_account_error(body.get("account"))
     if account_error is not None:
         return account_error
@@ -430,20 +472,30 @@ async def mcp_keys_create(request: Request) -> Response:
 
 
 async def mcp_keys_revoke(request: Request) -> Response:
-    """Revoke one MCP API key through the runtime (admins only)."""
+    """Revoke one MCP API key through the runtime.
+
+    Admins may revoke any key; a member only its own account's keys.
+    """
 
     account = _request_identity(request)
     if account is None:
         return _unauthorized()
     if account.role != "admin":
-        return _admin_required("Your Console account must be an admin to manage MCP API keys.")
+        key_id = request.query_params.get("id", "").strip()
+        visible = await _mcp_keys_visible_to(request, account)
+        if isinstance(visible, Response):
+            return visible
+        ownership_error = _mcp_key_ownership_error(key_id, visible)
+        if ownership_error is not None:
+            return ownership_error
     return await _proxy_mcp_delete(request, "/api/v1/mcp-keys")
 
 
 async def mcp_keys_roll(request: Request) -> Response:
-    """Rotate one MCP API key's token through the runtime (admins only).
+    """Rotate one MCP API key's token through the runtime.
 
-    The Console-facing body carries the key's ``account`` alongside ``id`` so a
+    Admins may roll any key; a member only its own account's keys. The
+    Console-facing body carries the key's ``account`` alongside ``id`` so a
     key whose account was deleted is refused before the runtime mints a token
     that could never authenticate; only ``id`` is forwarded, matching the
     runtime's strict roll body.
@@ -452,8 +504,6 @@ async def mcp_keys_roll(request: Request) -> Response:
     account = _request_identity(request)
     if account is None:
         return _unauthorized()
-    if account.role != "admin":
-        return _admin_required("Your Console account must be an admin to manage MCP API keys.")
     body = _parsed_json_object(await request.body())
     if body is None:
         return JSONResponse(
@@ -466,9 +516,18 @@ async def mcp_keys_roll(request: Request) -> Response:
             {"error": {"code": "invalid_request", "message": "id is required."}},
             status_code=400,
         )
+    if account.role != "admin" and body.get("account") != account.username:
+        return _admin_required("Your Console account may only roll API keys for itself.")
     account_error = _mcp_key_account_error(body.get("account"))
     if account_error is not None:
         return account_error
+    if account.role != "admin":
+        visible = await _mcp_keys_visible_to(request, account)
+        if isinstance(visible, Response):
+            return visible
+        ownership_error = _mcp_key_ownership_error(key_id.strip(), visible)
+        if ownership_error is not None:
+            return ownership_error
     payload = json.dumps({"id": key_id.strip()}).encode("utf-8")
     return await _proxy_mcp_post(request, "/api/v1/mcp-keys/roll", payload=payload)
 

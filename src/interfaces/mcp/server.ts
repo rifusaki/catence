@@ -384,11 +384,12 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
   registerTool('start_detached_sync', {
     title: 'Start a detached data sync',
     description:
-      'Write-only sync trigger, named like the other explicit lock-guarded write tools. Spawns one detached catence-data sync process for this athlete and returns immediately with the run handle and log file; it refuses while another sync run is active. Track the run with catence_sync_progress; this tool never waits for completion.',
+      'Write-only sync trigger, named like the other explicit lock-guarded write tools. Spawns one detached catence-data sync process for this athlete and returns immediately with the run handle and log file; it refuses while another sync run is active. Track the run with catence_sync_progress; this tool never waits for completion. Pass backfill with a from date to extend history backwards without advancing the incremental cursors (from is required when backfill is set).',
     inputSchema: {
       provider: z.enum(['intervals', 'garmin', 'strava', 'all']).optional(),
       from: z.string().date().optional(),
       refresh: z.boolean().optional(),
+      backfill: z.boolean().optional(),
     },
   }, tool('start_detached_sync', async (input) => {
     const paths = activePaths();
@@ -399,6 +400,7 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
       provider: input.provider,
       from: input.from,
       refresh: input.refresh,
+      backfill: input.backfill,
       // The child resolves the athlete within the catalog, not within the
       // athlete store this tool resolved for locks and logs: passing the
       // store itself trips the legacy-store guard in catalog deployments.

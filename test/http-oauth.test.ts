@@ -176,8 +176,8 @@ async function exchangeCode(origin: string, client: RegisteredClient, code: stri
 }
 
 /** register -> authorize -> consent confirm -> code -> token exchange. */
-async function runFlow(origin: string, publicUrl: string, credentials: { username: string; password: string }): Promise<{ client: RegisteredClient; tokens: TokenResponse; verifier: string; code: string }> {
-  const client = await registerClient(origin);
+async function runFlow(origin: string, publicUrl: string, credentials: { username: string; password: string }, registerOverrides: Record<string, unknown> = {}): Promise<{ client: RegisteredClient; tokens: TokenResponse; verifier: string; code: string }> {
+  const client = await registerClient(origin, registerOverrides);
   const { verifier, challenge } = pkcePair();
   const authorize = await fetch(authorizeUrl(origin, {
     clientId: client.client_id,
@@ -335,6 +335,31 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
     const noRedirect = await postJson(`${origin}/oauth/register`, { redirect_uris: [], grant_types: ['authorization_code'] });
     expect(noRedirect.status).toBe(400);
     await expect(noRedirect.json()).resolves.toMatchObject({ error: 'invalid_redirect_uri' });
+  });
+
+  it('treats private_key_jwt registrations as public clients and runs their full flow', { timeout: 90_000 }, async () => {
+    const { origin, publicUrl } = await oauthFixture();
+
+    // OpenAI's connector registers (and publishes its CIMD document) with
+    // token_endpoint_auth_method private_key_jwt. Catence cannot verify a
+    // client JWT assertion, so the registration is downgraded to a public
+    // client: no secret is issued and the stored method reads "none", while
+    // PKCE S256 still protects authorize and token. The same downgrade
+    // applies to the CIMD path (unit-tested in oauth-public-client.test.ts).
+    const client = await registerClient(origin, { token_endpoint_auth_method: 'private_key_jwt' });
+    expect(client.client_secret).toBeUndefined();
+    expect((client as Record<string, unknown>).token_endpoint_auth_method).toBe('none');
+
+    // The downgraded client completes the full authorization-code flow and
+    // its token drives the JSON APIs and /mcp within the account scope.
+    const { tokens } = await runFlow(origin, publicUrl, { username: 'martina', password: MARTINA_PASSWORD }, { token_endpoint_auth_method: 'private_key_jwt' });
+    const roster = await fetch(`${origin}/api/v1/athletes`, { headers: bearer(tokens.access_token) });
+    expect(roster.status).toBe(200);
+    await expect(roster.json()).resolves.toMatchObject({ defaultAthleteId: 'alex', athletes: [{ id: 'alex', label: 'Alex' }] });
+    const forbidden = await fetch(`${origin}/api/v1/dashboard?athleteId=sam`, { headers: bearer(tokens.access_token) });
+    expect(forbidden.status).toBe(403);
+    const initialize = await postJson(`${origin}/mcp`, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'pkj', version: '0.1.0' } } }, tokens.access_token);
+    expect(initialize.status).toBe(200);
   });
 
   it('runs the full flow — register, authorize, consent login, code, token — and enforces the account scope at the gate', { timeout: 90_000 }, async () => {
@@ -633,18 +658,27 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
     const { origin, publicUrl, home } = await oauthFixture();
     const { tokens } = await runFlow(origin, publicUrl, { username: 'martina', password: MARTINA_PASSWORD });
 
-    // A tampered token is unknown to the model.
+    // A tampered token is unknown to the model. A presented-but-rejected
+    // token gets RFC 6750 invalid_token with no resource_metadata: the
+    // client already holds a credential, so steering it into OAuth
+    // discovery would be wrong (and flips static-key MCP connectors, which
+    // probe with a key, into the OAuth flow).
     const tampered = `${tokens.access_token.slice(0, -1)}${tokens.access_token.endsWith('a') ? 'b' : 'a'}`;
     const tamperedResponse = await fetch(`${origin}/api/v1/athletes`, { headers: bearer(tampered) });
     expect(tamperedResponse.status).toBe(401);
-    expect(tamperedResponse.headers.get('www-authenticate')).toContain('resource_metadata=');
+    expect(tamperedResponse.headers.get('www-authenticate')).toBe('Bearer error="invalid_token", error_description="The access token is invalid or expired."');
+    const tamperedMcp = await postJson(`${origin}/mcp`, { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }, tampered);
+    expect(tamperedMcp.status).toBe(401);
+    expect(tamperedMcp.headers.get('www-authenticate')).toBe('Bearer error="invalid_token", error_description="The access token is invalid or expired."');
 
     // An expired token is swept and rejected: rewrite the record's expiry.
     const recordPath = path.join(home, 'oauth', 'access', `${sha256(tokens.access_token)}.json`);
     const record = JSON.parse(await readFile(recordPath, 'utf8')) as { expiresAt: string };
     record.expiresAt = new Date(Date.now() - 1_000).toISOString();
     await writeFile(recordPath, JSON.stringify(record));
-    expect((await fetch(`${origin}/api/v1/athletes`, { headers: bearer(tokens.access_token) })).status).toBe(401);
+    const expiredResponse = await fetch(`${origin}/api/v1/athletes`, { headers: bearer(tokens.access_token) });
+    expect(expiredResponse.status).toBe(401);
+    expect(expiredResponse.headers.get('www-authenticate')).toBe('Bearer error="invalid_token", error_description="The access token is invalid or expired."');
 
     // A deleted account fails closed: the token verifies, the principal does not.
     const second = await runFlow(origin, publicUrl, { username: 'martina', password: MARTINA_PASSWORD });

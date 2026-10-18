@@ -106,12 +106,32 @@ describe('startDetachedSync', () => {
     expect(captures).toHaveLength(1);
   });
 
+  it('spawns the backfill subcommand with --from', async () => {
+    const paths = await temporaryStore();
+    const { spawn, captures } = fakeSpawner();
+
+    const handle = await startDetachedSync(
+      { paths, athleteId: 'alex', provider: 'garmin', from: '2026-07-01', backfill: true },
+      { now: () => new Date('2026-08-21T10:00:00.000Z'), spawnProcess: spawn },
+    );
+
+    expect(handle).toMatchObject({ started: true, athleteId: 'alex', provider: 'garmin' });
+    expect(captures).toHaveLength(1);
+    const capture = captures[0]!;
+    expect(capture.arguments_).toEqual(expect.arrayContaining(['--home', paths.root, '--athlete', 'alex', 'backfill', '--provider', 'garmin', '--from', '2026-07-01']));
+    expect(capture.arguments_).not.toContain('sync');
+    const logHeader = await readFile(handle.logFile, 'utf8');
+    expect(logHeader).toContain('backfill --provider garmin --from 2026-07-01');
+  });
+
   it('validates provider and date inputs before touching the filesystem', async () => {
     const paths = await temporaryStore();
     const { spawn, captures } = fakeSpawner();
     await expect(startDetachedSync({ paths, athleteId: 'alex', provider: 'nope' as never }, { spawnProcess: spawn })).rejects.toThrow('provider must be intervals, garmin, strava, or all.');
     await expect(startDetachedSync({ paths, athleteId: 'alex', from: '01-07-2026' }, { spawnProcess: spawn })).rejects.toThrow('from must use YYYY-MM-DD.');
     await expect(startDetachedSync({ paths, athleteId: 'Not Valid' }, { spawnProcess: spawn })).rejects.toThrow('athleteId is required');
+    // The CLI's backfill subcommand requires --from; enforce it before spawn.
+    await expect(startDetachedSync({ paths, athleteId: 'alex', backfill: true }, { spawnProcess: spawn })).rejects.toThrow('from is required for a backfill.');
     expect(captures).toHaveLength(0);
   });
 

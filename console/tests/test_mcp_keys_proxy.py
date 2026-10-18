@@ -1,5 +1,6 @@
 import json
 import socket
+import urllib.parse
 from types import SimpleNamespace
 
 import bcrypt
@@ -148,18 +149,96 @@ def test_mcp_keys_routes_require_login(console_home):
         assert response.json()["error"]["code"] == "unauthorized"
 
 
-def test_mcp_keys_routes_are_admin_only(console_home, monkeypatch):
+def test_mcp_keys_member_cross_account_operations_are_refused(console_home, monkeypatch):
+    """A member may manage only its own account's keys; keying, rolling, or
+    otherwise touching another account is an admin operation and never
+    reaches the runtime."""
     _forbid_upstream(monkeypatch)
 
     member = client_for("rifusaki")
-    overview = member.get("/api/v1/mcp-keys")
-    create = member.post("/api/v1/mcp-keys", json={"account": "rifusaki"})
-    revoke = member.delete(f"/api/v1/mcp-keys?id={KEY_ID}")
-    roll = member.post("/api/v1/mcp-keys/roll", json={"id": KEY_ID, "account": "rifusaki"})
+    create = member.post("/api/v1/mcp-keys", json={"account": "coach", "label": "nope"})
+    roll = member.post("/api/v1/mcp-keys/roll", json={"id": KEY_ID, "account": "coach"})
 
-    for response in (overview, create, revoke, roll):
+    for response in (create, roll):
         assert response.status_code == 403
         assert response.json()["error"]["code"] == "admin_required"
+
+
+def test_mcp_keys_overview_filters_to_the_members_own_account(console_home, runtime_token, monkeypatch):
+    def fake_urlopen(request, timeout=0):
+        assert request.get_method() == "GET"
+        return _Upstream(json.dumps(KEYS_LISTING).encode("utf-8"))
+
+    monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
+
+    member = client_for("rifusaki").get("/api/v1/mcp-keys")
+    assert member.status_code == 200
+    assert member.json() == {"keys": [KEYS_LISTING["keys"][0]]}
+
+    admin = client_for("coach").get("/api/v1/mcp-keys")
+    assert admin.status_code == 200
+    assert admin.json() == KEYS_LISTING
+
+
+def test_mcp_keys_member_self_service_lifecycle(console_home, runtime_token, monkeypatch):
+    """A member creates, rolls, and revokes its own account's keys through the
+    runtime. Other accounts' keys answer 404 — the same code as an unknown id,
+    so the registry's other accounts stay unenumerable — and are never
+    forwarded."""
+    calls = []
+
+    def fake_urlopen(request, timeout=0):
+        calls.append(request)
+        method = request.get_method()
+        if method == "GET":
+            return _Upstream(json.dumps(KEYS_LISTING).encode("utf-8"))
+        if method == "DELETE":
+            key_id = urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)["id"][0]
+            return _Upstream(json.dumps({"revoked": key_id}).encode("utf-8"))
+        if request.full_url.endswith("/api/v1/mcp-keys"):
+            return _Upstream(json.dumps(CREATED_KEY).encode("utf-8"), status=201)
+        return _Upstream(json.dumps(ROLLED_KEY).encode("utf-8"))
+
+    monkeypatch.setattr(app.urllib.request, "urlopen", fake_urlopen)
+    member = client_for("rifusaki")
+
+    # Create for its own account: the body is forwarded verbatim and the raw
+    # token comes back exactly once.
+    create = member.post("/api/v1/mcp-keys", json={"account": "rifusaki", "label": "Claude"})
+    assert create.status_code == 201
+    assert create.json() == CREATED_KEY
+
+    # Revoke its own key: the visibility lookup runs first, then the DELETE.
+    calls.clear()
+    revoke = member.delete(f"/api/v1/mcp-keys?id={KEY_ID}")
+    assert revoke.status_code == 200
+    assert revoke.json() == {"revoked": KEY_ID}
+    assert [call.get_method() for call in calls] == ["GET", "DELETE"]
+
+    # Roll its own key: only the id is forwarded to the runtime.
+    calls.clear()
+    roll = member.post("/api/v1/mcp-keys/roll", json={"id": KEY_ID, "account": "rifusaki"})
+    assert roll.status_code == 200
+    assert roll.json() == ROLLED_KEY
+    assert [call.get_method() for call in calls] == ["GET", "POST"]
+    assert json.loads(calls[-1].data) == {"id": KEY_ID}
+
+    # Another account's key and an unknown id both 404 after the visibility
+    # lookup; neither is forwarded as a DELETE.
+    coach_key_id = KEYS_LISTING["keys"][1]["id"]
+    for key_id in (coach_key_id, "f" * 32):
+        calls.clear()
+        response = member.delete(f"/api/v1/mcp-keys?id={key_id}")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "mcp_key_not_found"
+        assert [call.get_method() for call in calls] == ["GET"]
+
+    # Rolling another account's key is the same 404.
+    calls.clear()
+    roll_foreign = member.post("/api/v1/mcp-keys/roll", json={"id": coach_key_id, "account": "rifusaki"})
+    assert roll_foreign.status_code == 404
+    assert roll_foreign.json()["error"]["code"] == "mcp_key_not_found"
+    assert [call.get_method() for call in calls] == ["GET"]
 
 
 def test_mcp_keys_routes_reject_wrong_methods(console_home, monkeypatch):

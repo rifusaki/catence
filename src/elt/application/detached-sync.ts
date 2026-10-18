@@ -17,6 +17,11 @@ export type DetachedSyncRequest = {
   from?: string;
   refresh?: boolean;
   /**
+   * Run `catence-data backfill` instead of `sync`: extend history backwards
+   * from `from` without advancing the incremental cursors. Requires `from`.
+   */
+  backfill?: boolean;
+  /**
    * The `--home` value the detached `catence-data` child must receive.
    *
    * Catalog deployments pass the catalog root here: `paths` points at the
@@ -79,6 +84,11 @@ function assertValidRequest(request: DetachedSyncRequest): void {
   if (request.from !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(request.from)) {
     throw new Error('from must use YYYY-MM-DD.');
   }
+  // The CLI's backfill subcommand requires --from; enforce it here so the
+  // child never spawns into a usage error.
+  if (request.backfill && !request.from) {
+    throw new Error('from is required for a backfill.');
+  }
 }
 
 /** Minimal structural spawner so tests can inject a fake child process. */
@@ -89,8 +99,8 @@ export type DetachedSyncSpawner = (
 ) => { unref(): void };
 
 /**
- * Spawn one detached `catence-data sync` process for an athlete store and
- * return immediately.
+ * Spawn one detached `catence-data sync` (or `backfill`, when requested)
+ * process for an athlete store and return immediately.
  *
  * The child outlives this process (SSH deaths, Console restarts), logs to a
  * file under the catalog home, and is guarded by the same live-progress
@@ -118,9 +128,10 @@ export async function startDetachedSync(
   const stamp = (dependencies.now ?? (() => new Date()))().toISOString().replace(/[:.]/g, '-');
   const logFile = path.join(request.paths.root, 'logs', `sync-${request.athleteId}-${stamp}.log`);
   await mkdir(path.dirname(logFile), { recursive: true });
-  await writeFile(logFile, `[${new Date().toISOString()}] catence-data --athlete ${request.athleteId} sync --provider ${provider}${request.from ? ` --from ${request.from}` : ''}${request.refresh ? ' --refresh' : ''}\n`, 'utf8');
+  const subcommand = request.backfill ? 'backfill' : 'sync';
+  await writeFile(logFile, `[${new Date().toISOString()}] catence-data --athlete ${request.athleteId} ${subcommand} --provider ${provider}${request.from ? ` --from ${request.from}` : ''}${request.refresh ? ' --refresh' : ''}\n`, 'utf8');
 
-  const arguments_ = [cliInvocation().entry, '--home', request.cliHome ?? request.paths.root, '--athlete', request.athleteId, 'sync', '--provider', provider];
+  const arguments_ = [cliInvocation().entry, '--home', request.cliHome ?? request.paths.root, '--athlete', request.athleteId, subcommand, '--provider', provider];
   if (request.from) arguments_.push('--from', request.from);
   if (request.refresh) arguments_.push('--refresh');
 
