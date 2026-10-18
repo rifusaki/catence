@@ -218,6 +218,74 @@ async function runFlow(origin: string, publicUrl: string, credentials: { usernam
   return { client, tokens, verifier, code };
 }
 
+/**
+ * Serve CIMD documents from a stubbed global fetch. The OAuth app captures
+ * fetch when it is created, so the stub must be installed before
+ * oauthFixture() runs; every other URL still goes to the network.
+ */
+function stubClientIdMetadataDocuments(documents: Record<string, unknown>): () => void {
+  const real = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const document = documents[url];
+    if (document === undefined) return real(input, init);
+    return new Response(JSON.stringify(document), {
+      status: 200,
+      headers: { 'content-type': 'application/json', 'cache-control': 'max-age=300' },
+    });
+  }) as typeof fetch;
+  return () => { globalThis.fetch = real; };
+}
+
+/** authorize -> consent confirm -> code -> token exchange for a CIMD client. */
+async function runCimdFlow(origin: string, publicUrl: string, clientId: string, redirectUri: string): Promise<{ tokens: TokenResponse; verifier: string; code: string }> {
+  const { verifier, challenge } = pkcePair();
+  const authorize = await fetch(authorizeUrl(origin, {
+    clientId,
+    redirectUri,
+    challenge,
+    state: 'st-cimd',
+    scope: 'mcp:tools',
+    resource: `${publicUrl}/mcp`,
+  }), { redirect: 'manual' });
+  expect(authorize.status).toBe(302);
+  expect(new URL(authorize.headers.get('location')!).pathname).toBe('/oauth/consent');
+
+  const confirm = await postForm(`${origin}/oauth/confirm`, {
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state: 'st-cimd',
+    scope: 'mcp:tools',
+    resource: `${publicUrl}/mcp`,
+    username: 'martina',
+    password: MARTINA_PASSWORD,
+  });
+  expect(confirm.status).toBe(302);
+  const callback = new URL(confirm.headers.get('location')!);
+  const code = callback.searchParams.get('code')!;
+  expect(code).toBeTruthy();
+  expect(callback.searchParams.get('state')).toBe('st-cimd');
+  expect(callback.searchParams.get('iss')).toBe(`${new URL(publicUrl).href}`);
+
+  const exchange = await postForm(`${origin}/oauth/token`, {
+    grant_type: 'authorization_code',
+    code,
+    code_verifier: verifier,
+    redirect_uri: redirectUri,
+    resource: `${publicUrl}/mcp`,
+    client_id: clientId,
+  });
+  expect(exchange.status).toBe(200);
+  const tokens = (await exchange.json()) as TokenResponse;
+  expect(tokens).toMatchObject({ token_type: 'bearer', expires_in: 3600, scope: 'mcp:tools' });
+  expect(tokens.access_token).toBeTruthy();
+  expect(tokens.refresh_token).toBeTruthy();
+  return { tokens, verifier, code };
+}
+
 type McpSession = { client: Client; close: () => Promise<void> };
 
 async function mcpSession(origin: string, token: string): Promise<McpSession> {
@@ -360,6 +428,92 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
     expect(forbidden.status).toBe(403);
     const initialize = await postJson(`${origin}/mcp`, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'pkj', version: '0.1.0' } } }, tokens.access_token);
     expect(initialize.status).toBe(200);
+  });
+
+  it('runs the full flow for a Claude-style CIMD client whose document is not rewritten', { timeout: 90_000 }, async () => {
+    // Anthropic's hosted connector: token_endpoint_auth_method "none" and a
+    // jwt-bearer grant in the document. Serving it through a stubbed fetch
+    // exercises the real fetch wrapper end to end: the wrapper reads the
+    // document to decide whether to downgrade private_key_jwt, and when the
+    // body must be handed back untouched it must still be readable (a
+    // consumed stream surfaced as an opaque 500 before).
+    const clientId = 'https://claude.ai/oauth/mcp-oauth-client-metadata';
+    const redirectUri = 'https://claude.ai/api/mcp/auth_callback';
+    const restoreFetch = stubClientIdMetadataDocuments({
+      [clientId]: {
+        client_id: clientId,
+        client_name: 'Claude',
+        client_uri: 'https://claude.ai',
+        redirect_uris: [redirectUri],
+        grant_types: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
+      },
+    });
+    try {
+      const { origin, publicUrl, home } = await oauthFixture();
+      const { tokens } = await runCimdFlow(origin, publicUrl, clientId, redirectUri);
+
+      // The access token is stored and verified under the URL client_id.
+      const roster = await fetch(`${origin}/api/v1/athletes`, { headers: bearer(tokens.access_token) });
+      expect(roster.status).toBe(200);
+
+      // Refresh rotation reads the refresh record under the same URL.
+      const refresh = await postForm(`${origin}/oauth/token`, {
+        grant_type: 'refresh_token',
+        refresh_token: tokens.refresh_token,
+        resource: `${publicUrl}/mcp`,
+        client_id: clientId,
+      });
+      expect(refresh.status).toBe(200);
+      const rotated = (await refresh.json()) as TokenResponse;
+      expect(rotated.access_token).toBeTruthy();
+      expect(rotated.refresh_token).toBeTruthy();
+
+      // The document is cached as-is: no client secret, method none.
+      const cached = JSON.parse(await readFile(path.join(home, 'oauth', 'cimd', `${sha256(clientId)}.json`), 'utf8'));
+      expect(cached.client).toMatchObject({
+        client_id: clientId,
+        client_name: 'Claude',
+        token_endpoint_auth_method: 'none',
+        redirect_uris: [redirectUri],
+      });
+      expect(cached.client.client_secret).toBeUndefined();
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  it('downgrades a private_key_jwt CIMD document and runs the full flow', { timeout: 90_000 }, async () => {
+    // OpenAI's connector publishes the legacy singular preference next to the
+    // plural list. The wrapper rewrites the declaration to "none" before the
+    // library validates and caches the document.
+    const clientId = 'https://chatgpt.com/oauth/client.json';
+    const redirectUri = 'https://chatgpt.com/connector_platform_oauth_redirect';
+    const restoreFetch = stubClientIdMetadataDocuments({
+      [clientId]: {
+        client_id: clientId,
+        client_name: 'ChatGPT',
+        redirect_uris: [redirectUri],
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'private_key_jwt',
+        token_endpoint_auth_methods_supported: ['none', 'private_key_jwt'],
+        jwks_uri: 'https://chatgpt.com/oauth/jwks.json',
+      },
+    });
+    try {
+      const { origin, publicUrl, home } = await oauthFixture();
+      const { tokens } = await runCimdFlow(origin, publicUrl, clientId, redirectUri);
+      const roster = await fetch(`${origin}/api/v1/athletes`, { headers: bearer(tokens.access_token) });
+      expect(roster.status).toBe(200);
+
+      const cached = JSON.parse(await readFile(path.join(home, 'oauth', 'cimd', `${sha256(clientId)}.json`), 'utf8'));
+      expect(cached.client.token_endpoint_auth_method).toBe('none');
+      expect(cached.client.client_secret).toBeUndefined();
+    } finally {
+      restoreFetch();
+    }
   });
 
   it('runs the full flow — register, authorize, consent login, code, token — and enforces the account scope at the gate', { timeout: 90_000 }, async () => {

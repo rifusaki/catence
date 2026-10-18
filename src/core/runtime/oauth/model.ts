@@ -78,8 +78,12 @@ const cimdClientRecordSchema = z.object({
   client_secret_expires_at: z.number().optional(),
 }).strict();
 
+// Codes and tokens are keyed by a hashed secret, never by the client id, and
+// can be issued to either kind of client: a DCR-registered client (UUID) or a
+// client identified by a Client ID Metadata Document (an HTTPS URL). Both are
+// persisted verbatim so the reader must accept both.
 const authorizationCodeRecordSchema = z.object({
-  clientId: uuidSchema,
+  clientId: z.string().min(1),
   userId: z.string(),
   expiresAt: isoTimestampSchema,
   scopes: z.array(z.string()),
@@ -91,7 +95,7 @@ const authorizationCodeRecordSchema = z.object({
 }).strict();
 
 const tokenRecordSchema = z.object({
-  clientId: uuidSchema,
+  clientId: z.string().min(1),
   userId: z.string().optional(),
   expiresAt: isoTimestampSchema,
   scopes: z.array(z.string()),

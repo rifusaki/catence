@@ -49,6 +49,10 @@ export type OAuthAppHandle = {
  * validates and caches the document — PKCE still protects the flow. The
  * rewritten body drops content-length; the library's size guard reads the
  * actual stream anyway.
+ *
+ * Parsing happens on a clone: every passthrough path must hand the library a
+ * response whose body is still readable, and a consumed stream would surface
+ * as an opaque 500 instead of the library's proper OAuth error.
  */
 function sanitizingMetadataFetch(fetchImpl: typeof fetch): typeof fetch {
   return async (input, init) => {
@@ -58,7 +62,7 @@ function sanitizingMetadataFetch(fetchImpl: typeof fetch): typeof fetch {
     if (!contentType.includes('application/json')) return response;
     let document: unknown;
     try {
-      document = JSON.parse(await response.text());
+      document = JSON.parse(await response.clone().text());
     } catch {
       return response;
     }
