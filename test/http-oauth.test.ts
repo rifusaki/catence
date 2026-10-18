@@ -556,14 +556,20 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
       expect(discovered.result.ttlMs).toBe(3_600_000);
       expect(discovered.result.cacheScope).toBe('public');
 
-      // A stateless tools/list with the modern header is bridged and answered.
+      // A stateless tools/list with the modern header is bridged and answered,
+      // reframed with the 2026-07-28 result fields (resultType + caching hints
+      // scoped private because the list varies with the caller's scope).
       const list = await fetch(`${origin}/mcp`, {
         method: 'POST',
         headers: modernHeaders,
         body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
       });
       expect(list.status).toBe(200);
-      expect(await list.text()).toContain('list_athletes');
+      const listBody = await list.text();
+      expect(listBody).toContain('list_athletes');
+      expect(listBody).toContain('"resultType":"complete"');
+      expect(listBody).toContain('"cacheScope":"private"');
+      expect(listBody).toContain('"ttlMs":300000');
 
       // Later dated 2026 revisions bridge the same way.
       const later = await fetch(`${origin}/mcp`, {
@@ -590,7 +596,21 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
         body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/list', params: {} }),
       });
       expect(rootList.status).toBe(200);
-      expect(await rootList.text()).toContain('list_athletes');
+      const rootBody = await rootList.text();
+      expect(rootBody).toContain('list_athletes');
+      expect(rootBody).toContain('"resultType":"complete"');
+
+      // Legacy clients keep the untouched SDK shape: modern framing fields
+      // must not leak into responses that never negotiated the revision.
+      const legacy = await fetch(`${origin}/mcp`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...bearer(tokens.access_token) },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/list', params: {} }),
+      });
+      expect(legacy.status).toBe(200);
+      const legacyBody = await legacy.text();
+      expect(legacyBody).toContain('list_athletes');
+      expect(legacyBody).not.toContain('resultType');
     } finally {
       await session.close();
     }

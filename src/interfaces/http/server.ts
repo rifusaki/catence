@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { timingSafeEqual } from 'node:crypto';
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type OutgoingHttpHeaders, type Server, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from '@modelcontextprotocol/sdk/types.js';
@@ -654,6 +654,130 @@ async function handleUnauthenticatedDiscovery(request: IncomingMessage, response
   return true;
 }
 
+/**
+ * The 2026-07-28 revision frames every completed result with `resultType` and
+ * requires caching hints on cacheable operations (server/discover, tools/list,
+ * prompts/list, resources/list, resources/templates/list, resources/read).
+ * The bundled SDK emits the legacy shape, so responses negotiated under a
+ * dated 2026 revision are rewritten on the way out. List results vary with the
+ * caller's scope, so cacheable responses from this server are always
+ * `private`. Errors and notifications carry no result and pass through.
+ */
+const MODERN_CACHEABLE_METHODS = new Set(['server/discover', 'tools/list', 'prompts/list', 'resources/list', 'resources/templates/list', 'resources/read']);
+const MODERN_RESULT_TTL_MS = 300_000;
+
+/** Rewrite one JSON-RPC payload; null when it carries nothing to change. */
+function frameModernRpcPayload(payload: string, method: string | undefined): string | null {
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(payload);
+  } catch {
+    return null;
+  }
+  if (typeof envelope !== 'object' || envelope === null || Array.isArray(envelope)) return null;
+  const record = envelope as Record<string, unknown>;
+  const result = record.result;
+  if (typeof result !== 'object' || result === null || Array.isArray(result)) return null;
+  const framed: Record<string, unknown> = { ...(result as Record<string, unknown>) };
+  let changed = false;
+  if (!('resultType' in framed)) {
+    framed.resultType = 'complete';
+    changed = true;
+  }
+  if (method !== undefined && MODERN_CACHEABLE_METHODS.has(method)) {
+    if (!('ttlMs' in framed)) {
+      framed.ttlMs = MODERN_RESULT_TTL_MS;
+      changed = true;
+    }
+    if (!('cacheScope' in framed)) {
+      framed.cacheScope = 'private';
+      changed = true;
+    }
+  }
+  return changed ? JSON.stringify({ ...record, result: framed }) : null;
+}
+
+/** Rewrite a whole response body (SSE event stream or plain JSON). */
+function frameModernResponseBody(body: string, contentType: string | undefined, method: string | undefined): string | null {
+  // The adapter hands headers straight to writeHead without caching them, so
+  // the content type may be unreadable here; the body shape is a reliable
+  // fallback (SSE payloads carry `data:` lines, JSON payloads open with `{`).
+  const isEventStream =
+    (contentType !== undefined && contentType.includes('text/event-stream')) ||
+    body.startsWith('event:') ||
+    body.startsWith('data:') ||
+    body.includes('\ndata:');
+  if (isEventStream) {
+    let changed = false;
+    const lines = body.split('\n').map((line) => {
+      if (!line.startsWith('data:')) return line;
+      const framed = frameModernRpcPayload(line.slice('data:'.length).trim(), method);
+      if (framed === null) return line;
+      changed = true;
+      return `data: ${framed}`;
+    });
+    return changed ? lines.join('\n') : null;
+  }
+  if ((contentType !== undefined && contentType.includes('application/json')) || body.trimStart().startsWith('{')) {
+    return frameModernRpcPayload(body, method);
+  }
+  return null;
+}
+
+/**
+ * Buffer the outgoing body so the modern framing is in place before any byte
+ * reaches the socket; bodies that need no rewriting are forwarded verbatim.
+ * The Node adapter may flush headers early for streamed (chunked) responses,
+ * which stays valid because rewritten bodies only ever drop `content-length`
+ * (SSE responses never carry one to begin with).
+ */
+function installModernFraming(response: ServerResponse, method: string | undefined): void {
+  const chunks: Buffer[] = [];
+  const append = (chunk: unknown, encoding?: unknown): void => {
+    if (typeof chunk === 'string') chunks.push(Buffer.from(chunk, typeof encoding === 'string' ? (encoding as BufferEncoding) : 'utf8'));
+    else if (Buffer.isBuffer(chunk)) chunks.push(chunk);
+    else if (chunk instanceof Uint8Array) chunks.push(Buffer.from(chunk));
+    else if (chunk !== undefined && chunk !== null) chunks.push(Buffer.from(String(chunk)));
+  };
+  const originalEnd = response.end.bind(response);
+  const originalWriteHead = response.writeHead.bind(response);
+  // Headers handed straight to writeHead are not cached for getHeader and may
+  // reach the socket immediately, so a computed content-length is dropped
+  // here before any byte leaves the process: the framed body differs in size
+  // and chunked framing is always valid for these responses. (`removeHeader`
+  // is not an option at end time — by then the headers are already sent.)
+  const withoutLength = (value: unknown): unknown => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return value;
+    const copy: Record<string, unknown> = {};
+    for (const [key, headerValue] of Object.entries(value)) {
+      if (key.toLowerCase() !== 'content-length') copy[key] = headerValue;
+    }
+    return copy;
+  };
+  response.writeHead = ((statusCode: number, arg1?: unknown, arg2?: unknown) => {
+    if (typeof arg1 === 'string') return originalWriteHead(statusCode, arg1, withoutLength(arg2) as OutgoingHttpHeaders);
+    return originalWriteHead(statusCode, withoutLength(arg1) as OutgoingHttpHeaders);
+  }) as typeof response.writeHead;
+  response.write = ((chunk: unknown, encodingOrCallback?: unknown): boolean => {
+    append(chunk, encodingOrCallback);
+    if (typeof encodingOrCallback === 'function') queueMicrotask(encodingOrCallback as () => void);
+    return true;
+  }) as typeof response.write;
+  response.end = ((chunk?: unknown, encodingOrCallback?: unknown, callback?: unknown): ServerResponse => {
+    if (response.writableEnded) return response;
+    append(chunk, encodingOrCallback);
+    const done = typeof encodingOrCallback === 'function' ? (encodingOrCallback as () => void) : typeof callback === 'function' ? (callback as () => void) : undefined;
+    const raw = Buffer.concat(chunks);
+    const header = response.getHeader('content-type');
+    const contentType = Array.isArray(header) ? header.join(', ') : header === undefined ? undefined : String(header);
+    const framed = frameModernResponseBody(raw.toString('utf8'), contentType, method);
+    const final = framed === null ? raw : Buffer.from(framed, 'utf8');
+    if (done) originalEnd(final, done);
+    else originalEnd(final);
+    return response;
+  }) as typeof response.end;
+}
+
 async function handleMcpRequest(request: IncomingMessage, response: ServerResponse, paths: CatencePaths | CatalogPaths, principal: CatencePrincipal): Promise<void> {
   if (request.method !== 'POST') {
     methodNotAllowed(response);
@@ -668,7 +792,8 @@ async function handleMcpRequest(request: IncomingMessage, response: ServerRespon
   // the web-standard headers from rawHeaders (not the parsed headers object),
   // so both views are rewritten.
   const requestedVersion = request.headers['mcp-protocol-version'];
-  if (typeof requestedVersion === 'string' && /^2026-\d{2}-\d{2}$/.test(requestedVersion)) {
+  const modernRequest = typeof requestedVersion === 'string' && /^2026-\d{2}-\d{2}$/.test(requestedVersion);
+  if (modernRequest) {
     request.headers['mcp-protocol-version'] = LATEST_PROTOCOL_VERSION;
     const rawHeaders = request.rawHeaders;
     for (let index = 0; index < rawHeaders.length; index += 2) {
@@ -695,6 +820,10 @@ async function handleMcpRequest(request: IncomingMessage, response: ServerRespon
     await writeDiscoveryResult(response, paths, { athleteIds: principal.athleteIds }, jsonRpc.id);
     return;
   }
+
+  // A dated 2026 revision expects the SDK's legacy result shape reframed with
+  // `resultType`/caching fields before it leaves the process.
+  if (modernRequest) installModernFraming(response, jsonRpc?.method);
 
   // The HTTP gate has already authenticated this request; the MCP server
   // re-enforces the principal's athlete scope on every tool and roster.
