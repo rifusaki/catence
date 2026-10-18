@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { CatencePaths } from '../../contracts/runtime.js';
-import { SYNC_STAGES, type SyncProgressSnapshot, type SyncProgressState } from '../../contracts/progress.js';
+import { STALE_RUN_TIMEOUT_MS, SYNC_STAGES, type SyncProgressSnapshot, type SyncProgressState } from '../../contracts/progress.js';
 import { mergeProgress, readRunningProgress } from '../../elt/storage/progress-sidecar.js';
 import type { QueryValues, ReadDataStore } from '../../contracts/storage.js';
 import { sqlString } from './sql.js';
@@ -145,6 +145,11 @@ export class ReadOnlyRepository {
   async progress(): Promise<SyncProgressSnapshot> {
     // Same sequential-read discipline as status(): the shared native
     // connection must not run these small reads concurrently.
+    // A run killed with its container keeps status='running' in the database;
+    // the heartbeat age filter mirrors the sidecar contract and db.syncProgress
+    // so such a run stops reading as active (and stops blocking new syncs)
+    // after the stale-run window.
+    const cutoff = new Date(Date.now() - STALE_RUN_TIMEOUT_MS).toISOString();
     const running = await this.rows<ProgressRow>(`
       SELECT runs.run_id, runs.provider, coalesce(progress.stage, 'starting') AS stage,
         progress.current_step,
@@ -157,8 +162,9 @@ export class ReadOnlyRepository {
       FROM sync_runs AS runs
       LEFT JOIN sync_run_progress AS progress USING (run_id)
       WHERE runs.status = 'running'
+        AND coalesce(progress.heartbeat_at, runs.started_at) > $cutoff
       ORDER BY runs.started_at DESC
-    `);
+    `, { cutoff });
     const recent = await this.rows<ProgressRow>(`
       SELECT run_id, provider, stage, current_step, completed_units, total_units, percent,
         elapsed_seconds, estimated_remaining_seconds,

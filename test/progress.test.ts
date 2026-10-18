@@ -258,6 +258,34 @@ describe('sync run progress sidecars', () => {
       await repository.close();
     }
   });
+
+  it('repository.progress() age-filters a killed database run', async () => {
+    // The read-only reader must apply the same stale-heartbeat cutoff as the
+    // writable one; otherwise a container-killed run reads as "Syncing…"
+    // forever, because nothing sweeps it until a new sync starts.
+    const { paths, database } = await temporaryDatabase();
+    const staleId = await database.beginRun('garmin', '2025-07-30');
+    await database.heartbeatRun(staleId, sampleState(staleId));
+    // heartbeatRun stamps now(); rewind both columns to simulate a run whose
+    // process died a day ago.
+    await database.run(
+      `UPDATE sync_run_progress SET heartbeat_at = heartbeat_at - INTERVAL 1 DAY WHERE run_id = $runId`,
+      { runId: staleId },
+    );
+    await database.run(`UPDATE sync_runs SET started_at = started_at - INTERVAL 1 DAY WHERE run_id = $runId`, {
+      runId: staleId,
+    });
+    await database.close();
+
+    const repository = await openReadOnlyRepository(paths);
+    try {
+      const snapshot = await repository.progress();
+      expect(snapshot.running).toHaveLength(0);
+      expect(snapshot.recent[0]).toMatchObject({ runId: staleId });
+    } finally {
+      await repository.close();
+    }
+  });
 });
 
 describe('ProgressPump', () => {
