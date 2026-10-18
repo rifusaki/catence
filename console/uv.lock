@@ -256,7 +256,7 @@ wheels = [
 
 [[package]]
 name = "catence-console"
-version = "0.2.1b21"
+version = "0.2.1b22"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
