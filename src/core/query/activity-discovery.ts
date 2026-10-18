@@ -7,7 +7,7 @@ export type FindActivitiesRequest = {
   sports?: string[];
   /** Accepted as a convenience alias for `sports: [sport]`. */
   sport?: string;
-  distanceKm?: [number, number];
+  distanceKm?: number[];
   nameContains?: string[];
   startDate?: string;
   endDate?: string;
@@ -52,7 +52,7 @@ function decodeCursor(cursor: string, expectedHash: string): Cursor {
   }
 }
 
-function raceSignals(row: ActivityRow, requestedDistance: [number, number] | undefined): Record<string, unknown> {
+function raceSignals(row: ActivityRow, requestedDistance: number[] | undefined): Record<string, unknown> {
   const name = row.name?.toLowerCase() ?? '';
   const nameSuggestsRace = /\b(race|marathon|half[ -]?marathon|media(?:[ -]?marat[oó]n)?|corrida|competition|10k|5k|hm)\b/i.test(name);
   const distanceKm = row.distance_m === null ? null : row.distance_m / 1_000;

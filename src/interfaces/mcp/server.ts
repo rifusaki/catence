@@ -674,7 +674,11 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     inputSchema: {
       sport: z.string().min(1).optional(),
       sports: z.array(z.string().min(1)).min(1).max(12).optional(),
-      distanceKm: z.tuple([z.number().min(0), z.number().min(0)]).optional(),
+      // Tuple-form `items` is valid draft-07 but strict clients reject it
+      // (ChatGPT's connector validator flagged exactly this as "Invalid MCP
+      // tool schema"). A bounded two-number array keeps the same contract; the
+      // service still enforces the ascending [minimum, maximum] order.
+      distanceKm: z.array(z.number().min(0)).min(2).max(2).optional(),
       nameContains: z.array(z.string().min(1)).min(1).max(12).optional(),
       startDate: z.string().date().optional(), endDate: z.string().date().optional(),
       sort: z.enum(['date_desc', 'date_asc']).optional(), limit: z.number().int().min(1).max(100).optional(), cursor: z.string().min(1).optional(),

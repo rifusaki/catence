@@ -577,6 +577,10 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
       // tool schema has no SDK `execution` field.
       expect(listBody).toContain('"io.modelcontextprotocol/serverInfo"');
       expect(listBody).not.toContain('"execution"');
+      // Strict-client normalizations: no propertyNames keyword and no
+      // tuple-form items survive into the modern tool list.
+      expect(listBody).not.toContain('"propertyNames"');
+      expect(listBody).not.toContain('"items":[');
 
       // Later dated 2026 revisions bridge the same way.
       const later = await fetch(`${origin}/mcp`, {
@@ -619,6 +623,10 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
       expect(legacyBody).toContain('list_athletes');
       expect(legacyBody).not.toContain('resultType');
       expect(legacyBody).toContain('"execution"');
+      // The propertyNames strip is modern-only; the tuple fix is at the
+      // source, so no response carries tuple-form items anymore.
+      expect(legacyBody).toContain('"propertyNames"');
+      expect(legacyBody).not.toContain('"items":[');
     } finally {
       await session.close();
     }
