@@ -155,6 +155,9 @@ function bearerTokenFrom(request: IncomingMessage): string | null {
 function logRequestCompletion(request: IncomingMessage, response: ServerResponse, pathname: string): void {
   if (process.env.CATENCE_HTTP_ACCESS_LOG === '0') return;
   const startedAt = Date.now();
+  // Captured before the compatibility bridge rewrites the header so the log
+  // always shows the value the client actually sent.
+  const rawProtocolVersion = request.headers['mcp-protocol-version'];
   response.once('finish', () => {
     const status = response.statusCode;
     const interesting =
@@ -167,7 +170,7 @@ function logRequestCompletion(request: IncomingMessage, response: ServerResponse
     const parts = [`[http] ${new Date().toISOString()}`, `${request.method} ${pathname}`, String(status), `${Date.now() - startedAt}ms`];
     const userAgent = request.headers['user-agent'];
     if (typeof userAgent === 'string' && userAgent) parts.push(`ua="${userAgent.slice(0, 120)}"`);
-    const protocolVersion = request.headers['mcp-protocol-version'];
+    const protocolVersion = rawProtocolVersion;
     if (typeof protocolVersion === 'string' && protocolVersion) parts.push(`mcp-protocol-version=${protocolVersion}`);
     const mcpMethod = request.headers['mcp-method'];
     if (typeof mcpMethod === 'string' && mcpMethod) parts.push(`mcp-method=${mcpMethod}`);
@@ -661,7 +664,11 @@ async function handleUnauthenticatedDiscovery(request: IncomingMessage, response
  * The bundled SDK emits the legacy shape, so responses negotiated under a
  * dated 2026 revision are rewritten on the way out. List results vary with the
  * caller's scope, so cacheable responses from this server are always
- * `private`. Errors and notifications carry no result and pass through.
+ * `private`. Every result also repeats the server identity in `_meta`, and
+ * tool definitions drop the SDK's `execution` field — neither the per-result
+ * `_meta.serverInfo` nor `execution` appeared in the revision's schemas for
+ * earlier SDKs, but the revision asks for the former and omits the latter.
+ * Errors and notifications carry no result and pass through.
  */
 const MODERN_CACHEABLE_METHODS = new Set(['server/discover', 'tools/list', 'prompts/list', 'resources/list', 'resources/templates/list', 'resources/read']);
 const MODERN_RESULT_TTL_MS = 300_000;
@@ -683,6 +690,24 @@ function frameModernRpcPayload(payload: string, method: string | undefined): str
   if (!('resultType' in framed)) {
     framed.resultType = 'complete';
     changed = true;
+  }
+  if (!('_meta' in framed)) {
+    framed._meta = { 'io.modelcontextprotocol/serverInfo': CATENCE_MCP_SERVER_INFO };
+    changed = true;
+  }
+  if (method === 'tools/list' && Array.isArray(framed.tools)) {
+    let stripped = false;
+    const tools = framed.tools.map((tool) => {
+      if (typeof tool !== 'object' || tool === null || Array.isArray(tool) || !('execution' in tool)) return tool;
+      const copy: Record<string, unknown> = { ...(tool as Record<string, unknown>) };
+      delete copy.execution;
+      stripped = true;
+      return copy;
+    });
+    if (stripped) {
+      framed.tools = tools;
+      changed = true;
+    }
   }
   if (method !== undefined && MODERN_CACHEABLE_METHODS.has(method)) {
     if (!('ttlMs' in framed)) {
@@ -931,7 +956,7 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       // The OAuth endpoints are the auth surface itself: they bypass the gate
       // and CORS entirely and are delegated to the Express sub-app. When OAuth
       // is effectively disabled they answer 404 — no metadata is advertised.
-      if (pathname.startsWith('/.well-known/oauth-') || pathname.startsWith('/oauth/')) {
+      if (pathname.startsWith('/.well-known/oauth-') || pathname.startsWith('/.well-known/openid-configuration') || pathname.startsWith('/oauth/')) {
         const config = effectiveOauth();
         if (config.enabled && config.publicUrl !== undefined) {
           const handle = await getOauthApp(config.publicUrl);

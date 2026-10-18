@@ -570,6 +570,10 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
       expect(listBody).toContain('"resultType":"complete"');
       expect(listBody).toContain('"cacheScope":"private"');
       expect(listBody).toContain('"ttlMs":300000');
+      // The revision asks for the server identity on every result, and its
+      // tool schema has no SDK `execution` field.
+      expect(listBody).toContain('"io.modelcontextprotocol/serverInfo"');
+      expect(listBody).not.toContain('"execution"');
 
       // Later dated 2026 revisions bridge the same way.
       const later = await fetch(`${origin}/mcp`, {
@@ -611,6 +615,7 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
       const legacyBody = await legacy.text();
       expect(legacyBody).toContain('list_athletes');
       expect(legacyBody).not.toContain('resultType');
+      expect(legacyBody).toContain('"execution"');
     } finally {
       await session.close();
     }
@@ -653,6 +658,14 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
       body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
     });
     expect(gated.status).toBe(401);
+
+    // The connector platform probes OIDC-style discovery on every validation
+    // pass; it must answer publicly with the authorization server metadata.
+    const openid = await fetch(`${origin}/.well-known/openid-configuration`);
+    expect(openid.status).toBe(200);
+    const openidBody = (await openid.json()) as { issuer?: unknown; token_endpoint?: unknown };
+    expect(typeof openidBody.issuer).toBe('string');
+    expect(openidBody.token_endpoint).toContain('/oauth/token');
 
     // The root alias answers the same anonymous discovery probe (bare-domain
     // connectors) while other root MCP calls stay behind the gate too.

@@ -129,6 +129,11 @@ export async function createOAuthApp(options: { catalogRoot: string; publicUrl: 
   app.get('/.well-known/oauth-authorization-server', serveMetadata(oauthMetadata));
   app.get('/.well-known/oauth-protected-resource', serveMetadata(protectedResourceMetadata));
   app.get('/.well-known/oauth-protected-resource/mcp', serveMetadata(protectedResourceMetadata));
+  // The connector platform probes OIDC-style discovery on every validation
+  // pass (observed hitting the auth gate as a 401 right after fetching the
+  // RFC 8414 document); answer it publicly with the same metadata.
+  app.get('/.well-known/openid-configuration', serveMetadata(oauthMetadata));
+  app.get('/.well-known/openid-configuration/mcp', serveMetadata(oauthMetadata));
 
   // DCR runs through the library's router, whose own express.json() would
   // re-parse (and reject) an already-consumed stream; parsing here first
