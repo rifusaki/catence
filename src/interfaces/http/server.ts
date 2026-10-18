@@ -145,6 +145,36 @@ function bearerTokenFrom(request: IncomingMessage): string | null {
   return header.slice('Bearer '.length);
 }
 
+/**
+ * One-line diagnostics for the auth and MCP surfaces: gate outcomes and every
+ * /mcp or /oauth exchange are otherwise invisible in container logs. Routine
+ * dashboard polling stays quiet; set CATENCE_HTTP_ACCESS_LOG=0 to disable.
+ * Logs method, path, status, latency, user agent, and the MCP protocol hints —
+ * never headers carrying credentials.
+ */
+function logRequestCompletion(request: IncomingMessage, response: ServerResponse, pathname: string): void {
+  if (process.env.CATENCE_HTTP_ACCESS_LOG === '0') return;
+  const startedAt = Date.now();
+  response.once('finish', () => {
+    const status = response.statusCode;
+    const interesting =
+      pathname === '/mcp' ||
+      pathname.startsWith('/oauth/') ||
+      pathname.startsWith('/.well-known/oauth-') ||
+      status >= 400;
+    if (!interesting) return;
+    const parts = [`[http] ${new Date().toISOString()}`, `${request.method} ${pathname}`, String(status), `${Date.now() - startedAt}ms`];
+    const userAgent = request.headers['user-agent'];
+    if (typeof userAgent === 'string' && userAgent) parts.push(`ua="${userAgent.slice(0, 120)}"`);
+    const protocolVersion = request.headers['mcp-protocol-version'];
+    if (typeof protocolVersion === 'string' && protocolVersion) parts.push(`mcp-protocol-version=${protocolVersion}`);
+    const mcpMethod = request.headers['mcp-method'];
+    if (typeof mcpMethod === 'string' && mcpMethod) parts.push(`mcp-method=${mcpMethod}`);
+    if (pathname === '/mcp') parts.push(`auth=${bearerTokenFrom(request) !== null ? 'bearer' : 'none'}`);
+    console.log(parts.join(' '));
+  });
+}
+
 function matchesLegacyToken(rawToken: string, expected: string): boolean {
   const received = Buffer.from(rawToken);
   const expectedBuffer = Buffer.from(expected);
@@ -578,17 +608,66 @@ function mcpServerCapabilities(server: ReturnType<typeof createCatenceMcpServer>
   return (server.server as unknown as { getCapabilities(): Record<string, unknown> }).getCapabilities();
 }
 
+/**
+ * Answer server/discover from a throwaway scoped server so the descriptor
+ * (capabilities, server identity, instructions) can never drift from what the
+ * initialize response reports. See MODERN_MCP_PROTOCOL_VERSION.
+ */
+async function writeDiscoveryResult(response: ServerResponse, paths: CatencePaths | CatalogPaths, scope: { athleteIds: string[] | 'all' }, id: unknown): Promise<void> {
+  const server = createCatenceMcpServer(paths, {}, { scope });
+  try {
+    json(response, 200, {
+      jsonrpc: '2.0',
+      id: id ?? null,
+      result: {
+        resultType: 'complete',
+        supportedVersions: [MODERN_MCP_PROTOCOL_VERSION, ...SUPPORTED_PROTOCOL_VERSIONS],
+        capabilities: mcpServerCapabilities(server),
+        _meta: { 'io.modelcontextprotocol/serverInfo': CATENCE_MCP_SERVER_INFO },
+        instructions: MCP_INSTRUCTIONS,
+        ttlMs: 3_600_000,
+        cacheScope: 'public',
+      },
+    });
+  } finally {
+    await server.close();
+  }
+}
+
+/**
+ * Hosted connectors may probe server/discover before attaching the bearer
+ * token; the result exposes nothing athlete-scoped, so it is answered ahead
+ * of the 401. Every other unauthenticated /mcp request stays behind the gate.
+ * Returns true when the response was written.
+ */
+async function handleUnauthenticatedDiscovery(request: IncomingMessage, response: ServerResponse, paths: CatencePaths | CatalogPaths): Promise<boolean> {
+  let body: unknown;
+  try {
+    body = await readJsonBody(request);
+  } catch {
+    return false;
+  }
+  const jsonRpc = singleJsonRpcRequest(body);
+  if (jsonRpc?.method !== 'server/discover') return false;
+  await writeDiscoveryResult(response, paths, { athleteIds: 'all' }, jsonRpc.id);
+  return true;
+}
+
 async function handleMcpRequest(request: IncomingMessage, response: ServerResponse, paths: CatencePaths | CatalogPaths, principal: CatencePrincipal): Promise<void> {
   if (request.method !== 'POST') {
     methodNotAllowed(response);
     return;
   }
 
-  // ChatGPT's discovery probe and the requests that follow it carry the
-  // 2026-07-28 revision; the transport understands only the older list. The
-  // Node adapter rebuilds the web-standard headers from rawHeaders (not the
-  // parsed headers object), so both views are rewritten.
-  if (request.headers['mcp-protocol-version'] === MODERN_MCP_PROTOCOL_VERSION) {
+  // ChatGPT's discovery probe and the requests that follow it carry a dated
+  // 2026 MCP revision (2026-07-28 as of today, later revisions as they ship);
+  // the SDK transport understands only its own older list, and the surface
+  // here is stateless either way, so any dated 2026 revision is bridged down
+  // while still-unknown values keep failing closed. The Node adapter rebuilds
+  // the web-standard headers from rawHeaders (not the parsed headers object),
+  // so both views are rewritten.
+  const requestedVersion = request.headers['mcp-protocol-version'];
+  if (typeof requestedVersion === 'string' && /^2026-\d{2}-\d{2}$/.test(requestedVersion)) {
     request.headers['mcp-protocol-version'] = LATEST_PROTOCOL_VERSION;
     const rawHeaders = request.rawHeaders;
     for (let index = 0; index < rawHeaders.length; index += 2) {
@@ -612,24 +691,7 @@ async function handleMcpRequest(request: IncomingMessage, response: ServerRespon
   if (jsonRpc?.method === 'server/discover') {
     // Modern clients probe discovery before anything else; answer from the
     // same descriptor the initialize response reports so the two never drift.
-    const server = createCatenceMcpServer(paths, {}, { scope: { athleteIds: principal.athleteIds } });
-    try {
-      json(response, 200, {
-        jsonrpc: '2.0',
-        id: jsonRpc.id ?? null,
-        result: {
-          resultType: 'complete',
-          supportedVersions: [MODERN_MCP_PROTOCOL_VERSION, ...SUPPORTED_PROTOCOL_VERSIONS],
-          capabilities: mcpServerCapabilities(server),
-          _meta: { 'io.modelcontextprotocol/serverInfo': CATENCE_MCP_SERVER_INFO },
-          instructions: MCP_INSTRUCTIONS,
-          ttlMs: 3_600_000,
-          cacheScope: 'public',
-        },
-      });
-    } finally {
-      await server.close();
-    }
+    await writeDiscoveryResult(response, paths, { athleteIds: principal.athleteIds }, jsonRpc.id);
     return;
   }
 
@@ -734,6 +796,7 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
   return createServer((request, response) => {
     void (async () => {
       const pathname = new URL(request.url ?? '/', 'http://localhost').pathname;
+      logRequestCompletion(request, response, pathname);
 
       // The OAuth endpoints are the auth surface itself: they bypass the gate
       // and CORS entirely and are delegated to the Express sub-app. When OAuth
@@ -765,6 +828,13 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
         ? FULL_ACCESS_PRINCIPAL
         : await resolvePrincipal(request, effectiveOptions, accountPaths);
       if (principal === null) {
+        // A hosted connector may probe server/discover before attaching the
+        // bearer token. The discovery result exposes nothing athlete-scoped,
+        // so that one probe is answered ahead of the 401; every other
+        // unauthenticated /mcp request stays behind the gate.
+        if (pathname === '/mcp' && request.method === 'POST' && await handleUnauthenticatedDiscovery(request, response, catalogPaths ?? staticPaths ?? resolveCatalogPaths())) {
+          return;
+        }
         // A presented-but-rejected token is a bearer problem, not an OAuth
         // discovery problem: answer RFC 6750 invalid_token without
         // resource_metadata, so static-key clients get a clear "your token is

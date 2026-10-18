@@ -565,6 +565,14 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
       expect(list.status).toBe(200);
       expect(await list.text()).toContain('list_athletes');
 
+      // Later dated 2026 revisions bridge the same way.
+      const later = await fetch(`${origin}/mcp`, {
+        method: 'POST',
+        headers: { ...modernHeaders, 'mcp-protocol-version': '2026-10-01' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} }),
+      });
+      expect(later.status).toBe(200);
+
       // Versions outside the bridge keep failing closed.
       const unsupported = await fetch(`${origin}/mcp`, {
         method: 'POST',
@@ -575,6 +583,45 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
     } finally {
       await session.close();
     }
+  });
+
+  it('answers an unauthenticated server/discover probe while other MCP calls stay gated', { timeout: 90_000 }, async () => {
+    // ChatGPT may probe discovery before attaching the bearer token; the
+    // probe reveals only server identity, so it is answered anonymously
+    // while every other unauthenticated /mcp call keeps the 401 gate.
+    const { origin } = await oauthFixture();
+    const probe = await fetch(`${origin}/mcp`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'mcp-protocol-version': '2026-07-28',
+        'mcp-method': 'server/discover',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'openai-mcp-discover',
+        method: 'server/discover',
+        params: { _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } },
+      }),
+    });
+    expect(probe.status).toBe(200);
+    const discovered = (await probe.json()) as { id: unknown; result: Record<string, any> };
+    expect(discovered.id).toBe('openai-mcp-discover');
+    expect(discovered.result.resultType).toBe('complete');
+    expect(discovered.result.supportedVersions[0]).toBe('2026-07-28');
+    expect(discovered.result._meta['io.modelcontextprotocol/serverInfo']).toMatchObject({ name: 'catence' });
+
+    const gated = await fetch(`${origin}/mcp`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'mcp-protocol-version': '2026-07-28',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+    });
+    expect(gated.status).toBe(401);
   });
 
   it('runs the full flow — register, authorize, consent login, code, token — and enforces the account scope at the gate', { timeout: 90_000 }, async () => {
