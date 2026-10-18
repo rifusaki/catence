@@ -853,7 +853,11 @@ async function handleMcpRequest(request: IncomingMessage, response: ServerRespon
   // The HTTP gate has already authenticated this request; the MCP server
   // re-enforces the principal's athlete scope on every tool and roster.
   const server = createCatenceMcpServer(paths, {}, { scope: { athleteIds: principal.athleteIds } });
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  // JSON responses mirror OpenAI's own reference implementation: a single
+  // request/response has no need for a stream, and a JSON body survives
+  // validators (and intermediaries) that would mishandle an SSE frame. The
+  // spec requires clients to accept both, so this stays compatible.
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   let cleanedUp = false;
   const cleanup = async () => {
     if (cleanedUp) return;

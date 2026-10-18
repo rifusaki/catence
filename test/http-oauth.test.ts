@@ -565,6 +565,9 @@ describe('OAuth 2.1 authorization server over HTTP', () => {
         body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
       });
       expect(list.status).toBe(200);
+      // JSON responses (like OpenAI's own reference server) survive validators
+      // that would mishandle an SSE frame.
+      expect(list.headers.get('content-type') ?? '').toContain('application/json');
       const listBody = await list.text();
       expect(listBody).toContain('list_athletes');
       expect(listBody).toContain('"resultType":"complete"');
