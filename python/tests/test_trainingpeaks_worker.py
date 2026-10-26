@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import json
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from python.catence.providers.trainingpeaks.registry import TP_READ_ENDPOINTS, assert_read_only_registry
+from python.catence.providers.trainingpeaks.staging import StagingWriter
+from python.catence.providers.trainingpeaks.worker import (
+    AUTH_EXPIRED_ERROR,
+    TrainingPeaksStagingWorker,
+    payload_day,
+    structure_summary,
+    workout_remote_id,
+    zone_setting_payloads,
+)
+
+RUN_ID = "00000000-0000-4000-8000-000000000000"
+
+
+class FakeResponse:
+    def __init__(self, data: Any = None, error_code: str | None = None, message: str | None = None) -> None:
+        self.data = data
+        self.is_error = error_code is not None
+        self.error_code = error_code
+        self.message = message
+
+
+class FakeClient:
+    """Only the surface the worker is allowed to call; anything else raises."""
+
+    def __init__(self, athlete_id: int = 4242, responses: dict[str, FakeResponse] | None = None) -> None:
+        self.athlete_id = athlete_id
+        self.responses = responses or {}
+        self.calls: list[str] = []
+
+    def ensure_athlete_id(self) -> int | None:
+        return self.athlete_id
+
+    def get(self, endpoint: str) -> FakeResponse:
+        self.calls.append(endpoint)
+        for prefix, response in self.responses.items():
+            if endpoint.startswith(prefix):
+                return response
+        return FakeResponse(data={})
+
+
+def read_records(output: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def make_writer(tmp_path: Path) -> StagingWriter:
+    output = tmp_path / "staging" / "trainingpeaks" / f"{RUN_ID}.jsonl"
+    writer = StagingWriter(tmp_path, output)
+    writer.manifest(RUN_ID, "2026-03-01")
+    return writer
+
+
+def test_registry_is_read_only_and_covers_only_phase_one_families() -> None:
+    assert_read_only_registry()
+    assert set(TP_READ_ENDPOINTS) == {"planned_workouts", "zones", "athlete_settings"}
+
+
+def test_planned_workouts_are_staged_with_raw_archive(tmp_path: Path) -> None:
+    client = FakeClient(responses={
+        "/fitness/v6/athletes/4242/workouts": FakeResponse(data=[
+            {"workoutId": 101, "workoutDay": "2026-03-02", "title": "Threshold", "description": "4x8",
+             "sport": "Bike", "workoutTypeId": 2, "durationPlanned": 5400, "distancePlanned": 30000,
+             "tssPlanned": 85, "ifPlanned": 0.92, "structure": {"blocks": [{"type": "Warmup", "totalDuration": 600}]},
+             "coachComments": [{"comment": "go"}], "athleteComments": []},
+        ]),
+    })
+    writer = make_writer(tmp_path)
+    worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
+    worker.sync(date(2026, 3, 1))
+    records = read_records(writer.output)
+    kinds = {record["kind"] for record in records}
+    assert "run_manifest" in kinds
+    assert "raw_object" in kinds
+    entities = [record for record in records if record["kind"] == "source_entity"]
+    planned = [record for record in entities if record["entityType"] == "planned_workout"]
+    assert len(planned) == 1
+    assert planned[0]["remoteId"] == "101"
+    assert planned[0]["occurredOn"] == "2026-03-02"
+    assert planned[0]["provider"] == "trainingpeaks"
+    assert planned[0]["payload"]["tssPlanned"] == 85
+    profile = [record for record in entities if record["entityType"] == "profile"]
+    assert len(profile) == 1
+
+
+def test_zone_settings_fan_out_per_metric_group(tmp_path: Path) -> None:
+    settings = {
+        "power": [{"workoutTypeId": 2, "threshold": 260, "calculationMethod": "PercentOfThreshold", "zones": [{"minimum": 0, "maximum": 150}]}],
+        "heartrate": [{"workoutTypeId": 2, "threshold": 168, "zones": [{"minimum": 0, "maximum": 140}]}],
+        "speed": [{"workoutTypeId": 3, "threshold": 4.2, "zones": [{"minimum": 0, "maximum": 3.0}]}],
+    }
+    client = FakeClient(responses={"/fitness/v1/athletes/4242/settings": FakeResponse(data=settings)})
+    writer = make_writer(tmp_path)
+    worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
+    worker.sync(date(2026, 3, 1))
+    entities = [record for record in read_records(writer.output) if record["kind"] == "source_entity"]
+    zones = [record for record in entities if record["entityType"] == "zone_setting"]
+    assert sorted(record["remoteId"] for record in zones) == ["2:heartrate", "2:power", "3:speed"]
+    for zone in zones:
+        assert zone["payload"]["threshold"] is not None
+
+
+def test_expired_cookie_maps_to_actionable_error(tmp_path: Path) -> None:
+    client = FakeClient(responses={
+        "/users/v3/user": FakeResponse(data={"user": {"personId": 4242}}),
+        "/fitness/v1/athletes/4242/settings": FakeResponse(error_code="AUTH_EXPIRED", message="Cookie expired"),
+        "/fitness/v6/athletes/4242/workouts": FakeResponse(error_code="AUTH_EXPIRED", message="Cookie expired"),
+    })
+    writer = make_writer(tmp_path)
+    worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
+    worker.sync(date(2026, 3, 1))
+    errors = [record for record in read_records(writer.output) if record["kind"] == "extraction_error"]
+    assert len(errors) == 2
+    for error in errors:
+        assert error["retryable"] is False
+        assert AUTH_EXPIRED_ERROR in error["message"]
+
+
+def test_failed_zone_family_does_not_block_planned_workouts(tmp_path: Path) -> None:
+    client = FakeClient(responses={
+        "/fitness/v1/athletes/4242/settings": FakeResponse(error_code="API_ERROR", message="route changed"),
+        "/fitness/v6/athletes/4242/workouts": FakeResponse(data=[{"workoutId": 7, "workoutDay": "2026-03-03"}]),
+    })
+    writer = make_writer(tmp_path)
+    worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
+    worker.sync(date(2026, 3, 1))
+    records = read_records(writer.output)
+    entities = [record for record in records if record["kind"] == "source_entity"]
+    assert any(record["entityType"] == "planned_workout" for record in entities)
+    errors = [record for record in records if record["kind"] == "extraction_error"]
+    assert len(errors) == 1
+    assert errors[0]["endpoint"] == "settings"
+
+
+def test_cookie_never_enters_staging(tmp_path: Path) -> None:
+    secret_cookie = "super-secret-cookie-value"
+    client = FakeClient(responses={"/fitness/v6/athletes/4242/workouts": FakeResponse(data=[{"workoutId": 1}])})
+    writer = make_writer(tmp_path)
+    worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
+    worker.sync(date(2026, 3, 1))
+    staging_text = writer.output.read_text(encoding="utf-8")
+    assert secret_cookie not in staging_text
+    for archive in (tmp_path / "raw" / "trainingpeaks").rglob("*.json"):
+        assert secret_cookie not in archive.read_text(encoding="utf-8")
+
+
+def test_planned_workout_window_defaults_to_today_plus_14_days(tmp_path: Path) -> None:
+    client = FakeClient()
+    writer = make_writer(tmp_path)
+    worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
+    worker.sync(date(2026, 3, 1))
+    assert any(call == "/fitness/v6/athletes/4242/workouts/2026-03-01/2026-03-15" for call in client.calls)
+
+
+def test_helpers() -> None:
+    assert payload_day({"workoutDay": "2026-03-02T10:00:00"}) == "2026-03-02"
+    assert workout_remote_id({"workoutId": 5}, "fallback") == "5"
+    assert workout_remote_id({"title": "x"}, "fallback") == "fallback"
+    assert structure_summary({"structure": {"blocks": [{"type": "Warmup", "totalDuration": 600}]}}) == [
+        {"type": "Warmup", "repeatCount": None, "totalDuration": 600, "totalDistance": None},
+    ]
+    assert zone_setting_payloads({"settings": {}}) == []
