@@ -8,6 +8,7 @@ const secretSchema = z.object({
   garmin: z.object({ email: z.string().min(1).optional(), password: z.string().min(1).optional() }).strict().optional(),
   intervals: z.object({ apiKey: z.string().min(1).optional(), athleteId: z.string().min(1).optional() }).strict().optional(),
   strava: z.object({ clientId: z.string().min(1).optional(), clientSecret: z.string().min(1).optional() }).strict().optional(),
+  trainingpeaks: z.object({ authCookie: z.string().min(1).optional() }).strict().optional(),
 }).strict();
 
 export type AthleteSecrets = z.infer<typeof secretSchema>;
@@ -17,15 +18,17 @@ const secretFields = {
   garmin: ['email', 'password'],
   intervals: ['apiKey', 'athleteId'],
   strava: ['clientId', 'clientSecret'],
+  trainingpeaks: ['authCookie'],
 } as const;
 
-const secretProviderOrder: readonly SecretProvider[] = ['garmin', 'intervals', 'strava'];
+const secretProviderOrder: readonly SecretProvider[] = ['garmin', 'intervals', 'strava', 'trainingpeaks'];
 
 /** Display labels for the Console credentials editor. */
 export const secretProviderLabels: Record<SecretProvider, string> = {
   garmin: 'Garmin',
   intervals: 'Intervals.icu',
   strava: 'Strava',
+  trainingpeaks: 'TrainingPeaks',
 };
 
 export type SecretFieldDescription = {
@@ -143,7 +146,7 @@ export async function athleteProviderEnvironment(paths: CatencePaths, base: Node
   // athlete store that has not explicitly configured that provider, unless
   // the operator has opted in via CATENCE_ALLOW_ENV_SECRETS or is using a
   // per-athlete scoped variable (CATENCE_ATHLETE_<ID>_GARMIN_EMAIL etc.).
-  for (const name of ['GARMIN_EMAIL', 'GARMIN_PASSWORD', 'INTERVALS_API_KEY', 'INTERVALS_ATHLETE_ID', 'STRAVA_CLIENT_ID', 'STRAVA_CLIENT_SECRET']) {
+  for (const name of ['GARMIN_EMAIL', 'GARMIN_PASSWORD', 'INTERVALS_API_KEY', 'INTERVALS_ATHLETE_ID', 'STRAVA_CLIENT_ID', 'STRAVA_CLIENT_SECRET', 'TP_AUTH_COOKIE']) {
     delete environment[name];
   }
   const garminEmail = resolveWithEnvFallback(secrets.garmin?.email, 'GARMIN_EMAIL', perAthletePrefix, base, allowGenericEnv);
@@ -152,11 +155,13 @@ export async function athleteProviderEnvironment(paths: CatencePaths, base: Node
   const intervalsAthleteId = resolveWithEnvFallback(secrets.intervals?.athleteId, 'INTERVALS_ATHLETE_ID', perAthletePrefix, base, allowGenericEnv);
   const stravaClientId = resolveWithEnvFallback(secrets.strava?.clientId, 'STRAVA_CLIENT_ID', perAthletePrefix, base, allowGenericEnv);
   const stravaClientSecret = resolveWithEnvFallback(secrets.strava?.clientSecret, 'STRAVA_CLIENT_SECRET', perAthletePrefix, base, allowGenericEnv);
+  const trainingpeaksAuthCookie = resolveWithEnvFallback(secrets.trainingpeaks?.authCookie, 'TP_AUTH_COOKIE', perAthletePrefix, base, allowGenericEnv);
   if (garminEmail) environment.GARMIN_EMAIL = garminEmail;
   if (garminPassword) environment.GARMIN_PASSWORD = garminPassword;
   if (intervalsApiKey) environment.INTERVALS_API_KEY = intervalsApiKey;
   if (intervalsAthleteId) environment.INTERVALS_ATHLETE_ID = intervalsAthleteId;
   if (stravaClientId) environment.STRAVA_CLIENT_ID = stravaClientId;
   if (stravaClientSecret) environment.STRAVA_CLIENT_SECRET = stravaClientSecret;
+  if (trainingpeaksAuthCookie) environment.TP_AUTH_COOKIE = trainingpeaksAuthCookie;
   return environment;
 }

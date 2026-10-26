@@ -7,7 +7,7 @@ import type { CatencePaths } from '../../contracts/runtime.js';
 import { STALE_RUN_TIMEOUT_MS } from '../../contracts/progress.js';
 import { syncProgress } from './management.js';
 
-export const DETACHED_SYNC_PROVIDERS = ['intervals', 'garmin', 'strava', 'all'] as const;
+export const DETACHED_SYNC_PROVIDERS = ['intervals', 'garmin', 'strava', 'trainingpeaks', 'all'] as const;
 export type DetachedSyncProvider = (typeof DETACHED_SYNC_PROVIDERS)[number];
 
 export type DetachedSyncRequest = {
@@ -79,7 +79,7 @@ function assertValidRequest(request: DetachedSyncRequest): void {
     throw new Error('athleteId is required and must be a lowercase athlete identifier.');
   }
   if (request.provider !== undefined && !DETACHED_SYNC_PROVIDERS.includes(request.provider)) {
-    throw new Error('provider must be intervals, garmin, strava, or all.');
+    throw new Error('provider must be intervals, garmin, strava, trainingpeaks, or all.');
   }
   if (request.from !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(request.from)) {
     throw new Error('from must use YYYY-MM-DD.');

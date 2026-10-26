@@ -85,7 +85,21 @@ export const stravaReadRegistry = registry('strava', [
   ['segment', 'child', 'segment'], ['segment_efforts', 'child', 'segment_effort'],
 ] as const);
 
-export const allReadOnlyEndpoints = [...intervalsReadRegistry, ...garminReadRegistry, ...stravaReadRegistry] as const;
+/**
+ * TrainingPeaks is a companion provider in the Intervals role: planned-workout
+ * and coach-entered zone/threshold provenance. Completed activities stay with
+ * Garmin; TP zone rows are never merged with Garmin's device-detected values.
+ */
+export const trainingpeaksReadRegistry = registry('trainingpeaks', [
+  ['planned_workouts', 'date_range', 'planned_workout'],
+  ['zones', 'collection', 'zone_setting'],
+  ['athlete_settings', 'singleton', 'profile'],
+] as const);
+
+/** How far ahead of today the planned-workout window reaches. */
+export const TRAININGPEAKS_PLANNED_DAYS_AHEAD = 14;
+
+export const allReadOnlyEndpoints = [...intervalsReadRegistry, ...garminReadRegistry, ...stravaReadRegistry, ...trainingpeaksReadRegistry] as const;
 
 export function assertReadOnlyRegistry(): void {
   for (const endpoint of allReadOnlyEndpoints) {

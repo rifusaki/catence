@@ -392,7 +392,7 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     description:
       'Write-only sync trigger, named like the other explicit lock-guarded write tools. Spawns one detached catence-data sync process for this athlete and returns immediately with the run handle and log file; it refuses while another sync run is active. Track the run with catence_sync_progress; this tool never waits for completion. Pass backfill with a from date to extend history backwards without advancing the incremental cursors (from is required when backfill is set).',
     inputSchema: {
-      provider: z.enum(['intervals', 'garmin', 'strava', 'all']).optional(),
+      provider: z.enum(['intervals', 'garmin', 'strava', 'trainingpeaks', 'all']).optional(),
       from: z.string().date().optional(),
       refresh: z.boolean().optional(),
       backfill: z.boolean().optional(),
