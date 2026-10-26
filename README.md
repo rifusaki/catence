@@ -11,6 +11,7 @@ As a context, I'm both an endurance athlete and a data junkie. I already got a c
 ## What is included
 
 - Garmin, Intervals.icu, and Strava ingestion with source-aware normalization.
+- Intervals.icu-derived fitness (daily CTL, ATL, TSB, ramp rate) is ingested and queryable through the catalog with explicit Intervals provenance; Garmin remains the source of record for activity detail and its own load numbers.
 - Read-only MCP tools, plus explicitly named, lock-guarded write tools for Strava hydration and detached syncs.
 - One Catence MCP server serves several athlete stores side by side. Every personal-data MCP call names an `athleteId`; tools act only on that store and never merge athletes implicitly. The MCP server does not authenticate callers — it trusts the `athleteId` each call names.
 - A password-protected Chainlit Console with an authenticated dashboard, a data-sync button with live progress, and in-app model management.

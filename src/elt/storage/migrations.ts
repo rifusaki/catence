@@ -1030,5 +1030,38 @@ const runDynamicsFactsMigration: Migration = {
   `,
 };
 
-export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration, syncRunProgressMigration, canonicalTrainingDerivedAvgPowerMigration, courseGeometryMigration, activityDecouplingFactsMigration, runDynamicsFactsMigration];
 export type { Migration };
+
+const intervalsFitnessTrendMigration: Migration = {
+  version: 19,
+  name: 'intervals_fitness_trend',
+  sql: `
+    -- Catalog exposure for Intervals-derived daily CTL/ATL/TSB (plus ramp
+    -- rate and daily load). The values are stored verbatim in daily_metrics
+    -- as provider observations; this view pivots them into one row per
+    -- provider/date so the catalog can serve them with explicit Intervals
+    -- provenance. Catence never recomputes these numbers.
+    CREATE TABLE IF NOT EXISTS daily_metrics (
+      provider VARCHAR NOT NULL,
+      metric_date DATE NOT NULL,
+      metric_name VARCHAR NOT NULL,
+      value_number DOUBLE,
+      value_text VARCHAR,
+      unit VARCHAR,
+      raw_object_hash VARCHAR,
+      PRIMARY KEY (provider, metric_date, metric_name)
+    );
+    CREATE OR REPLACE VIEW fitness_trend AS
+    SELECT provider, metric_date,
+      max(value_number) FILTER (WHERE metric_name = 'ctl') AS ctl,
+      max(value_number) FILTER (WHERE metric_name = 'atl') AS atl,
+      max(value_number) FILTER (WHERE metric_name = 'tsb') AS tsb,
+      max(value_number) FILTER (WHERE metric_name = 'ramp_rate') AS ramp_rate,
+      max(value_number) FILTER (WHERE metric_name = 'fitness_load') AS fitness_load
+    FROM daily_metrics
+    WHERE metric_name IN ('ctl', 'atl', 'tsb', 'ramp_rate', 'fitness_load')
+    GROUP BY provider, metric_date;
+  `,
+};
+
+export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration, syncRunProgressMigration, canonicalTrainingDerivedAvgPowerMigration, courseGeometryMigration, activityDecouplingFactsMigration, runDynamicsFactsMigration, intervalsFitnessTrendMigration];

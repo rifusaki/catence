@@ -294,6 +294,7 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
   }
   if (entity.entityType === 'wellness' || entity.entityType === 'daily_health') await importDailyMetrics(database, entity.provider, entity.remoteId, entity.occurredOn, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'body_composition') await importGarminWeight(database, entity.occurredOn, payload, rawHash);
+  if (entity.provider === 'intervals' && entity.entityType === 'fitness_summary') await importIntervalsFitnessSummary(database, entity.remoteId, entity.occurredOn, payload, rawHash);
   if (entity.entityType === 'nutrition_day' || entity.entityType === 'nutrition_log') await importNutrition(database, entity.provider, entity.occurredOn, entity.remoteId, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'training_metric') await importGarminCyclingFtp(database, entity.remoteId, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'lactate_threshold') await importGarminLactateThreshold(database, entity.remoteId, payload, rawHash);
@@ -1183,6 +1184,29 @@ async function importGarminWeight(database: CatenceDatabase, date: string | null
   }
   for (const [metricDate, { kg }] of latestByDay) {
     await upsertDailyMetric(database, 'garmin', metricDate, 'weight_kg', kg, null, 'kg', rawHash);
+  }
+}
+
+// Intervals-derived PMC values. The provider computes these (post-activity
+// snapshots in activity_summary and rolling daily values in fitness); Catence
+// stores them verbatim as provider observations, never recomputed, and keeps
+// the Intervals provenance explicit so a coach-entered or Garmin value is
+// never conflated with them.
+const intervalsFitnessMetricMap: Array<{ name: string; unit: string; keys: string[] }> = [
+  { name: 'ctl', unit: 'tss/d', keys: ['icu_ctl', 'ctl'] },
+  { name: 'atl', unit: 'tss/d', keys: ['icu_atl', 'atl'] },
+  { name: 'tsb', unit: 'tss', keys: ['icu_tsb', 'tsb'] },
+  { name: 'ramp_rate', unit: 'tss/d/week', keys: ['icu_ramp_rate', 'ramp_rate', 'rampRate'] },
+  { name: 'fitness_load', unit: 'tss', keys: ['icu_training_load', 'training_load'] },
+];
+
+async function importIntervalsFitnessSummary(database: CatenceDatabase, remoteId: string, date: string | null, payload: JsonObject, rawHash: string | null): Promise<void> {
+  const metricDate = datePart(date) ?? datePart(firstString(payload, ['id', 'date', 'start_date_local', 'start_date'])) ?? null;
+  if (!metricDate) return;
+  for (const metric of intervalsFitnessMetricMap) {
+    const value = firstNumber(payload, metric.keys);
+    if (value === null) continue;
+    await upsertDailyMetric(database, 'intervals', metricDate, metric.name, value, null, metric.unit, rawHash);
   }
 }
 
