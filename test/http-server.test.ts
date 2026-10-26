@@ -225,6 +225,7 @@ describe('Catence Streamable HTTP server', () => {
         { id: 'garmin', label: 'Garmin', fields: [{ name: 'email', configured: false }, { name: 'password', configured: false }] },
         { id: 'intervals', label: 'Intervals.icu' },
         { id: 'strava', label: 'Strava' },
+        { id: 'trainingpeaks', label: 'TrainingPeaks' },
       ],
     });
 
