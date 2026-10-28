@@ -10,7 +10,8 @@ As a context, I'm both an endurance athlete and a data junkie. I already got a c
 
 ## What is included
 
-- Garmin, Intervals.icu, and Strava ingestion with source-aware normalization.
+- Garmin, Intervals.icu, Strava, and read-only TrainingPeaks ingestion (planned workouts + coach-entered zones) with source-aware normalization.
+- Intervals.icu-derived fitness (daily CTL, ATL, TSB, ramp rate) is ingested and queryable through the catalog with explicit Intervals provenance; Garmin remains the source of record for activity detail and its own load numbers.
 - Read-only MCP tools, plus explicitly named, lock-guarded write tools for Strava hydration and detached syncs.
 - One Catence MCP server serves several athlete stores side by side. Every personal-data MCP call names an `athleteId`; tools act only on that store and never merge athletes implicitly. The MCP server does not authenticate callers — it trusts the `athleteId` each call names.
 - A password-protected Chainlit Console with an authenticated dashboard, a data-sync button with live progress, and in-app model management.
@@ -42,7 +43,10 @@ printf %s 'alex@example.com' | catence-data --athlete alex secret set --provider
 printf %s 'your-garmin-password' | catence-data --athlete alex secret set --provider garmin --field password --value-stdin
 printf %s 'intervals-api-key' | catence-data --athlete alex secret set --provider intervals --field apiKey --value-stdin
 printf %s '12345' | catence-data --athlete alex secret set --provider intervals --field athleteId --value-stdin
+printf %s '<production-tpauth-cookie-value>' | catence-data --athlete alex secret set --provider trainingpeaks --field authCookie --value-stdin
 ```
+
+TrainingPeaks is a read-only companion provider for planned workouts (next 14 days) and coach-entered zones/thresholds; the `Production_tpAuth` browser cookie expires every few weeks and needs a re-paste. See [docs/providers-trainingpeaks.md](docs/providers-trainingpeaks.md).
 
 Sync and create retrieval context:
 

@@ -32,6 +32,7 @@ describe('athlete provider secrets', () => {
       { id: 'garmin', label: 'Garmin', fields: [{ name: 'email', configured: false }, { name: 'password', configured: false }] },
       { id: 'intervals', label: 'Intervals.icu', fields: [{ name: 'apiKey', configured: false }, { name: 'athleteId', configured: false }] },
       { id: 'strava', label: 'Strava', fields: [{ name: 'clientId', configured: false }, { name: 'clientSecret', configured: false }] },
+      { id: 'trainingpeaks', label: 'TrainingPeaks', fields: [{ name: 'authCookie', configured: false }] },
     ]);
 
     await setAthleteSecret(paths, 'garmin', 'email', 'athlete@example.test');

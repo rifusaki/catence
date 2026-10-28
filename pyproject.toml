@@ -11,11 +11,14 @@ dependencies = [
   "pyarrow>=18.0.0",
   "pydantic>=2.0.0",
   "stravalib>=2.5.0",
+  "tp-mcp>=3.2.0",
 ]
 
 [tool.uv.sources]
 # fork commit
 garminconnect = { git = "https://github.com/rifusaki/python-garminconnect.git", rev = "38b3d5003ae348de384f679976d0527316775f94" }
+# fork commit (trainingpeaks-mcp-core): client/auth core only, consumed like python-garminconnect
+tp-mcp = { git = "https://github.com/rifusaki/trainingpeaks-mcp-core.git", rev = "ec883a697c77f6864a4849539729eff2daac646e" }
 
 [tool.uv]
 package = false

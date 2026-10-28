@@ -102,6 +102,11 @@ export class IntervalsExtractor {
           // detail, files, streams, and structured activity data.
           await this.database.recordActivitySyncState('intervals', activityId, summaryHash, runId, false);
         }
+        // The same payload also carries the rolling daily PMC numbers
+        // (icu_ctl/icu_atl/...) embedded per activity; there is no separate
+        // fitness endpoint. Fan them out as fitness_summary entities so the
+        // normalizer can store the day's provider-reported CTL/ATL/load.
+        await this.importEntities('fitness_summary', 'activities', payload, null, runId);
       }
     }
   }

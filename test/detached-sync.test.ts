@@ -127,7 +127,7 @@ describe('startDetachedSync', () => {
   it('validates provider and date inputs before touching the filesystem', async () => {
     const paths = await temporaryStore();
     const { spawn, captures } = fakeSpawner();
-    await expect(startDetachedSync({ paths, athleteId: 'alex', provider: 'nope' as never }, { spawnProcess: spawn })).rejects.toThrow('provider must be intervals, garmin, strava, or all.');
+    await expect(startDetachedSync({ paths, athleteId: 'alex', provider: 'nope' as never }, { spawnProcess: spawn })).rejects.toThrow('provider must be intervals, garmin, strava, trainingpeaks, or all.');
     await expect(startDetachedSync({ paths, athleteId: 'alex', from: '01-07-2026' }, { spawnProcess: spawn })).rejects.toThrow('from must use YYYY-MM-DD.');
     await expect(startDetachedSync({ paths, athleteId: 'Not Valid' }, { spawnProcess: spawn })).rejects.toThrow('athleteId is required');
     // The CLI's backfill subcommand requires --from; enforce it before spawn.

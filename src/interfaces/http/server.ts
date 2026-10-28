@@ -504,7 +504,7 @@ function parseSyncBody(body: unknown): SyncRequestBody {
   }
   if (raw.athleteId !== undefined && typeof raw.athleteId !== 'string') throw new Error('athleteId must be a string.');
   if (raw.provider !== undefined && (typeof raw.provider !== 'string' || !DETACHED_SYNC_PROVIDERS.includes(raw.provider as never))) {
-    throw new Error('provider must be intervals, garmin, strava, or all.');
+    throw new Error('provider must be intervals, garmin, strava, trainingpeaks, or all.');
   }
   if (raw.from !== undefined && (typeof raw.from !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(raw.from))) {
     throw new Error('from must use YYYY-MM-DD.');

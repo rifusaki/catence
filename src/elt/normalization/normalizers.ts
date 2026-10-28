@@ -294,6 +294,7 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
   }
   if (entity.entityType === 'wellness' || entity.entityType === 'daily_health') await importDailyMetrics(database, entity.provider, entity.remoteId, entity.occurredOn, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'body_composition') await importGarminWeight(database, entity.occurredOn, payload, rawHash);
+  if (entity.provider === 'intervals' && entity.entityType === 'fitness_summary') await importIntervalsFitnessSummary(database, entity.remoteId, entity.occurredOn, payload, rawHash);
   if (entity.entityType === 'nutrition_day' || entity.entityType === 'nutrition_log') await importNutrition(database, entity.provider, entity.occurredOn, entity.remoteId, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'training_metric') await importGarminCyclingFtp(database, entity.remoteId, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'lactate_threshold') await importGarminLactateThreshold(database, entity.remoteId, payload, rawHash);
@@ -305,6 +306,53 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
   if (entity.provider === 'garmin' && entity.entityType === 'health_event') await importHealthSession(database, entity.remoteId, entity.occurredOn, 'daily_event', payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'activity_power_best') await importActivityPowerBest(database, entity.parentRemoteId, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'course') await importGarminCourse(database, entity.remoteId, payload, rawHash);
+  if (entity.provider === 'trainingpeaks' && entity.entityType === 'zone_setting') await importTrainingPeaksZoneSetting(database, entity.remoteId, entity.occurredOn, payload, rawHash);
+  if (entity.provider === 'trainingpeaks' && entity.entityType === 'planned_workout') await importTrainingPeaksPlannedWorkout(database, entity.remoteId, entity.occurredOn, payload, rawHash);
+}
+
+// TrainingPeaks zone settings are coach-manual-data provenance. Each metric
+// group (power/HR/pace per workout type) becomes training_metric_observations
+// rows with an explicit trainingpeaks source_type. They are NEVER merged with
+// or preferred over Garmin's device-detected values: the query layer presents
+// both with provenance (neither is preferred), exactly like the daily_health
+// fallback rule except that here both sources stay visible.
+async function importTrainingPeaksZoneSetting(database: CatenceDatabase, remoteId: string, occurredOn: string | null, payload: JsonObject, rawHash: string | null): Promise<void> {
+  const [workoutTypeId, metricKey] = remoteId.split(':');
+  const threshold = firstNumber(payload, ['threshold']);
+  const observedAt = `${datePart(occurredOn) ?? new Date().toISOString().slice(0, 10)}T00:00:00Z`;
+  if (threshold === null) return;
+  const metric = metricForZoneMetric(metricKey, Number(workoutTypeId));
+  if (!metric) return;
+  await upsertTrainingMetricObservation(database, {
+    provider: 'trainingpeaks',
+    observationId: `trainingpeaks:zone:${remoteId}`,
+    metricName: metric.metric,
+    sport: metric.sport,
+    observedAt,
+    value: threshold,
+    unit: metric.unit,
+    dimensions: { workoutTypeId: Number(workoutTypeId), calculationMethod: firstString(payload, ['calculationMethod']), zoneCalculatorId: firstNumber(payload, ['zoneCalculatorId']), zones: payload.zones ?? null },
+    sourceType: 'trainingpeaks_zone_setting',
+    sourceRemoteId: remoteId,
+    activitySourceId: null,
+    rawHash,
+  });
+}
+
+function metricForZoneMetric(metricKey: string, workoutTypeId: number): { metric: string; unit: string; sport: string } | null {
+  if (metricKey === 'power' && workoutTypeId === 2) return { metric: 'cycling_ftp_w', unit: 'W', sport: 'cycling' };
+  if (metricKey === 'heartrate' && workoutTypeId === 2) return { metric: 'cycling_lthr_bpm', unit: 'bpm', sport: 'cycling' };
+  if (metricKey === 'heartrate' && workoutTypeId === 3) return { metric: 'running_lthr_bpm', unit: 'bpm', sport: 'running' };
+  if (metricKey === 'speed' && workoutTypeId === 3) return { metric: 'running_threshold_pace_s_per_km', unit: 's_per_km', sport: 'running' };
+  return null;
+}
+
+// Planned workouts join the same domain family Garmin scheduled_workouts
+// populate, tagged by provider. The domain upsert above already stored the
+// raw entity; this hook only needs to exist for future field-level mapping,
+// so it intentionally records nothing extra today.
+async function importTrainingPeaksPlannedWorkout(_database: CatenceDatabase, _remoteId: string, _occurredOn: string | null, _payload: JsonObject, _rawHash: string | null): Promise<void> {
+  return;
 }
 
 async function importActivity(database: CatenceDatabase, provider: Provider, remoteId: string, payload: JsonObject, rawHash: string | null): Promise<void> {
@@ -344,6 +392,7 @@ function isCyclingSport(sport: string | null): boolean {
 async function upsertTrainingMetricObservation(
   database: CatenceDatabase,
   values: {
+    provider?: Provider;
     observationId: string;
     metricName: string;
     sport: string;
@@ -362,13 +411,13 @@ async function upsertTrainingMetricObservation(
   await database.run(
     `INSERT INTO training_metric_observations
       (observation_id, provider, metric_name, sport, observed_at, value_number, value_text, unit, device_id, dimensions_json, source_type, source_remote_id, activity_source_id, raw_object_hash)
-     VALUES ($observationId, 'garmin', $metricName, $sport, $observedAt, $value, $valueText, $unit, $deviceId, $dimensions, $sourceType, $sourceRemoteId, $activitySourceId, $rawHash)
+     VALUES ($observationId, $provider, $metricName, $sport, $observedAt, $value, $valueText, $unit, $deviceId, $dimensions, $sourceType, $sourceRemoteId, $activitySourceId, $rawHash)
      ON CONFLICT (observation_id) DO UPDATE SET
        sport = excluded.sport, observed_at = excluded.observed_at, value_number = excluded.value_number, value_text = excluded.value_text,
        unit = excluded.unit, device_id = excluded.device_id, dimensions_json = excluded.dimensions_json,
        source_type = excluded.source_type, source_remote_id = excluded.source_remote_id,
        activity_source_id = excluded.activity_source_id, raw_object_hash = excluded.raw_object_hash`,
-    { ...values, value: values.value ?? null, valueText: values.valueText ?? null, unit: values.unit ?? null, deviceId: values.deviceId ?? null, dimensions: json(values.dimensions ?? {}) },
+    { ...values, provider: values.provider ?? 'garmin', value: values.value ?? null, valueText: values.valueText ?? null, unit: values.unit ?? null, deviceId: values.deviceId ?? null, dimensions: json(values.dimensions ?? {}) },
   );
 }
 
@@ -1183,6 +1232,29 @@ async function importGarminWeight(database: CatenceDatabase, date: string | null
   }
   for (const [metricDate, { kg }] of latestByDay) {
     await upsertDailyMetric(database, 'garmin', metricDate, 'weight_kg', kg, null, 'kg', rawHash);
+  }
+}
+
+// Intervals-derived PMC values. The provider computes these (post-activity
+// snapshots in activity_summary and rolling daily values in fitness); Catence
+// stores them verbatim as provider observations, never recomputed, and keeps
+// the Intervals provenance explicit so a coach-entered or Garmin value is
+// never conflated with them.
+const intervalsFitnessMetricMap: Array<{ name: string; unit: string; keys: string[] }> = [
+  { name: 'ctl', unit: 'tss/d', keys: ['icu_ctl', 'ctl'] },
+  { name: 'atl', unit: 'tss/d', keys: ['icu_atl', 'atl'] },
+  { name: 'tsb', unit: 'tss', keys: ['icu_tsb', 'tsb'] },
+  { name: 'ramp_rate', unit: 'tss/d/week', keys: ['icu_ramp_rate', 'ramp_rate', 'rampRate'] },
+  { name: 'fitness_load', unit: 'tss', keys: ['icu_training_load', 'training_load'] },
+];
+
+async function importIntervalsFitnessSummary(database: CatenceDatabase, remoteId: string, date: string | null, payload: JsonObject, rawHash: string | null): Promise<void> {
+  const metricDate = datePart(date) ?? datePart(firstString(payload, ['id', 'date', 'start_date_local', 'start_date'])) ?? null;
+  if (!metricDate) return;
+  for (const metric of intervalsFitnessMetricMap) {
+    const value = firstNumber(payload, metric.keys);
+    if (value === null) continue;
+    await upsertDailyMetric(database, 'intervals', metricDate, metric.name, value, null, metric.unit, rawHash);
   }
 }
 

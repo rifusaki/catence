@@ -208,11 +208,11 @@ athleteCommand.command('add')
 
 const secretCommand = program.command('secret').description('Write or remove a provider value in one athlete’s owner-only secret store.');
 secretCommand.command('set')
-  .requiredOption('--provider <provider>', 'garmin, intervals, or strava')
+  .requiredOption('--provider <provider>', 'garmin, intervals, strava, or trainingpeaks')
   .requiredOption('--field <field>', 'provider secret field')
   .requiredOption('--value-stdin', 'read the secret from stdin without putting it in shell history')
-  .action(async (options: { provider: 'garmin' | 'intervals' | 'strava'; field: string }) => {
-    if (!['garmin', 'intervals', 'strava'].includes(options.provider)) throw new Error('--provider must be garmin, intervals, or strava.');
+  .action(async (options: { provider: 'garmin' | 'intervals' | 'strava' | 'trainingpeaks'; field: string }) => {
+    if (!['garmin', 'intervals', 'strava', 'trainingpeaks'].includes(options.provider)) throw new Error('--provider must be garmin, intervals, strava, or trainingpeaks.');
     const { paths } = await currentAthlete();
     await setAthleteSecret(paths, options.provider, options.field, await stdinSecret());
     process.stdout.write(`${JSON.stringify({ athleteId: program.opts<{ athlete: string }>().athlete, provider: options.provider, field: options.field, stored: true }, null, 2)}\n`);
@@ -246,21 +246,21 @@ program.command('demo')
   });
 
 program.command('sync')
-  .requiredOption('--provider <provider>', 'intervals, garmin, strava, or all')
+  .requiredOption('--provider <provider>', 'intervals, garmin, strava, trainingpeaks, or all')
   .option('--from <date>', 'explicit ISO date range; otherwise use incremental cursors')
   .option('--refresh', 're-fetch Garmin activity details, files, and streams even when summaries are unchanged')
   .action(async (options: { provider: ProviderChoice; from?: string; refresh?: boolean }) => {
-    if (!['intervals', 'garmin', 'strava', 'all'].includes(options.provider)) throw new Error('--provider must be intervals, garmin, strava, or all.');
+    if (!['intervals', 'garmin', 'strava', 'trainingpeaks', 'all'].includes(options.provider)) throw new Error('--provider must be intervals, garmin, strava, trainingpeaks, or all.');
     const { paths } = await currentAthlete();
     process.stdout.write(`${JSON.stringify(await syncData(paths, options.provider, options.from, true, options.refresh ?? false), null, 2)}\n`);
   });
 
 program.command('backfill')
   .requiredOption('--from <date>', 'ISO date at which to begin backfill')
-  .option('--provider <provider>', 'intervals, garmin, strava, or all', 'all')
+  .option('--provider <provider>', 'intervals, garmin, strava, trainingpeaks, or all', 'all')
   .option('--refresh', 're-fetch and upsert data already covered by the requested range')
   .action(async (options: { provider: ProviderChoice; from: string; refresh?: boolean }) => {
-    if (!['intervals', 'garmin', 'strava', 'all'].includes(options.provider)) throw new Error('--provider must be intervals, garmin, strava, or all.');
+    if (!['intervals', 'garmin', 'strava', 'trainingpeaks', 'all'].includes(options.provider)) throw new Error('--provider must be intervals, garmin, strava, trainingpeaks, or all.');
     const { paths } = await currentAthlete();
     process.stdout.write(`${JSON.stringify(await syncData(paths, options.provider, options.from, false, options.refresh ?? false, true), null, 2)}\n`);
   });

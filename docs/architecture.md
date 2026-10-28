@@ -34,7 +34,7 @@ src/interfaces/  CLI and MCP transport adapters and executable entry points
 
 ### 1. Data fetching
 
-Garmin Connect provides the complete local record. Intervals.icu contributes only its separately named activity-analysis values (for example training load, RPE, feel, and weighted power). Strava is a deliberately sparse, targeted source for current gear and selected activity segment enrichment.
+Garmin Connect provides the complete local record. Intervals.icu contributes only its separately named activity-analysis values (for example training load, RPE, feel, weighted power, and its derived daily CTL/ATL/TSB fitness trend). TrainingPeaks is a read-only companion in the same role: planned workouts for the next 14 days and coach-entered zone/threshold settings, consumed from the trainingpeaks-mcp-core fork via cookie auth; its zone values carry explicit coach-manual provenance and are never merged with Garmin's device-detected ones. Strava is a deliberately sparse, targeted source for current gear and selected activity segment enrichment.
 
 For Garmin, we will use [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) as it is the most mature and widely used library for this purpose. On the Intervals.icu side, the best option available right now is [node-intervals-icue](https://github.com/paladini/node-intervals-icu).
 

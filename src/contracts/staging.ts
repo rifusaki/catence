@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const PROVIDERS = ['intervals', 'garmin', 'strava'] as const;
+export const PROVIDERS = ['intervals', 'garmin', 'strava', 'trainingpeaks'] as const;
 export type Provider = (typeof PROVIDERS)[number];
 export const STAGING_SCHEMA_VERSION = 1;
 

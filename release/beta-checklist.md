@@ -125,6 +125,10 @@ ssh -L 8787:127.0.0.1:8787 beta-server
       logs, and shell history; each `providers.json` file is mode `0600`.
 - [ ] Run one incremental provider sync and one Strava hydration (if configured)
       while the Console is live, confirming lock contention is reported safely.
+- [ ] TrainingPeaks (if configured): sync planned workouts + zones, confirm the
+      cookie never appears in staging/logs, and confirm the Console shows the
+      expiry banner after an expired-cookie run; the demo catalog covers this
+      only through the CLI path.
 - [ ] Restart the Compose stack and verify data, selected-athlete preference,
       and chat history persist in the beta volume.
 - [ ] Test MCP through SSH forwarding; confirm port 8787 has no public listener.

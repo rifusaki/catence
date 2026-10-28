@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { EVENT_WINDOW_PAST_DAYS } from '../ingestion/providers/registry.js';
+import { EVENT_WINDOW_PAST_DAYS, TRAININGPEAKS_PLANNED_DAYS_AHEAD } from '../ingestion/providers/registry.js';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,7 +24,7 @@ import { CatenceDatabase, openReadOnlyRepository, ReadOnlyDatabaseError } from '
 import { mergeProgress, ProgressPump, readRunningProgress, removeProgressSidecar, writeProgressSidecar, PROGRESS_KEEPALIVE_MS } from '../storage/progress-sidecar.js';
 import { withDataWriteLock } from '../storage/write-lock.js';
 
-type SyncProviderChoice = 'intervals' | 'garmin';
+type SyncProviderChoice = 'intervals' | 'garmin' | 'trainingpeaks';
 export type ProviderChoice = SyncProviderChoice | 'strava' | 'all';
 type CursorSource = 'cursor' | 'bootstrap' | 'initial' | 'explicit';
 type DateWindow = { fromDate: string; toDate: string; source: CursorSource };
@@ -196,8 +196,9 @@ async function backfillGarminSwimLengths(
  * Progress NDJSON lines (kind 'progress') are normalized and persisted as
  * throttled heartbeats; other output is forwarded to the sync logger.
  */
-function runGarminWorker(
+function runStagingWorker(
   runId: string,
+  provider: 'garmin' | 'trainingpeaks',
   arguments_: string[],
   environment: { cwd: string; env: NodeJS.ProcessEnv },
   pump: ProgressPump,
@@ -237,7 +238,7 @@ function runGarminWorker(
       try {
         parsed = JSON.parse(line);
       } catch {
-        log.info(`[garmin] ${line}`);
+        log.info(`[${provider}] ${line}`);
         return;
       }
       if (typeof parsed === 'object' && parsed !== null && (parsed as { kind?: unknown }).kind === 'progress') {
@@ -245,21 +246,21 @@ function runGarminWorker(
         if (state) pump.publish(state);
         return;
       }
-      log.info(`[garmin] ${line}`);
+      log.info(`[${provider}] ${line}`);
     });
     buffer(child.stderr, (line) => {
       let parsed: unknown;
       try {
         parsed = JSON.parse(line);
       } catch {
-        log.error(`[garmin] ${line}`);
+        log.error(`[${provider}] ${line}`);
         return;
       }
       if (typeof parsed === 'object' && parsed !== null && (parsed as { kind?: unknown }).kind === 'stage_timings') {
-        log.info('Garmin staging worker stage timings', parsed as Record<string, unknown>);
+        log.info('Staging worker stage timings', parsed as Record<string, unknown>);
         return;
       }
-      log.error(`[garmin] ${line}`);
+      log.error(`[${provider}] ${line}`);
     });
     child.on('error', (error) => {
       if (killTimer) clearTimeout(killTimer);
@@ -320,7 +321,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
   };
   const dailyWindow = explicitWindow ? await uncoveredExplicitWindow('daily') : await database.resolveIncrementalWindow(provider, 'daily', options.toDate, defaultFromDate(), 3);
   const activityWindow = explicitWindow ? await uncoveredExplicitWindow('activities') : await database.resolveIncrementalWindow(provider, 'activities', options.toDate, defaultFromDate(), 14);
-  const hasProviderWork = provider === 'intervals' ? activityWindow !== null : dailyWindow !== null || activityWindow !== null;
+  const hasProviderWork = provider === 'intervals' ? activityWindow !== null : provider === 'trainingpeaks' ? true : dailyWindow !== null || activityWindow !== null;
   if (!hasProviderWork) {
     log.debug('No uncovered work; skipping provider', { provider, daily: dailyWindow ?? null, activities: activityWindow ?? null });
     return {
@@ -331,7 +332,8 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       refreshedActivities: provider === 'garmin' && options.refreshActivities, skipped: true,
     };
   }
-  const fromDate = [dailyWindow?.fromDate, activityWindow?.fromDate].filter((date): date is string => Boolean(date)).sort()[0]!;
+  const fromDate = [dailyWindow?.fromDate, activityWindow?.fromDate].filter((date): date is string => Boolean(date)).sort()[0]
+    ?? (provider === 'trainingpeaks' ? new Date().toISOString().slice(0, 10) : '');
   const runId = await database.beginRun(provider, fromDate);
   log.info('Starting sync run', {
     runId, provider, fromDate, toDate: options.toDate,
@@ -352,6 +354,39 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       await runWithInterruptGuard(runId, database, () => undefined, guard, async () => {
         await new IntervalsExtractor(database, paths, config.apiKey, config.athleteId, log).sync(runId, activityWindow, !options.backfill || options.refreshActivities);
       });
+    } else if (provider === 'trainingpeaks') {
+      const output = path.join(paths.staging, 'trainingpeaks', `${runId}.jsonl`);
+      await mkdir(path.dirname(output), { recursive: true });
+      const fromDate = new Date().toISOString().slice(0, 10);
+      const toDate = new Date(Date.now() + TRAININGPEAKS_PLANNED_DAYS_AHEAD * 86_400_000).toISOString().slice(0, 10);
+      const arguments_ = ['run', 'python', '-m', 'python.catence.providers.trainingpeaks.cli', '--from', fromDate, '--to', toDate, '--data-dir', paths.root, '--output', output, '--run-id', runId];
+      let interruptChild: (() => void) | null = null;
+      await runWithInterruptGuard(runId, database, () => interruptChild?.(), guard, async () => {
+        const environment = await athleteProviderEnvironment(paths);
+        if (!environment.TP_AUTH_COOKIE) {
+          throw new Error('TrainingPeaks auth cookie is not configured. Set it with: catence-data --athlete <id> secret set --provider trainingpeaks --field authCookie --value-stdin');
+        }
+        extractionStarted = true;
+        pump.setStage('trainingpeaks');
+        const outcome = await runStagingWorker(
+          runId,
+          'trainingpeaks',
+          arguments_,
+          {
+            cwd: packageRoot(),
+            env: { ...environment, UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT ?? path.join(paths.root, 'python-venv') },
+          },
+          pump,
+          log,
+          (kill) => { interruptChild = kill; },
+        );
+        if (!guard.interrupted && outcome.code !== 0) {
+          throw new Error(`TrainingPeaks staging worker exited with code ${outcome.code}${outcome.signal ? ` (${outcome.signal})` : ''}.`);
+        }
+      });
+      if (!guard.interrupted && existsSync(output)) {
+        await importJsonl(database, runId, output, log);
+      }
     } else {
       const output = path.join(paths.staging, 'garmin', `${runId}.jsonl`);
       const knownActivities = path.join(paths.staging, 'garmin', `${runId}.known-activities.json`);
@@ -390,8 +425,9 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
       const workerStartedAt = Date.now();
       let interruptChild: (() => void) | null = null;
       await runWithInterruptGuard(runId, database, () => interruptChild?.(), guard, async () => {
-        const outcome = await runGarminWorker(
+        const outcome = await runStagingWorker(
           runId,
+          'garmin',
           arguments_,
           {
             cwd: packageRoot(),
@@ -451,7 +487,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
     );
     log.info('Sync run finished', { runId, provider, status: run?.status ?? 'unknown', errorCount: run?.error_count ?? 0 });
   }
-  if (!guard.interrupted && options.advanceCursor && !options.explicitFrom && extractionStarted) {
+  if (!guard.interrupted && options.advanceCursor && !options.explicitFrom && extractionStarted && provider !== 'trainingpeaks') {
     await database.advanceIncrementalCursor(provider, 'daily', runId, options.toDate, 3);
     await database.advanceIncrementalCursor(provider, 'activities', runId, options.toDate, 14);
   }
@@ -484,7 +520,7 @@ export async function syncData(paths: CatencePaths, provider: ProviderChoice, ex
     for (const runId of timedOutRuns.runIds) {
       await removeProgressSidecar(paths, runId).catch(() => undefined);
     }
-    const providers: SyncProviderChoice[] = provider === 'all' ? ['intervals', 'garmin'] : [provider];
+    const providers: SyncProviderChoice[] = provider === 'all' ? ['intervals', 'garmin', 'trainingpeaks'] : [provider];
     const toDate = new Date().toISOString().slice(0, 10);
     const runs: SyncResult[] = [];
     for (const source of providers) runs.push(await syncProvider(database, paths, source, { explicitFrom, toDate, advanceCursor, refreshActivities, backfill }, log));

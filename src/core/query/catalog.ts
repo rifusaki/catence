@@ -10,6 +10,7 @@ export type DatasetName =
   | 'activity_quality_flags'
   | 'daily_metrics'
   | 'daily_health'
+  | 'fitness_trend'
   | 'training_metrics'
   | 'training_metric_observations'
   | 'wellness_samples'
@@ -104,6 +105,10 @@ export const DATASET_CATALOG: Record<Exclude<DatasetName, 'training_metrics'>, D
   daily_metrics: {
     name: 'daily_metrics', relation: 'daily_metrics', description: 'Long-form provider daily facts. Metric names and units are explicit.', dateColumn: 'metric_date', provenanceColumns: ['provider', 'raw_object_hash'], permittedGroupings: ['provider', 'metric_name'],
     columns: [column('provider', 'VARCHAR', { filterable: true, groupable: true }), column('metric_date', 'DATE', { filterable: true, groupable: true }), column('metric_name', 'VARCHAR', { filterable: true, groupable: true }), column('value_number', 'DOUBLE', { metric: true }), column('value_text', 'VARCHAR'), column('unit', 'VARCHAR', { filterable: true, groupable: true }), column('raw_object_hash', 'VARCHAR')],
+  },
+  fitness_trend: {
+    name: 'fitness_trend', relation: 'fitness_trend', description: 'One canonical daily fitness/fatigue/form row per date (CTL, ATL, TSB) plus ramp rate and daily training load. Garmin wins whenever it has the values for that date; TrainingPeaks or Intervals.icu is a whole-day fallback, and the provider column names the winner. Source values are stored verbatim, never recomputed by Catence — query daily_metrics (metric names ctl/atl/tsb/ramp_rate/fitness_load) to compare provider observations. Missing dates mean no provider value exists, not a zero.', dateColumn: 'metric_date', provenanceColumns: ['provider'], permittedGroupings: ['provider'],
+    columns: [column('provider', 'VARCHAR', { filterable: true, groupable: true }), column('metric_date', 'DATE', { filterable: true, groupable: true }), column('ctl', 'DOUBLE', { unit: 'tss/d', metric: true, description: 'Chronic training load (fitness), Intervals-derived rolling daily average.' }), column('atl', 'DOUBLE', { unit: 'tss/d', metric: true, description: 'Acute training load (fatigue), Intervals-derived rolling daily average.' }), column('tsb', 'DOUBLE', { unit: 'tss', metric: true, description: 'Training stress balance (form) = CTL - ATL as reported by Intervals.' }), column('ramp_rate', 'DOUBLE', { unit: 'tss/d/week', metric: true, description: 'CTL ramp rate as reported by Intervals.' }), column('fitness_load', 'DOUBLE', { unit: 'tss', metric: true, description: 'Daily training load (TSS/TRIMP) used for the PMC series, as reported by Intervals.' })],
   },
   daily_health: {
     name: 'daily_health', relation: 'daily_health', description: 'One canonical daily-health record per date. Garmin wins whenever it has facts for that date; Intervals or another provider is a whole-day fallback. Use daily_metrics to compare source observations.', dateColumn: 'metric_date', provenanceColumns: ['provider'], permittedGroupings: ['provider'],

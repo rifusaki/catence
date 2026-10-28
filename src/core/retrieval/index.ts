@@ -96,7 +96,7 @@ export async function buildRetrievalIndex(database: WriteDataStore): Promise<{ d
   const domain = await database.rows<Record<string, unknown>>(`
     SELECT provider, entity_type, remote_id, cast(occurred_on AS VARCHAR) AS occurred_on, payload_json
     FROM domain_entities
-    WHERE entity_type IN ('event', 'workout', 'scheduled_workout', 'training_plan', 'route', 'message')
+    WHERE entity_type IN ('event', 'workout', 'scheduled_workout', 'planned_workout', 'training_plan', 'route', 'message')
   `);
   for (const entity of domain) {
     const fields = selectedPayloadText(payloadObject(entity.payload_json));
