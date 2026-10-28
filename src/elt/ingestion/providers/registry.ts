@@ -25,11 +25,13 @@ export const intervalsReadRegistry = registry('intervals', [
 /**
  * Intervals is an analysis companion to Garmin: its activity-list payload
  * supplies the separately named training calculations without duplicating
- * Garmin's activity detail, files, streams, or account data.
+ * Garmin's activity detail, files, streams, or account data. `fitness` rides
+ * along so the daily CTL/ATL/TSB series Intervals derives reaches the
+ * `fitness_trend` catalog dataset.
  */
 export const intervalsSecondaryReadRegistry = intervalsReadRegistry.filter(
   (endpoint) =>
-    endpoint.name === 'athlete' || endpoint.name === 'activities' || endpoint.name === 'events'
+    endpoint.name === 'athlete' || endpoint.name === 'activities' || endpoint.name === 'events' || endpoint.name === 'fitness'
 );
 
 /** How far back and ahead of today the planned-events fetch reaches. */

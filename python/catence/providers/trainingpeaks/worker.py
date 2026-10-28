@@ -93,6 +93,13 @@ def zone_setting_payloads(settings_payload: Any) -> list[tuple[str, dict[str, An
     metric family: powerZones/heartRateZones/speedZones, plus weights and
     thresholds). Each becomes a separately keyed zone_setting entity so the
     normalizer can upsert idempotently by workout type + metric + date.
+
+    A group with the default workout type (0) is TP's "common" zone set: it
+    is inherited from the populated sport rather than owned by one. It fans
+    out into every sport that (a) has a metric mapping, (b) is populated
+    with zones of its own, and (c) lacks a specific group for this metric —
+    when nothing is sport-populated at all, it fans out into every mapped
+    sport so the thresholds are never silently dropped.
     """
     document = as_dict(settings_payload)
     # The endpoint family returns either the bare settings object or a
@@ -100,21 +107,33 @@ def zone_setting_payloads(settings_payload: Any) -> list[tuple[str, dict[str, An
     settings = document.get("settings") if isinstance(document.get("settings"), Mapping) else document
     if not isinstance(settings, Mapping):
         return []
-    entities: list[tuple[str, dict[str, Any]]] = []
-    # The live API names the zone groups in camelCase; the short lowercase
-    # metric key stays the remoteId/normalizer contract.
+    # Mapped sports mirror the Node normalizer's metricForZoneMetric contract.
+    mapped_sports = {"power": (2,), "heartrate": (2, 3), "speed": (3,)}
+    per_metric: dict[str, tuple[list[dict[str, Any]], set[int]]] = {}
     for metric_key, payload_key in (("power", "powerZones"), ("heartrate", "heartRateZones"), ("speed", "speedZones")):
-        groups = settings.get(payload_key) or settings.get(metric_key) or []
-        if not isinstance(groups, list):
-            continue
+        groups = [dict(group) for group in settings.get(payload_key) or settings.get(metric_key) or [] if isinstance(group, Mapping)]
+        specific_types = {int(group["workoutTypeId"]) for group in groups if int(group.get("workoutTypeId", 0) or 0)}
+        per_metric[metric_key] = (groups, specific_types)
+    populated_sports: set[int] = set().union(*(types for _, types in per_metric.values())) if per_metric else set()
+    entities: list[tuple[str, dict[str, Any]]] = []
+    for metric_key, (groups, specific_types) in per_metric.items():
         for index, group in enumerate(groups):
-            if not isinstance(group, Mapping):
+            workout_type_id = int(group.get("workoutTypeId", 0) or 0)
+            if workout_type_id:
+                remote_id = f"{workout_type_id}:{metric_key}"
+                if len(groups) > 1:
+                    remote_id = f"{remote_id}:{index}"
+                entities.append((remote_id, group))
                 continue
-            workout_type_id = group.get("workoutTypeId", 0)
-            remote_id = f"{workout_type_id}:{metric_key}"
-            if len(groups) > 1:
-                remote_id = f"{remote_id}:{index}"
-            entities.append((remote_id, dict(group)))
+            inherit_to = [
+                sport for sport in mapped_sports[metric_key]
+                if sport not in specific_types and (sport in populated_sports or not populated_sports)
+            ]
+            for sport in inherit_to:
+                remote_id = f"{sport}:{metric_key}"
+                if len(groups) > 1:
+                    remote_id = f"{remote_id}:{index}"
+                entities.append((remote_id, group))
     return entities
 
 

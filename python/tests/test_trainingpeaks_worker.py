@@ -162,6 +162,43 @@ def test_planned_workout_window_defaults_to_today_plus_14_days(tmp_path: Path) -
     assert any(call == "/fitness/v6/athletes/4242/workouts/2026-03-01/2026-03-15" for call in client.calls)
 
 
+def test_default_zone_group_inherits_into_populated_sports() -> None:
+    # Martina-shaped payload: HR and power exist only as the common (type 0)
+    # group; speed is populated per sport. The common groups must inherit into
+    # the populated sports that lack their own group for that metric.
+    settings = {
+        "heartRateZones": [{"workoutTypeId": 0, "threshold": 178}],
+        "powerZones": [{"workoutTypeId": 0, "threshold": 177}],
+        "speedZones": [
+            {"workoutTypeId": 3, "threshold": 4.35},
+            {"workoutTypeId": 2, "threshold": 8.85},
+            {"workoutTypeId": 1, "threshold": 0.83},
+            {"workoutTypeId": 0, "threshold": 3.70},
+        ],
+    }
+    entities = zone_setting_payloads(settings)
+    by_remote_id = {remote_id: payload["threshold"] for remote_id, payload in entities}
+    # Common HR inherits into bike and run; common power into bike; the common
+    # speed group is superseded by the per-sport groups and inherits nowhere.
+    assert by_remote_id["2:heartrate"] == 178
+    assert by_remote_id["3:heartrate"] == 178
+    assert by_remote_id["2:power"] == 177
+    assert "2:speed" not in by_remote_id and "3:speed" not in by_remote_id
+    assert by_remote_id["3:speed:0"] == 4.35
+    assert by_remote_id["2:speed:1"] == 8.85
+    assert by_remote_id["1:speed:2"] == 0.83
+
+
+def test_default_zone_group_fans_out_when_no_sport_is_populated() -> None:
+    settings = {
+        "heartRateZones": [{"workoutTypeId": 0, "threshold": 165}],
+        "powerZones": [{"workoutTypeId": 0, "threshold": 240}],
+        "speedZones": [{"workoutTypeId": 0, "threshold": 3.1}],
+    }
+    entities = zone_setting_payloads(settings)
+    assert sorted(remote_id for remote_id, _ in entities) == ["2:heartrate", "2:power", "3:heartrate", "3:speed"]
+
+
 def test_helpers() -> None:
     assert payload_day({"workoutDay": "2026-03-02T10:00:00"}) == "2026-03-02"
     assert workout_remote_id({"workoutId": 5}, "fallback") == "5"

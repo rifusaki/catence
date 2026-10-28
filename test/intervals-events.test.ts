@@ -26,7 +26,7 @@ describe('intervals planned-events sync', () => {
 
   it('syncs calendar events alongside athlete and activities, nothing else', () => {
     const names = intervalsSecondaryReadRegistry.map((endpoint) => endpoint.name).sort();
-    expect(names).toEqual(['activities', 'athlete', 'events']);
+    expect(names).toEqual(['activities', 'athlete', 'events', 'fitness']);
     // The wide registry stays intact for manifest coverage.
     expect(intervalsReadRegistry.some((endpoint) => endpoint.name === 'wellness')).toBe(true);
   });
