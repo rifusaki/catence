@@ -223,7 +223,7 @@ wheels = [
 
 [[package]]
 name = "catence-chainlit"
-version = "0.2.7b4"
+version = "0.2.7b5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
@@ -251,12 +251,12 @@ dependencies = [
     { name = "watchfiles" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/80/14/00b650d60c02b17bd5149a1449221b808b2a1ace96d6ba40c5bc245b5126/catence_chainlit-0.2.7b4-py3-none-any.whl", hash = "sha256:41120a194a349af1b1a85079a03cf631b979e191141aa4afb733472dd768c683", size = 11432794, upload-time = "2026-10-18T02:06:10.599Z" },
+    { url = "https://files.pythonhosted.org/packages/09/16/1f9fdfe4d8f117533c40a36fa81cf85c604c1c8a298d89b9bde6db3e00b1/catence_chainlit-0.2.7b5-py3-none-any.whl", hash = "sha256:bf61663cce37baf46dc7ffdc19b907b2b740478bff9eb96ff103c9c785601570", size = 11434065, upload-time = "2026-10-28T23:53:12.093Z" },
 ]
 
 [[package]]
 name = "catence-console"
-version = "0.2.1b24"
+version = "0.2.1b29"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -276,7 +276,7 @@ dev = [
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20.0,<1.0.0" },
     { name = "bcrypt", specifier = ">=4.2.0,<6.0.0" },
-    { name = "catence-chainlit", specifier = ">=0.2.7b4,<0.3" },
+    { name = "catence-chainlit", specifier = ">=0.2.7b5,<0.3" },
     { name = "greenlet", specifier = ">=3.0.0,<4.0.0" },
     { name = "litellm", specifier = ">=1.80.0,<2.0.0" },
     { name = "sqlalchemy", specifier = ">=2.0.28,<3.0.0" },
