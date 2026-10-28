@@ -90,7 +90,7 @@ def zone_setting_payloads(settings_payload: Any) -> list[tuple[str, dict[str, An
     """Fan the TP settings document out into one zone_setting entity per group.
 
     A settings payload carries multiple zone sets (one per workout type and
-    metric family: powerzones/heartratezones/speedzones, plus weights and
+    metric family: powerZones/heartRateZones/speedZones, plus weights and
     thresholds). Each becomes a separately keyed zone_setting entity so the
     normalizer can upsert idempotently by workout type + metric + date.
     """
@@ -101,8 +101,10 @@ def zone_setting_payloads(settings_payload: Any) -> list[tuple[str, dict[str, An
     if not isinstance(settings, Mapping):
         return []
     entities: list[tuple[str, dict[str, Any]]] = []
-    for metric_key, metric in (("power", "powerzones"), ("heartrate", "heartratezones"), ("speed", "speedzones")):
-        groups = settings.get(metric_key) or settings.get(metric) or []
+    # The live API names the zone groups in camelCase; the short lowercase
+    # metric key stays the remoteId/normalizer contract.
+    for metric_key, payload_key in (("power", "powerZones"), ("heartrate", "heartRateZones"), ("speed", "speedZones")):
+        groups = settings.get(payload_key) or settings.get(metric_key) or []
         if not isinstance(groups, list):
             continue
         for index, group in enumerate(groups):
@@ -135,33 +137,33 @@ class TrainingPeaksStagingWorker:
                 self.progress.finish("interrupted")
             raise WorkerInterrupted("Sync run interrupted between extraction steps")
 
-    def sync(self, from_date: date, to_date: date | None = None) -> None:
+    async def sync(self, from_date: date, to_date: date | None = None) -> None:
         """Fetch the two endpoint families with per-family error isolation."""
         end = to_date or (self.today + timedelta(days=PLANNED_WORKOUTS_DAYS_AHEAD))
         self._check_interrupted()
-        athlete_id = self._ensure_athlete_id()
+        athlete_id = await self._ensure_athlete_id()
         if athlete_id is None:
             return
         self._check_interrupted()
-        self._sync_athlete_settings(athlete_id)
+        await self._sync_athlete_settings(athlete_id)
         self._check_interrupted()
-        self._sync_zones(athlete_id)
+        await self._sync_zones(athlete_id)
         self._check_interrupted()
-        self._sync_planned_workouts(athlete_id, from_date, end)
+        await self._sync_planned_workouts(athlete_id, from_date, end)
 
-    def _ensure_athlete_id(self) -> int | None:
+    async def _ensure_athlete_id(self) -> int | None:
         if self.progress is not None:
             self.progress.set_stage("auth")
-        athlete_id = self.client.ensure_athlete_id()
+        athlete_id = await self.client.ensure_athlete_id()
         if self.progress is not None:
             self.progress.finish("auth")
         if not athlete_id:
             self.writer.error("user", AUTH_EXPIRED_MESSAGE, retryable=False)
         return athlete_id
 
-    def _get(self, endpoint: str) -> Any:
+    async def _get(self, endpoint: str) -> Any:
         """GET an endpoint, translating auth failures into the expiry error."""
-        response = self.client.get(endpoint)
+        response = await self.client.get(endpoint)
         if response.is_error:
             error_code = getattr(response, "error_code", None)
             code = getattr(getattr(error_code, "value", error_code), "value", error_code) or ""
@@ -172,12 +174,12 @@ class TrainingPeaksStagingWorker:
             raise RuntimeError(message)
         return response.data
 
-    def _sync_planned_workouts(self, athlete_id: int, from_date: date, to_date: date) -> None:
+    async def _sync_planned_workouts(self, athlete_id: int, from_date: date, to_date: date) -> None:
         if self.progress is not None:
             self.progress.set_stage("planned_workouts")
         endpoint = f"/fitness/v6/athletes/{athlete_id}/workouts/{from_date.isoformat()}/{to_date.isoformat()}"
         try:
-            data = self._get(endpoint)
+            data = await self._get(endpoint)
         except PermissionError as error:
             self.writer.error("workouts", f"{AUTH_EXPIRED_ERROR}: {error}", retryable=False)
             return
@@ -191,11 +193,11 @@ class TrainingPeaksStagingWorker:
         if self.progress is not None:
             self.progress.finish("planned_workouts")
 
-    def _sync_zones(self, athlete_id: int) -> None:
+    async def _sync_zones(self, athlete_id: int) -> None:
         if self.progress is not None:
             self.progress.set_stage("zones")
         try:
-            data = self._get(f"/fitness/v1/athletes/{athlete_id}/settings")
+            data = await self._get(f"/fitness/v1/athletes/{athlete_id}/settings")
         except PermissionError as error:
             self.writer.error("settings", f"{AUTH_EXPIRED_ERROR}: {error}", retryable=False)
             return
@@ -208,12 +210,12 @@ class TrainingPeaksStagingWorker:
         if self.progress is not None:
             self.progress.finish("zones")
 
-    def _sync_athlete_settings(self, athlete_id: int) -> None:
+    async def _sync_athlete_settings(self, athlete_id: int) -> None:
         """Cheap context entity: units and athlete identity, not training data."""
         if self.progress is not None:
             self.progress.set_stage("athlete_settings")
         try:
-            data = self._get("/users/v3/user")
+            data = await self._get("/users/v3/user")
         except PermissionError as error:
             self.writer.error("user", f"{AUTH_EXPIRED_ERROR}: {error}", retryable=False)
             return

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import date
 from pathlib import Path
@@ -37,10 +38,10 @@ class FakeClient:
         self.responses = responses or {}
         self.calls: list[str] = []
 
-    def ensure_athlete_id(self) -> int | None:
+    async def ensure_athlete_id(self) -> int | None:
         return self.athlete_id
 
-    def get(self, endpoint: str) -> FakeResponse:
+    async def get(self, endpoint: str) -> FakeResponse:
         self.calls.append(endpoint)
         for prefix, response in self.responses.items():
             if endpoint.startswith(prefix):
@@ -75,7 +76,7 @@ def test_planned_workouts_are_staged_with_raw_archive(tmp_path: Path) -> None:
     })
     writer = make_writer(tmp_path)
     worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
-    worker.sync(date(2026, 3, 1))
+    asyncio.run(worker.sync(date(2026, 3, 1)))
     records = read_records(writer.output)
     kinds = {record["kind"] for record in records}
     assert "run_manifest" in kinds
@@ -92,15 +93,16 @@ def test_planned_workouts_are_staged_with_raw_archive(tmp_path: Path) -> None:
 
 
 def test_zone_settings_fan_out_per_metric_group(tmp_path: Path) -> None:
+    # Key names mirror the live /fitness/v1/athletes/{id}/settings payload.
     settings = {
-        "power": [{"workoutTypeId": 2, "threshold": 260, "calculationMethod": "PercentOfThreshold", "zones": [{"minimum": 0, "maximum": 150}]}],
-        "heartrate": [{"workoutTypeId": 2, "threshold": 168, "zones": [{"minimum": 0, "maximum": 140}]}],
-        "speed": [{"workoutTypeId": 3, "threshold": 4.2, "zones": [{"minimum": 0, "maximum": 3.0}]}],
+        "powerZones": [{"workoutTypeId": 2, "threshold": 260, "calculationMethod": "PercentOfThreshold", "zones": [{"minimum": 0, "maximum": 150}]}],
+        "heartRateZones": [{"workoutTypeId": 2, "threshold": 168, "zones": [{"minimum": 0, "maximum": 140}]}],
+        "speedZones": [{"workoutTypeId": 3, "threshold": 4.2, "zones": [{"minimum": 0, "maximum": 3.0}]}],
     }
     client = FakeClient(responses={"/fitness/v1/athletes/4242/settings": FakeResponse(data=settings)})
     writer = make_writer(tmp_path)
     worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
-    worker.sync(date(2026, 3, 1))
+    asyncio.run(worker.sync(date(2026, 3, 1)))
     entities = [record for record in read_records(writer.output) if record["kind"] == "source_entity"]
     zones = [record for record in entities if record["entityType"] == "zone_setting"]
     assert sorted(record["remoteId"] for record in zones) == ["2:heartrate", "2:power", "3:speed"]
@@ -116,7 +118,7 @@ def test_expired_cookie_maps_to_actionable_error(tmp_path: Path) -> None:
     })
     writer = make_writer(tmp_path)
     worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
-    worker.sync(date(2026, 3, 1))
+    asyncio.run(worker.sync(date(2026, 3, 1)))
     errors = [record for record in read_records(writer.output) if record["kind"] == "extraction_error"]
     assert len(errors) == 2
     for error in errors:
@@ -131,7 +133,7 @@ def test_failed_zone_family_does_not_block_planned_workouts(tmp_path: Path) -> N
     })
     writer = make_writer(tmp_path)
     worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
-    worker.sync(date(2026, 3, 1))
+    asyncio.run(worker.sync(date(2026, 3, 1)))
     records = read_records(writer.output)
     entities = [record for record in records if record["kind"] == "source_entity"]
     assert any(record["entityType"] == "planned_workout" for record in entities)
@@ -145,7 +147,7 @@ def test_cookie_never_enters_staging(tmp_path: Path) -> None:
     client = FakeClient(responses={"/fitness/v6/athletes/4242/workouts": FakeResponse(data=[{"workoutId": 1}])})
     writer = make_writer(tmp_path)
     worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
-    worker.sync(date(2026, 3, 1))
+    asyncio.run(worker.sync(date(2026, 3, 1)))
     staging_text = writer.output.read_text(encoding="utf-8")
     assert secret_cookie not in staging_text
     for archive in (tmp_path / "raw" / "trainingpeaks").rglob("*.json"):
@@ -156,7 +158,7 @@ def test_planned_workout_window_defaults_to_today_plus_14_days(tmp_path: Path) -
     client = FakeClient()
     writer = make_writer(tmp_path)
     worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
-    worker.sync(date(2026, 3, 1))
+    asyncio.run(worker.sync(date(2026, 3, 1)))
     assert any(call == "/fitness/v6/athletes/4242/workouts/2026-03-01/2026-03-15" for call in client.calls)
 
 

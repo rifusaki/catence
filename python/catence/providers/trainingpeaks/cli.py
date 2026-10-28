@@ -47,7 +47,7 @@ def main() -> None:
     try:
         async def run() -> None:
             async with client:
-                worker.sync(args.from_date, args.to_date)
+                await worker.sync(args.from_date, args.to_date)
 
         asyncio.run(run())
     except WorkerInterrupted:
