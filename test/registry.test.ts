@@ -15,6 +15,6 @@ describe('read-only endpoint registry', () => {
     expect(allReadOnlyEndpoints.length).toBeGreaterThan(60);
     expect(intervalsActivityReadEndpoints).toContain('original_file');
     expect(intervalsActivityReadEndpoints).toContain('streams');
-    expect(intervalsSecondaryReadRegistry.map((endpoint) => endpoint.name)).toEqual(['athlete', 'activities', 'events', 'fitness']);
+    expect(intervalsSecondaryReadRegistry.map((endpoint) => endpoint.name)).toEqual(['athlete', 'activities', 'events']);
   });
 });
