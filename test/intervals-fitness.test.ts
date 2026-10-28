@@ -40,6 +40,33 @@ describe('Intervals fitness catalog exposure', () => {
     }
   });
 
+  it('unifies to one row per date with Garmin winning over Intervals', async () => {
+    const { database } = await temporaryDatabase();
+    const runId = await database.beginRun('intervals', '2026-02-01');
+    try {
+      // Garmin owns 2026-02-01; Intervals only owns 2026-02-02.
+      await database.run("INSERT INTO daily_metrics VALUES ('garmin', DATE '2026-02-01', 'ctl', 50.0, NULL, 'tss/d', NULL)");
+      await database.run("INSERT INTO daily_metrics VALUES ('garmin', DATE '2026-02-01', 'atl', 40.0, NULL, 'tss/d', NULL)");
+      const record = {
+        kind: 'source_entity' as const, schemaVersion: 1 as const, provider: 'intervals' as const,
+        entityType: 'fitness_summary', remoteId: '2026-02-01', parentRemoteId: null, occurredOn: '2026-02-01',
+        sourceUpdatedAt: null, rawObjectHash: 'fitness-raw', extension: {},
+        payload: { id: '2026-02-01', icu_ctl: 45.2, icu_atl: 38.1 },
+      };
+      await importRecord(database, runId, record);
+      await importRecord(database, runId, { ...record, remoteId: '2026-02-02', occurredOn: '2026-02-02', payload: { id: '2026-02-02', icu_ctl: 47.0 } });
+      const rows = await database.rows<{ metric_date: string; provider: string; ctl: number }>(
+        'SELECT metric_date::VARCHAR AS metric_date, provider, ctl FROM fitness_trend ORDER BY metric_date',
+      );
+      expect(rows).toEqual([
+        { metric_date: '2026-02-01', provider: 'garmin', ctl: 50.0 },
+        { metric_date: '2026-02-02', provider: 'intervals', ctl: 47.0 },
+      ]);
+    } finally {
+      await database.close();
+    }
+  });
+
   it('catalogs the fitness_trend dataset with explicit Intervals-derived provenance', () => {
     const dataset = getDataset('fitness_trend');
     expect(dataset.relation).toBe('fitness_trend');
