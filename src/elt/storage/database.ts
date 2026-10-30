@@ -377,6 +377,14 @@ export class CatenceDatabase implements WriteDataStore {
     return Object.fromEntries(rows.map((row) => [row.remote_activity_id, row.summary_hash]));
   }
 
+  /** Workout remote ids already stored for TrainingPeaks; past-window fetches skip these to accumulate history. */
+  async knownTrainingPeaksWorkoutIds(): Promise<string[]> {
+    const rows = await this.rows<{ remote_id: string }>(
+      "SELECT remote_id FROM source_entities WHERE provider = 'trainingpeaks' AND entity_type = 'planned_workout'",
+    );
+    return rows.map((row) => row.remote_id);
+  }
+
   async hasGarminLactateThresholdHistory(): Promise<boolean> {
     const rows = await this.rows<{ n: number }>(
       "SELECT count(*) AS n FROM training_metric_observations WHERE observation_id LIKE 'garmin:lactate_threshold:daily:%'",

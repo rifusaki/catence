@@ -99,7 +99,13 @@ export const trainingpeaksReadRegistry = registry('trainingpeaks', [
   ['athlete_settings', 'singleton', 'profile'],
 ] as const);
 
-/** How far ahead of today the planned-workout window reaches. */
+/**
+ * How far back and ahead of today the workout fetch window reaches. Past
+ * workouts accumulate (a workout stored by an earlier run is never refetched
+ * into staging), while the future window is refreshed on every sync. Backfill
+ * does not apply: the history lookback is fixed, not cursor-driven.
+ */
+export const TRAININGPEAKS_HISTORY_DAYS_BACK = 30;
 export const TRAININGPEAKS_PLANNED_DAYS_AHEAD = 14;
 
 export const allReadOnlyEndpoints = [...intervalsReadRegistry, ...garminReadRegistry, ...stravaReadRegistry, ...trainingpeaksReadRegistry] as const;

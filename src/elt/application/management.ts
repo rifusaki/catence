@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { EVENT_WINDOW_PAST_DAYS, TRAININGPEAKS_PLANNED_DAYS_AHEAD } from '../ingestion/providers/registry.js';
+import { EVENT_WINDOW_PAST_DAYS, TRAININGPEAKS_HISTORY_DAYS_BACK, TRAININGPEAKS_PLANNED_DAYS_AHEAD } from '../ingestion/providers/registry.js';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -333,7 +333,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
     };
   }
   const fromDate = [dailyWindow?.fromDate, activityWindow?.fromDate].filter((date): date is string => Boolean(date)).sort()[0]
-    ?? (provider === 'trainingpeaks' ? new Date().toISOString().slice(0, 10) : '');
+    ?? (provider === 'trainingpeaks' ? new Date(Date.now() - TRAININGPEAKS_HISTORY_DAYS_BACK * 86_400_000).toISOString().slice(0, 10) : '');
   const runId = await database.beginRun(provider, fromDate);
   log.info('Starting sync run', {
     runId, provider, fromDate, toDate: options.toDate,
@@ -357,9 +357,15 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
     } else if (provider === 'trainingpeaks') {
       const output = path.join(paths.staging, 'trainingpeaks', `${runId}.jsonl`);
       await mkdir(path.dirname(output), { recursive: true });
-      const fromDate = new Date().toISOString().slice(0, 10);
+      // History accumulation: the fetch reaches 30 days back, but workouts a
+      // previous run already stored are handed to the worker so the past is
+      // staged once and never overwritten. The future 14-day window re-stages
+      // every run. Backfill deliberately does not apply to this provider.
+      const fromDate = new Date(Date.now() - TRAININGPEAKS_HISTORY_DAYS_BACK * 86_400_000).toISOString().slice(0, 10);
       const toDate = new Date(Date.now() + TRAININGPEAKS_PLANNED_DAYS_AHEAD * 86_400_000).toISOString().slice(0, 10);
-      const arguments_ = ['run', 'python', '-m', 'python.catence.providers.trainingpeaks.cli', '--from', fromDate, '--to', toDate, '--data-dir', paths.root, '--output', output, '--run-id', runId];
+      const knownWorkouts = path.join(paths.staging, 'trainingpeaks', `${runId}.known-workouts.json`);
+      await writeFile(knownWorkouts, JSON.stringify(await database.knownTrainingPeaksWorkoutIds()));
+      const arguments_ = ['run', 'python', '-m', 'python.catence.providers.trainingpeaks.cli', '--from', fromDate, '--to', toDate, '--known-workouts', knownWorkouts, '--data-dir', paths.root, '--output', output, '--run-id', runId];
       let interruptChild: (() => void) | null = null;
       await runWithInterruptGuard(runId, database, () => interruptChild?.(), guard, async () => {
         const environment = await athleteProviderEnvironment(paths);

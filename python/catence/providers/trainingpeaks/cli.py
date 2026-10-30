@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import signal
 from datetime import date
@@ -19,7 +20,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--known-workouts", dest="known_workouts", type=Path, default=None,
+                        help="JSON array of already-stored workout remote ids; past workouts in this list are not re-staged.")
     return parser.parse_args()
+
+
+def load_known_workout_ids(path: Path | None) -> set[str]:
+    if path is None or not path.exists():
+        return set()
+    return {str(remote_id) for remote_id in json.loads(path.read_text(encoding="utf-8"))}
 
 
 def main() -> None:
@@ -34,7 +43,8 @@ def main() -> None:
     writer.manifest(args.run_id, args.from_date.isoformat())
     reporter = ProgressReporter(args.run_id, provider="trainingpeaks")
     client = TPClient()
-    worker = TrainingPeaksStagingWorker(client, writer, progress=reporter, today=date.today())
+    worker = TrainingPeaksStagingWorker(client, writer, progress=reporter, today=date.today(),
+                                        known_workout_ids=load_known_workout_ids(args.known_workouts))
     interrupt_signal: int | None = None
 
     def _request_interrupt(signum: int, _frame: object) -> None:

@@ -1,12 +1,12 @@
 """TrainingPeaks staging worker.
 
-Fetches only the two Phase-1 endpoint families (planned workouts for a
-future window, zones/thresholds settings) plus the cheap athlete context
-endpoint, and emits Catence staging JSONL. The worker never touches
-DuckDB; Node owns all writes. Per-endpoint error isolation mirrors the
-existing sync semantics: a failed family fails only its own batch, and
-cookie expiry is surfaced as a distinct, actionable error code so the
-Console can prompt a cookie re-paste.
+Fetches only the two Phase-1 endpoint families (workouts over a window that
+straddles today - a bounded history lookback plus the planned future window -
+and zones/thresholds settings) plus the cheap athlete context endpoint, and
+emits Catence staging JSONL. The worker never touches DuckDB; Node owns all
+writes. Per-endpoint error isolation mirrors the existing sync semantics: a
+failed family fails only its own batch, and cookie expiry is surfaced as a
+distinct, actionable error code so the Console can prompt a cookie re-paste.
 """
 
 from __future__ import annotations
@@ -138,13 +138,22 @@ def zone_setting_payloads(settings_payload: Any) -> list[tuple[str, dict[str, An
 
 
 class TrainingPeaksStagingWorker:
-    """Extract TrainingPeaks planned workouts and zone settings into JSONL staging."""
+    """Extract TrainingPeaks planned workouts and zone settings into JSONL staging.
 
-    def __init__(self, client: Any, writer: StagingWriter, progress: Any = None, today: date | None = None) -> None:
+    Workout history accumulates: a past workout already staged in a previous
+    run (present in ``known_workout_ids``) is never re-emitted, while today
+    and future workouts are re-emitted every run so the next-14-day plan
+    stays refreshed. Raw responses archive regardless; the skip only governs
+    entity rows.
+    """
+
+    def __init__(self, client: Any, writer: StagingWriter, progress: Any = None, today: date | None = None,
+                 known_workout_ids: Iterable[str] | None = None) -> None:
         self.client = client
         self.writer = writer
         self.progress = progress
         self.today = today or date.today()
+        self.known_workout_ids = {str(remote_id) for remote_id in (known_workout_ids or ())}
         self._interrupted = False
 
     def request_interrupt(self) -> None:
@@ -206,11 +215,23 @@ class TrainingPeaksStagingWorker:
             self.writer.error("workouts", str(error))
             return
         raw_hash = self.writer.archive_json("workouts", None, data, {"fromDate": from_date.isoformat(), "toDate": to_date.isoformat()})
+        today = self.today.isoformat()
         for index, item in enumerate(as_items(data)):
             remote_id = workout_remote_id(item, f"workouts:{index}")
+            if self._already_accumulated(item, remote_id, today):
+                continue
             self.writer.source_entity("planned_workout", remote_id, dict(item), raw_hash, occurred_on=payload_day(item))
         if self.progress is not None:
             self.progress.finish("planned_workouts")
+
+    def _already_accumulated(self, item: Mapping[str, Any], remote_id: str, today: str) -> bool:
+        """True when the workout is strictly past and a prior run stored it.
+
+        A workout without a parseable day cannot be classified; it is treated
+        as not accumulated so it is emitted rather than silently dropped.
+        """
+        day = payload_day(item)
+        return day is not None and day < today and remote_id in self.known_workout_ids
 
     async def _sync_zones(self, athlete_id: int) -> None:
         if self.progress is not None:

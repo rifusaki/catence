@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from python.catence.providers.trainingpeaks.cli import load_known_workout_ids
 from python.catence.providers.trainingpeaks.registry import TP_READ_ENDPOINTS, assert_read_only_registry
 from python.catence.providers.trainingpeaks.staging import StagingWriter
 from python.catence.providers.trainingpeaks.worker import (
@@ -160,6 +161,70 @@ def test_planned_workout_window_defaults_to_today_plus_14_days(tmp_path: Path) -
     worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1))
     asyncio.run(worker.sync(date(2026, 3, 1)))
     assert any(call == "/fitness/v6/athletes/4242/workouts/2026-03-01/2026-03-15" for call in client.calls)
+
+
+def test_known_past_workouts_are_not_re_staged_but_unknown_past_ones_accumulate(tmp_path: Path) -> None:
+    client = FakeClient(responses={
+        "/fitness/v6/athletes/4242/workouts": FakeResponse(data=[
+            {"workoutId": 1, "workoutDay": "2026-02-10", "title": "Already stored"},
+            {"workoutId": 2, "workoutDay": "2026-02-12", "title": "Never stored"},
+            {"workoutId": 1, "workoutDay": "2026-03-10", "title": "Known but future"},
+        ]),
+    })
+    writer = make_writer(tmp_path)
+    worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1), known_workout_ids=["1"])
+    asyncio.run(worker.sync(date(2026, 2, 1)))
+    entities = [record for record in read_records(writer.output) if record["kind"] == "source_entity"]
+    planned = {record["remoteId"]: record for record in entities if record["entityType"] == "planned_workout"}
+    assert "1" in planned and planned["1"]["occurredOn"] == "2026-03-10"
+    assert "2" in planned and planned["2"]["occurredOn"] == "2026-02-12"
+    assert planned["1"]["payload"]["title"] == "Known but future"
+
+
+def test_todays_workout_is_refreshed_even_when_known(tmp_path: Path) -> None:
+    # Today is not history: the workout may still change or complete during
+    # the day, so a known id must not suppress re-staging until tomorrow.
+    client = FakeClient(responses={
+        "/fitness/v6/athletes/4242/workouts": FakeResponse(data=[{"workoutId": 9, "workoutDay": "2026-03-01"}]),
+    })
+    writer = make_writer(tmp_path)
+    worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1), known_workout_ids=["9"])
+    asyncio.run(worker.sync(date(2026, 2, 1)))
+    entities = [record for record in read_records(writer.output) if record["kind"] == "source_entity"]
+    assert any(record["remoteId"] == "9" for record in entities if record["entityType"] == "planned_workout")
+
+
+def test_workout_without_a_parseable_day_is_staged_rather_than_dropped(tmp_path: Path) -> None:
+    client = FakeClient(responses={
+        "/fitness/v6/athletes/4242/workouts": FakeResponse(data=[{"workoutId": 5, "title": "No day"}]),
+    })
+    writer = make_writer(tmp_path)
+    worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1), known_workout_ids=["5"])
+    asyncio.run(worker.sync(date(2026, 2, 1)))
+    entities = [record for record in read_records(writer.output) if record["kind"] == "source_entity"]
+    assert any(record["remoteId"] == "5" for record in entities if record["entityType"] == "planned_workout")
+
+
+def test_known_past_workouts_are_skipped_only_after_the_raw_archive(tmp_path: Path) -> None:
+    # The whole-response archive must exist even when every past workout is
+    # skipped: the raw payload remains the durable record of the fetch.
+    client = FakeClient(responses={
+        "/fitness/v6/athletes/4242/workouts": FakeResponse(data=[{"workoutId": 1, "workoutDay": "2026-02-10"}]),
+    })
+    writer = make_writer(tmp_path)
+    worker = TrainingPeaksStagingWorker(client, writer, today=date(2026, 3, 1), known_workout_ids=["1"])
+    asyncio.run(worker.sync(date(2026, 2, 1)))
+    records = read_records(writer.output)
+    assert any(record["kind"] == "raw_object" for record in records)
+    assert not any(record["kind"] == "source_entity" and record["entityType"] == "planned_workout" for record in records)
+
+
+def test_load_known_workout_ids_reads_optional_json_array(tmp_path: Path) -> None:
+    assert load_known_workout_ids(None) == set()
+    assert load_known_workout_ids(tmp_path / "absent.json") == set()
+    known = tmp_path / "known.json"
+    known.write_text(json.dumps([101, "102"]), encoding="utf-8")
+    assert load_known_workout_ids(known) == {"101", "102"}
 
 
 def test_default_zone_group_inherits_into_populated_sports() -> None:
