@@ -268,6 +268,50 @@ def test_max_metrics_history_retains_distinct_historical_days(tmp_path):
     assert api.fallback_calls == []
 
 
+def test_collections_stages_saved_garmin_courses_as_routes(tmp_path):
+    class CollectionsApi:
+        def __init__(self) -> None:
+            self.connect_calls: list[str] = []
+
+        def get_workouts(self):
+            return []
+
+        def get_goals(self):
+            return []
+
+        def get_golf_summary(self):
+            return {}
+
+        def get_scheduled_workouts(self, _year, _month):
+            return {}
+
+        def get_events(self, _start_date, limit=100, page=1):
+            return []
+
+        def connectapi(self, path: str):
+            self.connect_calls.append(path)
+            assert path == "course-service/course"
+            return [{
+                "courseId": 507213271,
+                "courseName": "Autumn Half",
+                "activityType": {"typeKey": "running"},
+                "distanceInMeters": 21183.5,
+                "elevationGainInMeters": 382.1,
+            }]
+
+    writer = Writer()
+    api = CollectionsApi()
+    worker = GarminStagingWorker(api, writer, tmp_path)
+
+    worker._collections()
+
+    assert api.connect_calls == ["course-service/course"]
+    routes = [entity for entity in writer.entities if entity[0] == "route"]
+    assert len(routes) == 1
+    assert routes[0][1] == "507213271"
+    assert routes[0][2]["courseName"] == "Autumn Half"
+
+
 def test_stage_course_fetches_and_stages_a_course_source_entity(tmp_path):
     class CourseApi:
         def __init__(self) -> None:

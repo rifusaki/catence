@@ -25,6 +25,7 @@ export type DatasetName =
   | 'workout_documents'
   | 'training_plans'
   | 'routes'
+  | 'route_segments'
   | 'gear'
   | 'devices'
   | 'goals'
@@ -153,7 +154,14 @@ export const DATASET_CATALOG: Record<Exclude<DatasetName, 'training_metrics'>, D
     columns: [column('provider', 'VARCHAR', { filterable: true, groupable: true }), column('workout_id', 'VARCHAR', { filterable: true, groupable: true }), column('workout_doc', 'JSON'), column('payload_json', 'JSON', { description: PAYLOAD_JSON_DESCRIPTION })],
   },
   training_plans: domain('training_plans', 'training_plan_id', 'Training plans and plan hierarchy.', 'occurred_on'),
-  routes: domain('routes', 'route_id', 'Saved routes.'),
+  routes: {
+    name: 'routes', relation: 'routes', description: 'Saved routes mirrored from Strava and Garmin. One row per unique route (routes synced Strava -> Garmin share a route_id); each provider occurrence is listed in route_sources. Find a route by its friendly name with find_route, then read its segments with get_route_segments.', provenanceColumns: ['route_id', 'source_refs'], permittedGroupings: ['sport'],
+    columns: [column('route_id', 'VARCHAR', { filterable: true, groupable: true }), column('name', 'VARCHAR', { filterable: true }), column('sport', 'VARCHAR', { filterable: true, groupable: true }), column('distance_m', 'DOUBLE', { unit: 'm', metric: true }), column('total_elevation_gain_m', 'DOUBLE', { unit: 'm', metric: true }), column('updated_at', 'TIMESTAMPTZ'), column('source_refs', 'VARCHAR')],
+  },
+  route_segments: {
+    name: 'route_segments', relation: 'route_segments', description: 'Strava segments present in a saved route, hydrated during route sync; join strava_segments (segments dataset) for names, grades, and climb category. Read via get_route_segments rather than querying directly.', provenanceColumns: ['route_id', 'segment_id', 'raw_object_hash'], permittedGroupings: ['route_id', 'segment_id'],
+    columns: [column('route_id', 'VARCHAR', { filterable: true, groupable: true }), column('segment_id', 'VARCHAR', { filterable: true, groupable: true }), column('position', 'INTEGER', { metric: true }), column('raw_object_hash', 'VARCHAR')],
+  },
   gear: domain('gear', 'gear_id', 'Equipment and gear records.'),
   devices: domain('devices', 'device_id', 'Device metadata and ownership details.'),
   goals: domain('goals', 'goal_id', 'Goals and challenges.'),

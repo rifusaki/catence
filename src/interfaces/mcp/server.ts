@@ -16,6 +16,7 @@ import {
   DetachedSyncBusyError,
   EventsService,
   filterRosterToScope,
+  RoutesService,
   FitnessService,
   getDataset,
   hydrateStravaActivity,
@@ -245,6 +246,7 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     { question: 'swim per-length analysis (pace / SPL / SWOLF)', steps: ['find_activities', 'get_swim_laps', 'swim_progress_report'] },
     { question: 'running dynamics / running form', steps: ['describe_dataset (run_dynamics)', 'read_series / aggregate_data (run_dynamics by date or activity; vertical_oscillation_cm, ground_contact_time_ms, flight_time_ms, stride_length_cm, vertical_ratio_pct, cadence_spm)'] },
     { question: 'segments / climbs / KOM / PR', steps: ['get_activity_segments', 'hydrate_strava_segment_history'] },
+    { question: 'saved route / route by name / route segments', steps: ['find_route (friendly name)', 'get_route_segments'] },
     { question: 'race readiness / fitness targets', steps: ['readiness_baseline', 'analyze_series', 'aggregate_data'] },
     { question: 'recovery / daily or weekly load', steps: ['review_daily_recovery_load', 'review_weekly_training', 'wellness_baselines'] },
     { question: 'cycling FTP / VO₂max / power curve', steps: ['get_ftp_history', 'get_vo2max_history', 'power_coverage_report', 'power_curve_trend'] },
@@ -830,6 +832,45 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     };
   }));
 
+  registerTool('find_route', {
+    title: 'Find a saved route by its friendly name',
+    description: 'Find saved Strava/Garmin routes by the name shown to the user. Routes synced Strava -> Garmin share one canonical route_id and are not duplicated; every provider occurrence is listed under sources. Read-only.',
+    keywords: ['route', 'routes', 'saved route', 'garmin route', 'strava route', 'find route', 'route name', 'course', 'loop'],
+    inputSchema: { query: z.string().min(1).max(200) },
+  }, tool('find_route', async (input) => useRepository(activePaths(), async (repository) => {
+    const result = await new RoutesService(repository).findRoutes(input.query);
+    return {
+      data: { ...result, routes: result.matches },
+      provenance: { relations: ['routes', 'route_sources'] },
+      caveats: result.caveats,
+    };
+  })));
+
+  registerTool('get_route_segments', {
+    title: 'Read a saved route\u2019s Strava segments',
+    description: 'Resolve a saved route (canonical route_id or provider route source id, or a friendly name resolved via find_route) and return the Strava segments present in it, hydrated during route sync and joined to segment facts exactly like activity segments. Read-only.',
+    keywords: ['route segments', 'segments on a route', 'climbs on a route', 'route', 'saved route'],
+    inputSchema: { routeId: z.string().min(1), limit: z.number().int().min(1).max(500).optional() },
+  }, tool('get_route_segments', async (input) => useRepository(activePaths(), async (repository) => {
+    const service = new RoutesService(repository);
+    const resolved = await service.resolveRoute(input.routeId);
+    const routeId = resolved?.route_id ?? input.routeId;
+    if (!resolved) {
+      const found = await service.findRoutes(input.routeId);
+      if (found.exact) {
+        const segments = await service.routeSegments(found.exact.route_id, input.limit ?? 200);
+        return { data: segments, provenance: { relations: ['routes', 'route_sources', 'route_segments', 'strava_segments'] }, caveats: segments.caveats };
+      }
+      return { data: { routeId: input.routeId, route: null, segments: [] }, provenance: { relations: ['routes', 'route_sources'] }, caveats: [`No saved route named ${input.routeId} exists. Use find_route to look it up by friendly name.`, ...found.caveats] };
+    }
+    const segments = await service.routeSegments(routeId, input.limit ?? 200);
+    return {
+      data: segments,
+      provenance: { relations: ['routes', 'route_sources', 'route_segments', 'strava_segments'] },
+      caveats: [...segments.caveats, 'Segment verification is unavailable from Strava public segment data and is never inferred.'],
+    };
+  })));
+
   registerTool('hydrate_strava_segment_history', {
     title: 'Hydrate one Strava segment history',
     description: 'Write-only targeted enrichment. Fetches a persisted Strava segment and the authenticated athlete’s paged historic efforts; interrupted or throttled work is resumable.',
@@ -845,7 +886,7 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
   registerTool('discover_tools', {
     title: 'Discover all Catence tools and routing',
     description: [
-      'Inventory the full Catence tool surface even when the host truncates its visible tool list. Query by question: next race/upcoming event (aggregate_data on events, search_context, resolve_event_course), course elevation/height profile/GPX (resolve_event_course then read_series or aggregate_data on course_geometry), swim per-length pace/SPL/SWOLF (find_activities, get_swim_laps, swim_progress_report), segments/climbs/KOM/PR (get_activity_segments), running dynamics/form (run_dynamics via describe_dataset/read_series/aggregate_data), race readiness (readiness_baseline), recovery (review_daily_recovery_load, review_weekly_training), cycling FTP/VO₂max/power (get_ftp_history, get_vo2max_history, power_coverage_report, power_curve_trend).',
+      'Inventory the full Catence tool surface even when the host truncates its visible tool list. Query by question: next race/upcoming event (aggregate_data on events, search_context, resolve_event_course), course elevation/height profile/GPX (resolve_event_course then read_series or aggregate_data on course_geometry), swim per-length pace/SPL/SWOLF (find_activities, get_swim_laps, swim_progress_report), segments/climbs/KOM/PR (get_activity_segments), saved routes and their segments (find_route then get_route_segments), running dynamics/form (run_dynamics via describe_dataset/read_series/aggregate_data), race readiness (readiness_baseline), recovery (review_daily_recovery_load, review_weekly_training), cycling FTP/VO₂max/power (get_ftp_history, get_vo2max_history, power_coverage_report, power_curve_trend).',
       ...TOOL_INDEX.map((entry) => `${entry.name} — ${entry.title}`),
     ].join('\n'),
   }, tool('discover_tools', async () => ({

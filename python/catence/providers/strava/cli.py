@@ -14,7 +14,9 @@ from .staging import StravaStagingWriter
 SCOPES = ["read", "activity:read_all", "read_all"]
 READ_ALLOWLIST = {
     "athlete", "gear", "activity_candidates", "activity_detail", "segment", "segment_efforts",
+    "routes", "route_segments",
 }
+ROUTES_PAGE_SIZE = 200
 
 
 class StravaConnectionError(RuntimeError):
@@ -23,7 +25,7 @@ class StravaConnectionError(RuntimeError):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage targeted, read-only Strava data for Catence.")
-    parser.add_argument("--mode", required=True, choices=["authorization-url", "auth", "gear", "activity", "segment-history"])
+    parser.add_argument("--mode", required=True, choices=["authorization-url", "auth", "gear", "activity", "segment-history", "routes"])
     parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--result", required=True, type=Path)
@@ -338,6 +340,71 @@ def stage_activity(reader: StravaReader, writer: StravaStagingWriter, args: argp
     return {"status": "completed", "stravaActivityId": remote_id, "rawHash": detail_hash, "matchEvidence": evidence, "rateHeaders": reader.observed_headers}
 
 
+def stage_routes(reader: StravaReader, writer: StravaStagingWriter) -> dict[str, Any]:
+    """Stage every saved Strava route, hydrating each route's segment list.
+
+    ``/athletes/{id}/routes`` lists the authenticated athlete's routes; each
+    route detail (``/routes/{id}``) carries a ``segments`` array. The listing
+    is paginated and the full active list is staged every run so the importer's
+    mirror sweep can delete routes that were removed upstream.
+    """
+    athlete = object_value(reader.get("athlete", "/athlete"))
+    athlete_id = athlete.get("id")
+    if athlete_id is None or str(athlete_id) == "":
+        raise StravaConnectionError("Strava did not return the authenticated athlete ID required to list saved routes.")
+    routes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    page = 1
+    while True:
+        try:
+            batch = reader.get("routes", f"/athletes/{athlete_id}/routes", page=page, per_page=ROUTES_PAGE_SIZE)
+        except StravaConnectionError as error:
+            if "rate limited" in str(error).lower():
+                return {"status": "partial", "routeCount": 0, "segmentCount": 0, "continuationPage": page, "message": str(error), "rateHeaders": reader.observed_headers}
+            raise
+        if not isinstance(batch, list):
+            raise StravaConnectionError("Strava returned an invalid saved-route listing.")
+        if not batch:
+            break
+        new_routes = 0
+        for route in batch:
+            if not isinstance(route, dict) or route.get("id") is None or str(route["id"]) == "":
+                raise StravaConnectionError("Strava returned a saved route without an identifier.")
+            route_id = str(route["id"])
+            if route_id in seen:
+                continue
+            seen.add(route_id)
+            routes.append(route)
+            new_routes += 1
+        if new_routes == 0:
+            raise StravaConnectionError("Strava saved-route pagination did not advance; refusing to treat a repeated page as a complete listing.")
+        # Strava may return a short page before the final page. Continue until
+        # an empty page instead of assuming a short page is the end.
+        page += 1
+    route_count = 0
+    segment_count = 0
+    for route in routes:
+        route_id = str(route["id"])
+        try:
+            detail = object_value(reader.get("route_segments", f"/routes/{route_id}"))
+        except StravaConnectionError as error:
+            if "rate limited" in str(error).lower():
+                return {"status": "partial", "routeCount": route_count, "segmentCount": segment_count, "continuationPage": page, "message": str(error), "rateHeaders": reader.observed_headers}
+            raise
+        if detail.get("id") is None or str(detail["id"]) != route_id:
+            raise StravaConnectionError(f"Strava returned a route whose ID did not match the requested route {route_id}.")
+        segments = detail.get("segments")
+        if not isinstance(segments, list):
+            raise StravaConnectionError(f"Strava route {route_id} did not include its segment list.")
+        payload = dict(detail)
+        payload["segments"] = segments
+        raw_hash = writer.archive_json("routes", route_id, payload, {"endpoint": "route_segments"})
+        writer.source_entity("route", route_id, payload, raw_hash)
+        route_count += 1
+        segment_count += len(segments)
+    return {"status": "completed", "routeCount": route_count, "segmentCount": segment_count, "rateHeaders": reader.observed_headers}
+
+
 def stage_segment_history(reader: StravaReader, writer: StravaStagingWriter, args: argparse.Namespace) -> dict[str, Any]:
     if not args.segment_id:
         raise StravaConnectionError("Segment history hydration requires a persisted Strava segment ID.")
@@ -392,6 +459,8 @@ def main() -> None:
             result = stage_gear(reader, writer)
         elif args.mode == "activity":
             result = stage_activity(reader, writer, args)
+        elif args.mode == "routes":
+            result = stage_routes(reader, writer)
         else:
             result = stage_segment_history(reader, writer, args)
         result_path_write(args.result, result)

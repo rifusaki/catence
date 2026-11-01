@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { createReadStream } from 'node:fs';
+import { createInterface } from 'node:readline';
 import { readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -10,6 +12,7 @@ import { athleteProviderEnvironment } from '../../../../core/runtime/secrets.js'
 import { CatenceDatabase, openReadOnlyRepository } from '../../../storage/database.js';
 import { importJsonl } from '../../importer.js';
 import { createSyncLogger } from '../../../../core/logging.js';
+import { reconcileRouteSources } from '../../../normalization/routes.js';
 import { withDataWriteLock } from '../../../storage/write-lock.js';
 
 const execFileAsync = promisify(execFile);
@@ -22,6 +25,8 @@ type WorkerResult = {
   stravaActivityId?: string;
   segmentId?: string;
   gearCount?: number;
+  routeCount?: number;
+  segmentCount?: number;
   effortCount?: number;
   continuationPage?: number;
   lastCompletedPage?: number;
@@ -182,6 +187,76 @@ async function runReadOperation(paths: CatencePaths, operation: 'gear' | 'activi
 
 export async function syncStravaGear(paths: CatencePaths, refresh = true): Promise<WorkerResult | Record<string, unknown>> {
   return runReadOperation(paths, 'gear', [], { type: 'gear', id: 'authenticated_athlete' }, refresh);
+}
+
+/** Remote ids of every route staged in a manifest, used as the mirror-sync keep list. */
+async function stagedRouteIds(stagedManifestPath: string): Promise<string[]> {
+  const ids: string[] = [];
+  const file = createReadStream(stagedManifestPath, { encoding: 'utf8' });
+  const lines = createInterface({ input: file, crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const record = JSON.parse(line) as { kind?: unknown; provider?: unknown; entityType?: unknown; remoteId?: unknown };
+      if (record?.kind === 'source_entity' && record.provider === 'strava' && record.entityType === 'route' && typeof record.remoteId === 'string') {
+        ids.push(record.remoteId);
+      }
+    } catch {
+      continue;
+    }
+  }
+  return ids;
+}
+
+/**
+ * Sync the authenticated athlete's saved Strava routes and mirror the active
+ * list: routes present in the latest listing are upserted (unchanged payloads
+ * are not rewritten), routes missing from it are deleted. Each route's
+ * Strava segments are hydrated with it.
+ */
+export async function syncStravaRoutes(paths: CatencePaths): Promise<WorkerResult | Record<string, unknown>> {
+  return withDataWriteLock(paths, async () => {
+    await ensurePaths(paths);
+    const log = createSyncLogger(paths);
+    const database = await CatenceDatabase.open(paths);
+    try {
+      await checkBudget(database, paths);
+      const runId = await database.beginRun('strava', new Date().toISOString().slice(0, 10));
+      log.info('Starting Strava route sync', { runId });
+      const directory = path.join(paths.staging, 'strava');
+      const stagingPath = path.join(directory, `${runId}.routes.jsonl`);
+      const resultPath = path.join(directory, `${runId}.routes.result.json`);
+      let result: WorkerResult;
+      try {
+        result = await invokeWorker(paths, ['--mode', 'routes', '--run-id', runId, '--output', stagingPath], resultPath);
+        if (result.status === 'completed') {
+          if (!existsSync(stagingPath)) throw new StravaEnrichmentError('Strava route worker completed without writing its staging manifest.');
+          const keep = await stagedRouteIds(stagingPath);
+          if (typeof result.routeCount === 'number' && keep.length !== result.routeCount) {
+            throw new StravaEnrichmentError(`Strava route staging manifest contains ${keep.length} routes but the worker reported ${result.routeCount}.`);
+          }
+          await importJsonl(database, runId, stagingPath, log);
+          const reconciled = await reconcileRouteSources(database, 'strava', keep);
+          log.info('Strava route mirror reconciliation finished', { runId, ...reconciled });
+        } else {
+          log.warn('Skipping Strava route import and mirror reconciliation because the route listing did not complete', { runId, status: result.status, message: result.message });
+        }
+        await storeRateState(database, result);
+        await writeState(database, 'routes', 'authenticated_athlete', result);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log.error('Strava route sync failed', { runId, error: message });
+        await database.addError(runId, 'strava', 'routes', null, message, true);
+        throw error;
+      } finally {
+        await database.finishRun(runId);
+      }
+      if (result.status === 'error') throw new StravaEnrichmentError(result.message ?? 'Strava route sync failed.');
+      return result;
+    } finally {
+      await database.close();
+    }
+  });
 }
 
 type ActivityMatch = { activity_source_id: string; activity_id: string; provider: string; remote_activity_id: string; external_id: string | null; source_payload: string | Record<string, unknown> | null; started_at_utc: string | Date | null; sport: string | null; distance_m: number | null; elapsed_s: number | null };

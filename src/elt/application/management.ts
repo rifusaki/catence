@@ -17,7 +17,8 @@ import { createSyncLogger, type SyncLogger } from '../../core/logging.js';
 import { athleteProviderEnvironment } from '../../core/runtime/secrets.js';
 import { importJsonl } from '../ingestion/importer.js';
 import { IntervalsExtractor } from '../ingestion/providers/intervals.js';
-import { completeStravaAuthorization, disconnectStrava, getStravaAuthorizationUrl, syncStravaGear } from '../ingestion/providers/strava/service.js';
+import { completeStravaAuthorization, disconnectStrava, getStravaAuthorizationUrl, syncStravaGear, syncStravaRoutes } from '../ingestion/providers/strava/service.js';
+import { reconcileRouteSources } from '../normalization/routes.js';
 import { setManualActivityLink, unlinkActivitySource } from '../normalization/activities/linking.js';
 import { importSourceEntity } from '../normalization/normalizers.js';
 import { CatenceDatabase, openReadOnlyRepository, ReadOnlyDatabaseError } from '../storage/database.js';
@@ -53,15 +54,20 @@ function packageRoot(): string {
 const GARMIN_EVENTS_LOOKBACK_DAYS = 365;
 const GARMIN_SCHEDULED_MONTHS_BACK = 3;
 
+export type GarminStagedInventory = {
+  events: string[];
+  scheduled: string[];
+  routes: string[];
+  routeListingFailed: boolean;
+};
+
 /**
- * Delete calendar entities that the latest Garmin listing no longer contains.
- * The staging manifest is the authority on which ids were just fetched; any
- * in-window row of the same type missing from it was deleted (or un-enrolled)
- * upstream and would otherwise linger as a ghost.
+ * Read the ids the Garmin worker just staged. A route extraction error (or a
+ * route that only received the worker's fallback id) means the listing is not
+ * authoritative and must never drive a mirror-delete sweep.
  */
-async function reconcileGarminCalendarEntities(database: CatenceDatabase, stagedManifestPath: string): Promise<void> {
-  const events: string[] = [];
-  const scheduled: string[] = [];
+export async function readGarminStagedInventory(stagedManifestPath: string): Promise<GarminStagedInventory> {
+  const inventory: GarminStagedInventory = { events: [], scheduled: [], routes: [], routeListingFailed: false };
   const file = createReadStream(stagedManifestPath, { encoding: 'utf8' });
   const lines = createInterface({ input: file, crlfDelay: Infinity });
   for await (const line of lines) {
@@ -72,17 +78,46 @@ async function reconcileGarminCalendarEntities(database: CatenceDatabase, staged
     } catch {
       continue; // The importer owns malformed-line reporting.
     }
-    const candidate = record as { kind?: unknown; provider?: unknown; entityType?: unknown; remoteId?: unknown };
+    const candidate = record as { kind?: unknown; provider?: unknown; endpoint?: unknown; entityType?: unknown; remoteId?: unknown };
+    if (candidate?.kind === 'extraction_error' && candidate.provider === 'garmin' && (candidate.endpoint === 'routes' || candidate.endpoint === 'route-service/routes' || candidate.endpoint === 'course-service/course')) {
+      inventory.routeListingFailed = true;
+      continue;
+    }
     if (candidate?.kind !== 'source_entity' || candidate.provider !== 'garmin') continue;
-    if (candidate.entityType === 'event' && typeof candidate.remoteId === 'string') events.push(candidate.remoteId);
-    if (candidate.entityType === 'scheduled_workout' && typeof candidate.remoteId === 'string') scheduled.push(candidate.remoteId);
+    if (candidate.entityType === 'event' && typeof candidate.remoteId === 'string') inventory.events.push(candidate.remoteId);
+    if (candidate.entityType === 'scheduled_workout' && typeof candidate.remoteId === 'string') inventory.scheduled.push(candidate.remoteId);
+    if (candidate.entityType === 'route' && typeof candidate.remoteId === 'string') {
+      if (candidate.remoteId.startsWith('routes:')) inventory.routeListingFailed = true;
+      else inventory.routes.push(candidate.remoteId);
+    }
   }
+  return inventory;
+}
+
+/**
+ * Delete calendar entities that the latest Garmin listing no longer contains.
+ * The staging manifest is the authority on which ids were just fetched; any
+ * in-window row of the same type missing from it was deleted (or un-enrolled)
+ * upstream and would otherwise linger as a ghost.
+ */
+export async function reconcileGarminCalendarEntities(database: CatenceDatabase, stagedManifestPath: string, log?: Pick<SyncLogger, 'warn'>): Promise<void> {
+  const inventory = await readGarminStagedInventory(stagedManifestPath);
 
   const now = new Date();
   const eventCutoff = new Date(now.getTime() - GARMIN_EVENTS_LOOKBACK_DAYS * 86_400_000).toISOString().slice(0, 10);
   const scheduledCutoff = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - GARMIN_SCHEDULED_MONTHS_BACK, 1)).toISOString().slice(0, 10);
-  await database.deleteMissingCalendarEntities('garmin', ['event'], events, eventCutoff);
-  await database.deleteMissingCalendarEntities('garmin', ['scheduled_workout'], scheduled, scheduledCutoff);
+  await database.deleteMissingCalendarEntities('garmin', ['event'], inventory.events, eventCutoff);
+  await database.deleteMissingCalendarEntities('garmin', ['scheduled_workout'], inventory.scheduled, scheduledCutoff);
+  // Saved routes are a full listing every run, so the database mirrors the
+  // active Garmin list: sources missing from the staged manifest were deleted
+  // upstream and are removed, and routes left without any source go too.
+  // Skip the sweep when the listing failed: an empty keep-list would otherwise
+  // erase every mirrored route.
+  if (inventory.routeListingFailed) {
+    log?.warn('Skipping Garmin route mirror reconciliation because the saved-route listing did not complete');
+    return;
+  }
+  await reconcileRouteSources(database, 'garmin', inventory.routes);
 }
 
 type GarminWorkerOutcome = { code: number | null; signal: NodeJS.Signals | null };
@@ -454,7 +489,7 @@ async function syncProvider(database: CatenceDatabase, paths: CatencePaths, prov
         await importJsonl(database, runId, output, log);
         log.info('Garmin staging import finished', { runId, durationMs: Date.now() - phaseStartedAt });
         phaseStartedAt = Date.now();
-        await reconcileGarminCalendarEntities(database, output);
+        await reconcileGarminCalendarEntities(database, output, log);
         log.info('Garmin calendar reconciliation finished', { runId, durationMs: Date.now() - phaseStartedAt });
         if (provider === 'garmin') {
           try {
@@ -515,7 +550,11 @@ export async function initializeDataStore(paths: CatencePaths): Promise<Record<s
 
 export async function syncData(paths: CatencePaths, provider: ProviderChoice, explicitFrom?: string, advanceCursor = true, refreshActivities = false, backfill = false): Promise<Record<string, unknown>> {
   await ensurePaths(paths);
-  if (provider === 'strava') return { provider, result: await syncStravaGear(paths) };
+  if (provider === 'strava') {
+    const gear = await syncStravaGear(paths);
+    const routes = await syncStravaRoutes(paths);
+    return { provider, result: { gear, routes } };
+  }
   const database = await CatenceDatabase.open(paths);
   const log = createSyncLogger(paths);
   try {

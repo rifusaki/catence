@@ -1094,4 +1094,54 @@ const unifiedFitnessTrendMigration: Migration = {
   `,
 };
 
-export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration, syncRunProgressMigration, canonicalTrainingDerivedAvgPowerMigration, courseGeometryMigration, activityDecouplingFactsMigration, runDynamicsFactsMigration, intervalsFitnessTrendMigration, unifiedFitnessTrendMigration];
+const routesMigration: Migration = {
+  version: 21,
+  name: 'routes',
+  sql: `
+    -- Saved routes from Strava and Garmin, mirrored on each provider sync.
+    -- routes holds the canonical route (one row per unique route, keyed by a
+    -- deterministic route_id derived from the provider pair so a route synced
+    -- Strava -> Garmin keeps one identity instead of two duplicates); every
+    -- provider occurrence is recorded in route_sources, exactly like
+    -- activities/activity_sources. route_segments hydrates the Strava segments
+    -- a route passes through, mirroring activity_segments for activities.
+    CREATE TABLE IF NOT EXISTS route_facts (
+      route_id VARCHAR PRIMARY KEY,
+      name VARCHAR,
+      sport VARCHAR,
+      distance_m DOUBLE,
+      total_elevation_gain_m DOUBLE,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS route_sources (
+      route_source_id VARCHAR PRIMARY KEY,
+      route_id VARCHAR NOT NULL REFERENCES route_facts (route_id),
+      provider VARCHAR NOT NULL,
+      remote_route_id VARCHAR NOT NULL,
+      raw_object_hash VARCHAR,
+      synced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (provider, remote_route_id)
+    );
+    CREATE INDEX IF NOT EXISTS route_sources_route_idx ON route_sources (route_id);
+    CREATE TABLE IF NOT EXISTS route_segments (
+      route_id VARCHAR NOT NULL REFERENCES route_facts (route_id),
+      segment_id VARCHAR NOT NULL,
+      position INTEGER NOT NULL,
+      raw_object_hash VARCHAR,
+      PRIMARY KEY (route_id, segment_id)
+    );
+    CREATE INDEX IF NOT EXISTS route_segments_segment_idx ON route_segments (segment_id);
+
+    -- Replaces the legacy domain_entities projection: routes now reads the
+    -- mirrored route_facts joined with every provider occurrence.
+    CREATE OR REPLACE VIEW routes AS
+    SELECT r.route_id, r.name, r.sport, r.distance_m, r.total_elevation_gain_m, r.updated_at,
+      (SELECT string_agg(rs.provider || ':' || rs.remote_route_id, ', ' ORDER BY rs.provider)
+       FROM route_sources AS rs WHERE rs.route_id = r.route_id) AS source_refs
+    FROM route_facts AS r;
+
+    UPDATE retrieval_index_state SET status = 'stale' WHERE index_name = 'context';
+  `,
+};
+
+export const migrations: Migration[] = [...baseMigrations, stravaAndIdentityMigration, garminPrimaryAndTrainingMetricsMigration, garminActivitySportAndFtpBackfillMigration, garminPrimaryDailyHealthMigration, garminHistoricalMetricsAndStreamsMigration, garminUtcActivityTimestampMigration, garminLactateThresholdMetricsMigration, swimFactsAndQualityMigration, syncRunProgressMigration, canonicalTrainingDerivedAvgPowerMigration, courseGeometryMigration, activityDecouplingFactsMigration, runDynamicsFactsMigration, intervalsFitnessTrendMigration, unifiedFitnessTrendMigration, routesMigration];

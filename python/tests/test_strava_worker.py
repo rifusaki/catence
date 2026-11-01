@@ -160,3 +160,145 @@ def test_activity_hydration_reports_a_search_window_when_strava_returns_no_candi
 
 def test_scope_set_is_the_minimum_requested_for_targeted_enrichment() -> None:
     assert SCOPES == ["read", "activity:read_all", "read_all"]
+
+
+def test_stage_routes_paginates_the_athletes_saved_routes_and_hydrates_segments(tmp_path: Path, monkeypatch: object) -> None:
+    from python.catence.providers.strava import cli
+
+    monkeypatch.setattr(cli, "ROUTES_PAGE_SIZE", 2)  # type: ignore[attr-defined]
+    writer = StravaStagingWriter(tmp_path, tmp_path / "stage.jsonl")
+    writer.manifest("00000000-0000-4000-8000-000000000000", "2026-02-01")
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    class Reader:
+        observed_headers = {"x-ratelimit-limit": "100,1000"}
+
+        def get(self, endpoint: str, path: str, **params: object) -> object:
+            calls.append((endpoint, path, params))
+            if endpoint == "athlete":
+                return {"id": 42}
+            if endpoint == "routes":
+                assert path == "/athletes/42/routes"
+                page = params["page"]
+                assert params["per_page"] == 2
+                if page == 1:
+                    # A short page is not authoritative: Strava can return one
+                    # before the final page, so pagination must continue.
+                    return [{"id": 555, "name": "Morning Loop"}]
+                if page == 2:
+                    return [{"id": 556, "name": "Evening Ride"}, {"id": 557, "name": "Recovery Spin"}]
+                return []
+            if endpoint == "route_segments":
+                route_id = int(path.rsplit("/", 1)[1])
+                segments = [{"id": 101, "name": "Hill Climb"}] if route_id == 555 else []
+                return {"id": route_id, "segments": segments}
+            raise AssertionError(f"unexpected call {endpoint} {path}")
+
+    result = cli.stage_routes(Reader(), writer)
+
+    assert result["status"] == "completed"
+    assert result["routeCount"] == 3
+    assert result["segmentCount"] == 1
+    assert [call[:2] for call in calls] == [
+        ("athlete", "/athlete"),
+        ("routes", "/athletes/42/routes"),
+        ("routes", "/athletes/42/routes"),
+        ("routes", "/athletes/42/routes"),
+        ("route_segments", "/routes/555"),
+        ("route_segments", "/routes/556"),
+        ("route_segments", "/routes/557"),
+    ]
+
+    lines = [json.loads(line) for line in (tmp_path / "stage.jsonl").read_text().splitlines() if line.strip()]
+    route_entities = [line for line in lines if line.get("kind") == "source_entity" and line.get("entityType") == "route"]
+    assert [entity["remoteId"] for entity in route_entities] == ["555", "556", "557"]
+    assert route_entities[0]["payload"]["segments"] == [{"id": 101, "name": "Hill Climb"}]
+
+
+def test_stage_routes_fails_closed_when_pagination_repeats_a_page(tmp_path: Path, monkeypatch: object) -> None:
+    from python.catence.providers.strava import cli
+
+    monkeypatch.setattr(cli, "ROUTES_PAGE_SIZE", 2)  # type: ignore[attr-defined]
+    writer = StravaStagingWriter(tmp_path, tmp_path / "stage.jsonl")
+
+    class Reader:
+        observed_headers: dict[str, str] = {}
+
+        def get(self, endpoint: str, _path: str, **_params: object) -> object:
+            if endpoint == "athlete":
+                return {"id": 42}
+            return [{"id": 555, "name": "Morning Loop"}]
+
+    try:
+        cli.stage_routes(Reader(), writer)
+    except StravaConnectionError as error:
+        assert "did not advance" in str(error)
+    else:
+        raise AssertionError("expected repeated pagination to fail closed")
+
+
+def test_stage_routes_requires_the_authenticated_athlete_id(tmp_path: Path) -> None:
+    from python.catence.providers.strava.cli import stage_routes
+
+    writer = StravaStagingWriter(tmp_path, tmp_path / "stage.jsonl")
+
+    class Reader:
+        observed_headers: dict[str, str] = {}
+
+        def get(self, endpoint: str, _path: str, **_params: object) -> object:
+            if endpoint == "athlete":
+                return {}
+            raise AssertionError("routes must not be requested without an athlete id")
+
+    try:
+        stage_routes(Reader(), writer)
+    except StravaConnectionError as error:
+        assert "athlete ID" in str(error)
+    else:
+        raise AssertionError("expected a missing athlete id to fail closed")
+
+
+def test_stage_routes_rejects_a_route_without_an_identifier(tmp_path: Path) -> None:
+    from python.catence.providers.strava.cli import stage_routes
+
+    writer = StravaStagingWriter(tmp_path, tmp_path / "stage.jsonl")
+
+    class Reader:
+        observed_headers: dict[str, str] = {}
+
+        def get(self, endpoint: str, _path: str, **params: object) -> object:
+            if endpoint == "athlete":
+                return {"id": 42}
+            if endpoint == "routes":
+                return [{"name": "No ID"}] if params.get("page") == 1 else []
+            raise AssertionError("route details must not be requested for an unidentified route")
+
+    try:
+        stage_routes(Reader(), writer)
+    except StravaConnectionError as error:
+        assert "without an identifier" in str(error)
+    else:
+        raise AssertionError("expected an unidentified route to fail closed")
+
+
+def test_stage_routes_rejects_a_mismatched_route_id(tmp_path: Path) -> None:
+    from python.catence.providers.strava.cli import stage_routes
+
+    writer = StravaStagingWriter(tmp_path, tmp_path / "stage.jsonl")
+
+    class Reader:
+        observed_headers: dict[str, str] = {}
+
+        def get(self, endpoint: str, _path: str, **params: object) -> object:
+            if endpoint == "athlete":
+                return {"id": 42}
+            if endpoint == "routes":
+                return [{"id": 555, "name": "Morning Loop"}] if params.get("page") == 1 else []
+            return {"id": 999, "name": "Something Else", "segments": []}
+
+    try:
+        stage_routes(Reader(), writer)
+    except StravaConnectionError as error:
+        assert "did not match" in str(error)
+    else:
+        raise AssertionError("expected a mismatched route id to fail closed")

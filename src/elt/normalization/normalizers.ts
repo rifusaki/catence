@@ -1,6 +1,7 @@
 import type { CatenceDatabase } from '../storage/database.js';
 import { json } from '../storage/sql.js';
 import type { Provider, SourceEntity } from '../../contracts/staging.js';
+import { importRouteEntity } from './routes.js';
 
 type JsonObject = Record<string, unknown>;
 
@@ -306,6 +307,7 @@ export async function importSourceEntity(database: CatenceDatabase, entity: Sour
   if (entity.provider === 'garmin' && entity.entityType === 'health_event') await importHealthSession(database, entity.remoteId, entity.occurredOn, 'daily_event', payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'activity_power_best') await importActivityPowerBest(database, entity.parentRemoteId, payload, rawHash);
   if (entity.provider === 'garmin' && entity.entityType === 'course') await importGarminCourse(database, entity.remoteId, payload, rawHash);
+  if ((entity.provider === 'garmin' || entity.provider === 'strava') && entity.entityType === 'route') await importRouteEntity(database, entity);
   if (entity.provider === 'trainingpeaks' && entity.entityType === 'zone_setting') await importTrainingPeaksZoneSetting(database, entity.remoteId, entity.occurredOn, payload, rawHash);
   if (entity.provider === 'trainingpeaks' && entity.entityType === 'planned_workout') await importTrainingPeaksPlannedWorkout(database, entity.remoteId, entity.occurredOn, payload, rawHash);
 }
