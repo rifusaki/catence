@@ -24,7 +24,7 @@ async function storeGenericEntity(database: CatenceDatabase, entity: SourceEntit
 export async function upsertStravaSegment(database: CatenceDatabase, source: ObjectValue, rawHash: string | null): Promise<void> {
   const segmentId = text(source.id);
   if (!segmentId) return;
-  const hasDescriptiveFacts = text(source.name) !== null || typeof source.starred === 'boolean' || number(source.average_grade) !== null || number(source.distance) !== null;
+  const hasDescriptiveFacts = text(source.name) !== null || typeof source.starred === 'boolean' || number(source.average_grade) !== null || number(source.avg_grade) !== null || number(source.distance) !== null;
   await database.run(`INSERT INTO strava_segments (segment_id, name, activity_type, distance_m, average_grade_pct, maximum_grade_pct, climb_category, elevation_high_m, elevation_low_m, total_elevation_gain_m, private, hazardous, starred, raw_object_hash, payload_json)
     VALUES ($segmentId, $name, $activityType, $distanceM, $averageGrade, $maximumGrade, $climbCategory, $elevationHigh, $elevationLow, $elevationGain, $private, $hazardous, $starred, $rawHash, $payload)
     ON CONFLICT (segment_id) DO UPDATE SET
@@ -44,7 +44,7 @@ export async function upsertStravaSegment(database: CatenceDatabase, source: Obj
       payload_json = CASE WHEN $hasDescriptiveFacts THEN excluded.payload_json ELSE strava_segments.payload_json END,
       updated_at = now()`,
     {
-      segmentId, name: text(source.name), activityType: text(source.activity_type), distanceM: number(source.distance), averageGrade: number(source.average_grade), maximumGrade: number(source.maximum_grade), climbCategory: number(source.climb_category), elevationHigh: number(source.elevation_high), elevationLow: number(source.elevation_low), elevationGain: number(source.total_elevation_gain), private: typeof source.private === 'boolean' ? source.private : null, hazardous: typeof source.hazardous === 'boolean' ? source.hazardous : null, starred: typeof source.starred === 'boolean' ? source.starred : null, rawHash, payload: json(source), hasDescriptiveFacts,
+      segmentId, name: text(source.name), activityType: text(source.activity_type), distanceM: number(source.distance), averageGrade: number(source.average_grade) ?? number(source.avg_grade), maximumGrade: number(source.maximum_grade) ?? number(source.max_grade), climbCategory: number(source.climb_category), elevationHigh: number(source.elevation_high), elevationLow: number(source.elevation_low), elevationGain: number(source.total_elevation_gain), private: typeof source.private === 'boolean' ? source.private : null, hazardous: typeof source.hazardous === 'boolean' ? source.hazardous : null, starred: typeof source.starred === 'boolean' ? source.starred : null, rawHash, payload: json(source), hasDescriptiveFacts,
     });
 }
 

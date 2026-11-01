@@ -25,6 +25,8 @@ type WorkerResult = {
   stravaActivityId?: string;
   segmentId?: string;
   gearCount?: number;
+  routeCount?: number;
+  segmentCount?: number;
   effortCount?: number;
   continuationPage?: number;
   lastCompletedPage?: number;
@@ -227,11 +229,17 @@ export async function syncStravaRoutes(paths: CatencePaths): Promise<WorkerResul
       let result: WorkerResult;
       try {
         result = await invokeWorker(paths, ['--mode', 'routes', '--run-id', runId, '--output', stagingPath], resultPath);
-        if (existsSync(stagingPath)) {
-          await importJsonl(database, runId, stagingPath, log);
+        if (result.status === 'completed') {
+          if (!existsSync(stagingPath)) throw new StravaEnrichmentError('Strava route worker completed without writing its staging manifest.');
           const keep = await stagedRouteIds(stagingPath);
+          if (typeof result.routeCount === 'number' && keep.length !== result.routeCount) {
+            throw new StravaEnrichmentError(`Strava route staging manifest contains ${keep.length} routes but the worker reported ${result.routeCount}.`);
+          }
+          await importJsonl(database, runId, stagingPath, log);
           const reconciled = await reconcileRouteSources(database, 'strava', keep);
           log.info('Strava route mirror reconciliation finished', { runId, ...reconciled });
+        } else {
+          log.warn('Skipping Strava route import and mirror reconciliation because the route listing did not complete', { runId, status: result.status, message: result.message });
         }
         await storeRateState(database, result);
         await writeState(database, 'routes', 'authenticated_athlete', result);

@@ -1,9 +1,12 @@
+import { mkdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { temporaryDatabase } from './helpers.js';
 import { importRecord } from '../src/elt/ingestion/importer.js';
-import { canonicalRouteId, reconcileRouteSources } from '../src/elt/normalization/routes.js';
+import { canonicalRouteId, normalizeRouteSport, reconcileRouteSources } from '../src/elt/normalization/routes.js';
 import { RoutesService } from '../src/core/query/routes.js';
 import { openReadOnlyRepository } from '../src/elt/storage/database.js';
+import { readGarminStagedInventory, reconcileGarminCalendarEntities } from '../src/elt/application/management.js';
 import type { SourceEntity } from '../src/contracts/staging.js';
 
 function routeEntity(provider: 'garmin' | 'strava', remoteId: string, payload: Record<string, unknown>): SourceEntity {
@@ -35,7 +38,12 @@ describe('route normalization', () => {
     const { paths, database } = await temporaryDatabase();
     try {
       await importRecord(database, 'run-seed', routeEntity('strava', '555', MORNING_LOOP));
-      await importRecord(database, 'run-seed', routeEntity('garmin', 'g-77', { ...MORNING_LOOP }));
+      await importRecord(database, 'run-seed', routeEntity('garmin', 'g-77', {
+        courseName: 'Morning Loop',
+        activityType: { typeKey: 'running' },
+        distanceInMeters: 10_000,
+        elevationGainInMeters: 120,
+      }));
 
       const routes = await database.rows('SELECT route_id, name, sport, distance_m FROM route_facts');
       expect(routes).toHaveLength(1);
@@ -70,6 +78,101 @@ describe('route normalization', () => {
       await importRecord(database, 'run-3', routeEntity('strava', '555', { ...MORNING_LOOP, segments: [MORNING_LOOP.segments[0]] }));
       const segments = await database.rows('SELECT segment_id FROM route_segments');
       expect(segments.map((row) => row.segment_id)).toEqual(['101']);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('refreshes route facts when a changed payload arrives', async () => {
+    const { database } = await temporaryDatabase();
+    try {
+      await importRecord(database, 'run-1', routeEntity('strava', '555', MORNING_LOOP));
+      const [before] = await database.rows<{ updated_at: string; distance_m: number }>(
+        'SELECT cast(updated_at AS VARCHAR) AS updated_at, distance_m FROM route_facts',
+      );
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      await importRecord(database, 'run-2', {
+        ...routeEntity('strava', '555', { ...MORNING_LOOP, distance: 12_000, elevationGain: 180 }),
+        rawObjectHash: 'hash-strava-555-changed',
+      });
+      const [after] = await database.rows<{ updated_at: string; distance_m: number; total_elevation_gain_m: number }>(
+        'SELECT cast(updated_at AS VARCHAR) AS updated_at, distance_m, total_elevation_gain_m FROM route_facts',
+      );
+      expect(after.distance_m).toBe(12_000);
+      expect(after.total_elevation_gain_m).toBe(180);
+      expect(after.updated_at).not.toBe(before.updated_at);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('maps Strava numeric route types and Garmin activityType families to one canonical route', async () => {
+    const { database } = await temporaryDatabase();
+    try {
+      await importRecord(database, 'run-seed', routeEntity('strava', '555', {
+        name: 'Coastal Loop', type: 1, distance: 50_000, elevation_gain: 300,
+      }));
+      await importRecord(database, 'run-seed', routeEntity('garmin', 'g-88', {
+        courseName: 'Coastal Loop', activityType: { typeKey: 'road_biking' }, distanceInMeters: 50_000, elevationGainInMeters: 300,
+      }));
+
+      const routes = await database.rows<{ route_id: string; sport: string }>('SELECT route_id, sport FROM route_facts');
+      expect(routes).toHaveLength(1);
+      expect(routes[0].sport).toBe('cycling');
+      expect(routes[0].route_id).toBe(canonicalRouteId('Coastal Loop', 'cycling'));
+      const sources = await database.rows<{ route_source_id: string }>('SELECT route_source_id FROM route_sources ORDER BY route_source_id');
+      expect(sources.map((row) => row.route_source_id)).toEqual(['garmin:g-88', 'strava:555']);
+      expect(normalizeRouteSport(2)).toBe('running');
+      expect(normalizeRouteSport({ typeKey: 'trail_running' })).toBe('running');
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('skips Garmin route reconciliation when the saved-route listing failed', async () => {
+    const { paths, database } = await temporaryDatabase();
+    try {
+      await importRecord(database, 'run-seed', routeEntity('garmin', 'g-77', MORNING_LOOP));
+      const manifest = path.join(paths.staging, 'garmin', 'failed.jsonl');
+      await mkdir(path.dirname(manifest), { recursive: true });
+      await writeFile(manifest, [
+        JSON.stringify({ kind: 'run_manifest', runId: 'run-failed' }),
+        JSON.stringify({ kind: 'extraction_error', provider: 'garmin', endpoint: 'routes', message: 'boom' }),
+      ].join('\n'));
+      const inventory = await readGarminStagedInventory(manifest);
+      expect(inventory.routeListingFailed).toBe(true);
+      await reconcileGarminCalendarEntities(database, manifest);
+      const sources = await database.rows<{ route_source_id: string }>('SELECT route_source_id FROM route_sources');
+      expect(sources.map((row) => row.route_source_id)).toEqual(['garmin:g-77']);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('preserves Strava segments when a Garmin mirror imports, then drops them when the Strava source is removed', async () => {
+    const { database } = await temporaryDatabase();
+    try {
+      await importRecord(database, 'run-seed', routeEntity('strava', '555', MORNING_LOOP));
+      await importRecord(database, 'run-seed', routeEntity('garmin', 'g-77', {
+        courseName: 'Morning Loop',
+        activityType: { typeKey: 'running' },
+        distanceInMeters: 10_000,
+        elevationGainInMeters: 120,
+      }));
+
+      const before = await database.rows('SELECT segment_id FROM route_segments ORDER BY segment_id');
+      expect(before.map((row) => row.segment_id)).toEqual(['101', '102']);
+
+      const result = await reconcileRouteSources(database, 'strava', []);
+      expect(result.deletedSources).toBe(1);
+      expect(result.deletedRoutes).toBe(0);
+
+      const sources = await database.rows('SELECT route_source_id FROM route_sources');
+      expect(sources.map((row) => row.route_source_id)).toEqual(['garmin:g-77']);
+      const routes = await database.rows('SELECT route_id FROM route_facts');
+      expect(routes).toHaveLength(1);
+      const segments = await database.rows('SELECT segment_id FROM route_segments');
+      expect(segments).toHaveLength(0);
     } finally {
       await database.close();
     }

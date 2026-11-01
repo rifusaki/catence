@@ -28,11 +28,29 @@ def as_items(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, list):
         return [as_dict(item) for item in value]
     if isinstance(value, dict):
-        for key in ("activityList", "items", "data", "meals", "foodLogEntries", "hrvSummaries", "individualStats", "results", "values", "events", "racePredictions", "predictions", "dailyPredictions"):
+        for key in ("activityList", "routeList", "courseList", "items", "data", "meals", "foodLogEntries", "hrvSummaries", "individualStats", "results", "values", "events", "racePredictions", "predictions", "dailyPredictions"):
             if isinstance(value.get(key), list):
                 return [as_dict(item) for item in value[key]]
         return [value]
     return []
+
+
+def route_items(value: Any) -> list[dict[str, Any]] | None:
+    """Parse the saved-route listing, which may be a bare list or a wrapper.
+
+    Returning ``None`` for an unrecognized shape lets the caller record a
+    fail-closed extraction error instead of staging the wrapper as one route.
+    """
+    if isinstance(value, list):
+        return [as_dict(item) for item in value]
+    if isinstance(value, dict):
+        for key in ("routeList", "courseList", "routes"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                return [as_dict(item) for item in nested]
+        if any(key in value for key in ("routeId", "courseId", "routeName", "courseName", "id", "name")):
+            return [value]
+    return None
 
 
 def functional_threshold_power_items(value: Any) -> list[dict[str, Any]]:
@@ -107,7 +125,7 @@ def ftp_history_date(payload: Mapping[str, Any]) -> str | None:
 
 
 def remote_id(payload: dict[str, Any], fallback: str) -> str:
-    for key in ("activityId", "workoutId", "scheduleId", "id", "calendarDate", "date", "uuid"):
+    for key in ("activityId", "workoutId", "scheduleId", "routeId", "courseId", "id", "calendarDate", "date", "uuid"):
         if payload.get(key) is not None:
             return str(payload[key])
     return fallback
@@ -954,16 +972,25 @@ class GarminStagingWorker:
             "goals": ("get_goals", (), "goal"), "golf_summary": ("get_golf_summary", (), "golf_scorecard"),
         }
         # Saved routes: garminconnect 0.3.x has no first-class route listing, so
-        # the raw Connect API is used like stage_course does for courses:
-        # connectapi("route-service/routes") returns the user's saved routes.
+        # the raw Connect API is used like stage_course does for courses.
+        # Garmin exposes saved courses/routes at course-service/course; the
+        # route-service namespace returns 404 for this account.
         def fetch_routes(_: str) -> None:
             payload, raw_hash = self._capture(
                 "routes",
-                lambda: self.api.connectapi("route-service/routes"),
-                scope={"endpoint": "route-service/routes"},
+                lambda: self.api.connectapi("course-service/course"),
+                scope={"endpoint": "course-service/course"},
             )
-            if payload is not None:
-                self._entity("routes", "route", payload, raw_hash)
+            if payload is None:
+                return
+            items = route_items(payload)
+            if items is None:
+                self.writer.error("routes", "Garmin returned an unrecognized saved-route listing payload.")
+                return
+            if any(remote_id(item, "") == "" for item in items):
+                self.writer.error("routes", "Garmin returned a saved route without an identifier.")
+                return
+            self._entity("routes", "route", items, raw_hash)
         months = [shift_month(today, offset) for offset in range(-SCHEDULED_WORKOUTS_MONTHS_BACK, SCHEDULED_WORKOUTS_MONTHS_AHEAD + 1)]
         events_start = events_from or (today - timedelta(days=EVENTS_PAST_DAYS)).isoformat()
         if self.progress is not None:
