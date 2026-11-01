@@ -17,7 +17,8 @@ import { createSyncLogger, type SyncLogger } from '../../core/logging.js';
 import { athleteProviderEnvironment } from '../../core/runtime/secrets.js';
 import { importJsonl } from '../ingestion/importer.js';
 import { IntervalsExtractor } from '../ingestion/providers/intervals.js';
-import { completeStravaAuthorization, disconnectStrava, getStravaAuthorizationUrl, syncStravaGear } from '../ingestion/providers/strava/service.js';
+import { completeStravaAuthorization, disconnectStrava, getStravaAuthorizationUrl, syncStravaGear, syncStravaRoutes } from '../ingestion/providers/strava/service.js';
+import { reconcileRouteSources } from '../normalization/routes.js';
 import { setManualActivityLink, unlinkActivitySource } from '../normalization/activities/linking.js';
 import { importSourceEntity } from '../normalization/normalizers.js';
 import { CatenceDatabase, openReadOnlyRepository, ReadOnlyDatabaseError } from '../storage/database.js';
@@ -62,6 +63,7 @@ const GARMIN_SCHEDULED_MONTHS_BACK = 3;
 async function reconcileGarminCalendarEntities(database: CatenceDatabase, stagedManifestPath: string): Promise<void> {
   const events: string[] = [];
   const scheduled: string[] = [];
+  const routes: string[] = [];
   const file = createReadStream(stagedManifestPath, { encoding: 'utf8' });
   const lines = createInterface({ input: file, crlfDelay: Infinity });
   for await (const line of lines) {
@@ -76,6 +78,7 @@ async function reconcileGarminCalendarEntities(database: CatenceDatabase, staged
     if (candidate?.kind !== 'source_entity' || candidate.provider !== 'garmin') continue;
     if (candidate.entityType === 'event' && typeof candidate.remoteId === 'string') events.push(candidate.remoteId);
     if (candidate.entityType === 'scheduled_workout' && typeof candidate.remoteId === 'string') scheduled.push(candidate.remoteId);
+    if (candidate.entityType === 'route' && typeof candidate.remoteId === 'string') routes.push(candidate.remoteId);
   }
 
   const now = new Date();
@@ -83,6 +86,10 @@ async function reconcileGarminCalendarEntities(database: CatenceDatabase, staged
   const scheduledCutoff = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - GARMIN_SCHEDULED_MONTHS_BACK, 1)).toISOString().slice(0, 10);
   await database.deleteMissingCalendarEntities('garmin', ['event'], events, eventCutoff);
   await database.deleteMissingCalendarEntities('garmin', ['scheduled_workout'], scheduled, scheduledCutoff);
+  // Saved routes are a full listing every run, so the database mirrors the
+  // active Garmin list: sources missing from the staged manifest were deleted
+  // upstream and are removed, and routes left without any source go too.
+  await reconcileRouteSources(database, 'garmin', routes);
 }
 
 type GarminWorkerOutcome = { code: number | null; signal: NodeJS.Signals | null };
@@ -515,7 +522,11 @@ export async function initializeDataStore(paths: CatencePaths): Promise<Record<s
 
 export async function syncData(paths: CatencePaths, provider: ProviderChoice, explicitFrom?: string, advanceCursor = true, refreshActivities = false, backfill = false): Promise<Record<string, unknown>> {
   await ensurePaths(paths);
-  if (provider === 'strava') return { provider, result: await syncStravaGear(paths) };
+  if (provider === 'strava') {
+    const gear = await syncStravaGear(paths);
+    const routes = await syncStravaRoutes(paths);
+    return { provider, result: { gear, routes } };
+  }
   const database = await CatenceDatabase.open(paths);
   const log = createSyncLogger(paths);
   try {

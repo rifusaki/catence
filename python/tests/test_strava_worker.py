@@ -160,3 +160,57 @@ def test_activity_hydration_reports_a_search_window_when_strava_returns_no_candi
 
 def test_scope_set_is_the_minimum_requested_for_targeted_enrichment() -> None:
     assert SCOPES == ["read", "activity:read_all", "read_all"]
+
+
+def test_stage_routes_lists_every_route_and_hydrates_its_segments(tmp_path: Path) -> None:
+    from python.catence.providers.strava.cli import stage_routes
+
+    writer = StravaStagingWriter(tmp_path, tmp_path / "stage.jsonl")
+    writer.manifest("00000000-0000-4000-8000-000000000000", "2026-02-01")
+    calls: list[str] = []
+
+    class Reader:
+        observed_headers = {"x-ratelimit-limit": "100,1000"}
+
+        def get(self, endpoint: str, path: str, **_params: object) -> object:
+            calls.append(f"{endpoint}:{path}")
+            if endpoint == "routes":
+                return [{"id": 555, "name": "Morning Loop"}, {"id": 556, "name": "Evening Ride"}]
+            if endpoint == "route_segments" and path == "/routes/555":
+                return {"id": 555, "name": "Morning Loop", "segments": [{"id": 101, "name": "Hill Climb"}]}
+            if endpoint == "route_segments" and path == "/routes/556":
+                return {"id": 556, "name": "Evening Ride", "segments": []}
+            raise AssertionError(f"unexpected call {endpoint} {path}")
+
+    result = stage_routes(Reader(), writer)
+
+    assert result["status"] == "completed"
+    assert result["routeCount"] == 2
+    assert result["segmentCount"] == 1
+    assert calls == ["routes:/athlete/routes", "route_segments:/routes/555", "route_segments:/routes/556"]
+
+    lines = [json.loads(line) for line in (tmp_path / "stage.jsonl").read_text().splitlines() if line.strip()]
+    route_entities = [line for line in lines if line.get("kind") == "source_entity" and line.get("entityType") == "route"]
+    assert [entity["remoteId"] for entity in route_entities] == ["555", "556"]
+    assert route_entities[0]["payload"]["segments"] == [{"id": 101, "name": "Hill Climb"}]
+
+
+def test_stage_routes_rejects_a_mismatched_route_id(tmp_path: Path) -> None:
+    from python.catence.providers.strava.cli import stage_routes
+
+    writer = StravaStagingWriter(tmp_path, tmp_path / "stage.jsonl")
+
+    class Reader:
+        observed_headers: dict[str, str] = {}
+
+        def get(self, endpoint: str, _path: str, **_params: object) -> object:
+            if endpoint == "routes":
+                return [{"id": 555, "name": "Morning Loop"}]
+            return {"id": 999, "name": "Something Else", "segments": []}
+
+    try:
+        stage_routes(Reader(), writer)
+    except StravaConnectionError as error:
+        assert "did not match" in str(error)
+    else:
+        raise AssertionError("expected a mismatched route id to fail closed")

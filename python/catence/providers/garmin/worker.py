@@ -953,11 +953,22 @@ class GarminStagingWorker:
             "workouts": ("get_workouts", (), "workout"),
             "goals": ("get_goals", (), "goal"), "golf_summary": ("get_golf_summary", (), "golf_scorecard"),
         }
+        # Saved routes: garminconnect 0.3.x has no first-class route listing, so
+        # the raw Connect API is used like stage_course does for courses:
+        # connectapi("route-service/routes") returns the user's saved routes.
+        def fetch_routes(_: str) -> None:
+            payload, raw_hash = self._capture(
+                "routes",
+                lambda: self.api.connectapi("route-service/routes"),
+                scope={"endpoint": "route-service/routes"},
+            )
+            if payload is not None:
+                self._entity("routes", "route", payload, raw_hash)
         months = [shift_month(today, offset) for offset in range(-SCHEDULED_WORKOUTS_MONTHS_BACK, SCHEDULED_WORKOUTS_MONTHS_AHEAD + 1)]
         events_start = events_from or (today - timedelta(days=EVENTS_PAST_DAYS)).isoformat()
         if self.progress is not None:
             self.progress.set_stage("collections")
-            self.progress.advance(total=len(calls) + len(months) + 1)
+            self.progress.advance(total=len(calls) + len(months) + 2)
         completed = 0
 
         def done() -> None:
@@ -975,6 +986,7 @@ class GarminStagingWorker:
                 self._entity(endpoint, entity_type, payload, raw_hash)
 
         self._map(list(calls.items()), fetch_call, done)
+        self._map(["routes"], fetch_routes, done)
         # Scheduled workouts span past-to-future months so upcoming sessions
         # surface ahead of time and recently completed ones stay associatable
         # with their finished activities. The calendar service answers each

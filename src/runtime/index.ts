@@ -93,6 +93,7 @@ export { ActivityDiscoveryService } from '../core/query/activity-discovery.js';
 export { DATASET_CATALOG, getDataset, QueryValidationError } from '../core/query/catalog.js';
 export { FitnessService } from '../core/query/fitness.js';
 export { EventsService, extractCourseId } from '../core/query/events.js';
+export { RoutesService } from '../core/query/routes.js';
 export { SwimmingService } from '../core/query/swimming.js';
 export { WELLNESS_METRICS, WellnessService } from '../core/query/wellness.js';
 export { jsonSafe, ReadOnlyRepository } from '../core/query/repository.js';
@@ -150,6 +151,7 @@ export { migrations } from '../elt/storage/migrations.js';
 export {
   hydrateStravaActivity,
   hydrateStravaSegmentHistory,
+  syncStravaRoutes,
   StravaEnrichmentError,
   StravaRateLimitError,
 } from '../elt/ingestion/providers/strava/service.js';

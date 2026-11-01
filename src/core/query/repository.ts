@@ -215,6 +215,8 @@ export class ReadOnlyRepository {
       UNION ALL SELECT 'segment_effort_history', min(cast(started_at AS DATE)), max(cast(started_at AS DATE)), count(*)::INTEGER FROM segment_effort_history
       UNION ALL SELECT 'segments', CAST(NULL AS DATE), CAST(NULL AS DATE), count(*)::INTEGER FROM strava_segments
       UNION ALL SELECT 'course_geometry', CAST(NULL AS DATE), CAST(NULL AS DATE), count(*)::INTEGER FROM course_geometry
+      UNION ALL SELECT 'routes', CAST(NULL AS DATE), CAST(NULL AS DATE), count(*)::INTEGER FROM route_facts
+      UNION ALL SELECT 'route_segments', CAST(NULL AS DATE), CAST(NULL AS DATE), count(*)::INTEGER FROM route_segments
     `);
     return { coverage: rows, providers: await this.rows(`SELECT provider, count(*)::INTEGER AS activity_sources FROM activity_sources GROUP BY provider ORDER BY provider`) };
   }

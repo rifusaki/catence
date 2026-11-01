@@ -1,6 +1,7 @@
 import type { CatenceDatabase } from '../../storage/database.js';
 import type { SourceEntity } from '../../../contracts/staging.js';
 import { json } from '../../storage/sql.js';
+import { importRouteEntity } from '../routes.js';
 
 type ObjectValue = Record<string, unknown>;
 const object = (value: unknown): ObjectValue => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as ObjectValue : {};
@@ -20,7 +21,7 @@ async function storeGenericEntity(database: CatenceDatabase, entity: SourceEntit
 }
 
 /** Persist richer segment facts without letting a sparse embedded history effort erase them. */
-async function upsertSegment(database: CatenceDatabase, source: ObjectValue, rawHash: string | null): Promise<void> {
+export async function upsertStravaSegment(database: CatenceDatabase, source: ObjectValue, rawHash: string | null): Promise<void> {
   const segmentId = text(source.id);
   if (!segmentId) return;
   const hasDescriptiveFacts = text(source.name) !== null || typeof source.starred === 'boolean' || number(source.average_grade) !== null || number(source.distance) !== null;
@@ -52,7 +53,7 @@ async function upsertEffort(database: CatenceDatabase, payload: ObjectValue, act
   const segment = object(payload.segment);
   const segmentId = text(segment.id) ?? text(payload.segment_id);
   if (!effortId || !segmentId) return;
-  await upsertSegment(database, segment, rawHash);
+  await upsertStravaSegment(database, segment, rawHash);
   const values = {
     effortId, segmentId, elapsedS: number(payload.elapsed_time), movingS: number(payload.moving_time), distanceM: number(payload.distance), averageWatts: number(payload.average_watts), averageHr: number(payload.average_heartrate), maxHr: number(payload.max_heartrate), averageCadence: number(payload.average_cadence), deviceWatts: typeof payload.device_watts === 'boolean' ? payload.device_watts : null, prRank: number(payload.pr_rank), komRank: number(payload.kom_rank), startedAt: text(payload.start_date), rawHash, payload: json(payload),
   };
@@ -76,7 +77,8 @@ export async function normalizeStravaEntity(database: CatenceDatabase, entity: S
     await database.insertSourceAccount('strava', accountId, [text(payload.firstname), text(payload.lastname)].filter(Boolean).join(' ') || null, payload);
     return;
   }
-  if (entity.entityType === 'segment') return upsertSegment(database, payload, entity.rawObjectHash);
+  if (entity.entityType === 'route') return importRouteEntity(database, entity);
+  if (entity.entityType === 'segment') return upsertStravaSegment(database, payload, entity.rawObjectHash);
   if (entity.entityType === 'segment_effort') return upsertEffort(database, payload, null, entity.rawObjectHash, true);
   if (entity.entityType !== 'activity') return;
   const activitySourceId = `strava:${entity.remoteId}`;

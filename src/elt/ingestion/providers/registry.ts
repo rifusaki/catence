@@ -77,6 +77,7 @@ export const garminReadRegistry = registry('garmin', [
   ['activity_csv', 'activity', 'activity_file'], ['workouts', 'collection', 'workout'], ['scheduled_workouts', 'date_range', 'scheduled_workout'],
   ['events', 'collection', 'event'],
   ['course', 'child', 'course'],
+  ['routes', 'collection', 'route'],
   ['training_plans', 'collection', 'training_plan'], ['goals', 'collection', 'goal'], ['personal_records', 'singleton', 'personal_record'],
   ['earned_badges', 'collection', 'badge'], ['available_badges', 'collection', 'badge'], ['challenges', 'collection', 'challenge'],
   ['gear', 'collection', 'gear'], ['golf_summary', 'collection', 'golf_scorecard'], ['golf_user_stats', 'singleton', 'golf_user_stat'],
@@ -86,6 +87,7 @@ export const stravaReadRegistry = registry('strava', [
   ['athlete', 'singleton', 'athlete'], ['gear', 'child', 'gear'],
   ['activity_candidates', 'date_range', 'activity'], ['activity_detail', 'activity', 'activity'],
   ['segment', 'child', 'segment'], ['segment_efforts', 'child', 'segment_effort'],
+  ['routes', 'collection', 'route'], ['route_segments', 'child', 'route'],
 ] as const);
 
 /**
