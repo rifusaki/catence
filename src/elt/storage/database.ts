@@ -35,26 +35,57 @@ export class CatenceDatabase implements WriteDataStore {
   private constructor(
     private readonly instance: DuckDBInstance,
     private readonly connection: DuckDBConnection,
+    private readonly ownsInstance = true,
   ) {}
 
   static async open(paths: CatencePaths): Promise<CatenceDatabase> {
     const instance = await DuckDBInstance.create(paths.database);
-    const connection = await instance.connect();
-    const database = new CatenceDatabase(instance, connection);
-    await database.migrate();
-    return database;
+    let database: CatenceDatabase | null = null;
+    try {
+      database = new CatenceDatabase(instance, await instance.connect(), true);
+      await database.migrate();
+      return database;
+    } catch (error) {
+      await database?.close().catch(() => undefined);
+      if (!database) instance.closeSync();
+      throw error;
+    }
+  }
+
+  /**
+   * Open the process-wide read-write instance and return a migration lease
+   * for it. The caller owns the instance and must close the lease before
+   * retaining it for connection fan-out.
+   */
+  static async openInstance(paths: CatencePaths): Promise<{ instance: DuckDBInstance; database: CatenceDatabase }> {
+    const instance = await DuckDBInstance.create(paths.database);
+    let database: CatenceDatabase | null = null;
+    try {
+      database = new CatenceDatabase(instance, await instance.connect(), false);
+      await database.migrate();
+      return { instance, database };
+    } catch (error) {
+      await database?.close().catch(() => undefined);
+      instance.closeSync();
+      throw error;
+    }
+  }
+
+  /** Open another connection against an instance owned by a CatenceStore. */
+  static async fromInstance(instance: DuckDBInstance): Promise<CatenceDatabase> {
+    return new CatenceDatabase(instance, await instance.connect(), false);
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     try {
-      // A connection must be disconnected before its owning instance. Keeping
-      // the instance alive for the full database lifetime also prevents the
-      // native binding from releasing it during an in-flight connection close.
+      // A connection must be disconnected before its owning instance. Only the
+      // lease that opened the instance may close it; store connections must
+      // leave the process-wide instance alive for their siblings.
       this.connection.closeSync();
     } finally {
-      this.instance.closeSync();
+      if (this.ownsInstance) this.instance.closeSync();
     }
   }
 

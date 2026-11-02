@@ -146,6 +146,7 @@ export {
 export type { OpenCodeGoConsoleProfiles, OpenCodeGoMergeResult, OpenCodeGoRoute } from '../core/runtime/opencode-go.js';
 export type { InterruptedRuns, SyncProgressSnapshot, SyncProgressState } from '../contracts/progress.js';
 export { CatenceDatabase, openReadOnlyRepository, ReadOnlyDatabaseError } from '../elt/storage/database.js';
+export { CatenceStore, CatenceStoreRegistry } from '../elt/storage/store.js';
 export { DataWriteBusyError } from '../elt/storage/write-lock.js';
 export { migrations } from '../elt/storage/migrations.js';
 export {

@@ -22,6 +22,7 @@ import { reconcileRouteSources } from '../normalization/routes.js';
 import { setManualActivityLink, unlinkActivitySource } from '../normalization/activities/linking.js';
 import { importSourceEntity } from '../normalization/normalizers.js';
 import { CatenceDatabase, openReadOnlyRepository, ReadOnlyDatabaseError } from '../storage/database.js';
+import type { CatenceStore } from '../storage/store.js';
 import { mergeProgress, ProgressPump, readRunningProgress, removeProgressSidecar, writeProgressSidecar, PROGRESS_KEEPALIVE_MS } from '../storage/progress-sidecar.js';
 import { withDataWriteLock } from '../storage/write-lock.js';
 
@@ -548,14 +549,16 @@ export async function initializeDataStore(paths: CatencePaths): Promise<Record<s
   return { dataDir: paths.root, database: paths.database, message: 'Catence data store is ready. Run sync to import provider data.' };
 }
 
-export async function syncData(paths: CatencePaths, provider: ProviderChoice, explicitFrom?: string, advanceCursor = true, refreshActivities = false, backfill = false): Promise<Record<string, unknown>> {
+export type SyncDataOptions = { store?: CatenceStore };
+
+export async function syncData(paths: CatencePaths, provider: ProviderChoice, explicitFrom?: string, advanceCursor = true, refreshActivities = false, backfill = false, options: SyncDataOptions = {}): Promise<Record<string, unknown>> {
   await ensurePaths(paths);
   if (provider === 'strava') {
-    const gear = await syncStravaGear(paths);
-    const routes = await syncStravaRoutes(paths);
+    const gear = await syncStravaGear(paths, true, options);
+    const routes = await syncStravaRoutes(paths, options);
     return { provider, result: { gear, routes } };
   }
-  const database = await CatenceDatabase.open(paths);
+  const database = options.store ? await options.store.database() : await CatenceDatabase.open(paths);
   const log = createSyncLogger(paths);
   try {
     const timedOutRuns = await database.interruptStaleSyncRuns(STALE_RUN_TIMEOUT_MS);

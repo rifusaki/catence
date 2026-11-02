@@ -10,6 +10,7 @@ import type { CatencePaths } from '../../../../contracts/runtime.js';
 import { ensurePaths, loadCatenceConfig } from '../../../../core/runtime/configuration.js';
 import { athleteProviderEnvironment } from '../../../../core/runtime/secrets.js';
 import { CatenceDatabase, openReadOnlyRepository } from '../../../storage/database.js';
+import type { CatenceStore } from '../../../storage/store.js';
 import { importJsonl } from '../../importer.js';
 import { createSyncLogger } from '../../../../core/logging.js';
 import { reconcileRouteSources } from '../../../normalization/routes.js';
@@ -36,6 +37,32 @@ type WorkerResult = {
   matchDiagnostics?: Record<string, unknown>;
   rateHeaders?: Record<string, string>;
 };
+
+export type StravaWriteOptions = { store?: CatenceStore };
+
+/**
+ * Server-owned writes use a connection from the process-wide instance and skip
+ * the cross-process file lock. CLI/stdio writes keep the file lock and their
+ * own instance so two processes can never write the same DuckDB file.
+ */
+async function withWriteDatabase<T>(paths: CatencePaths, options: StravaWriteOptions, work: (database: CatenceDatabase) => Promise<T>): Promise<T> {
+  if (options.store) {
+    const database = await options.store.database();
+    try {
+      return await work(database);
+    } finally {
+      await database.close();
+    }
+  }
+  return withDataWriteLock(paths, async () => {
+    const database = await CatenceDatabase.open(paths);
+    try {
+      return await work(database);
+    } finally {
+      await database.close();
+    }
+  });
+}
 
 export class StravaRateLimitError extends Error {
   constructor(message: string, readonly retryAfterSeconds?: number) {
@@ -142,51 +169,46 @@ async function cachedState(database: CatenceDatabase, resourceType: string, remo
   return { ...detail, cache: { reused: true, fetchedAt: row.fetched_at, completedAt: row.completed_at } };
 }
 
-async function runReadOperation(paths: CatencePaths, operation: 'gear' | 'activity' | 'segment-history', extraArgs: string[], resource: { type: string; id: string }, refresh = false): Promise<WorkerResult | Record<string, unknown>> {
-  return withDataWriteLock(paths, async () => {
+async function runReadOperation(paths: CatencePaths, operation: 'gear' | 'activity' | 'segment-history', extraArgs: string[], resource: { type: string; id: string }, refresh = false, options: StravaWriteOptions = {}): Promise<WorkerResult | Record<string, unknown>> {
+  return withWriteDatabase(paths, options, async (database) => {
     await ensurePaths(paths);
     const log = createSyncLogger(paths);
-    const database = await CatenceDatabase.open(paths);
-    try {
-      if (!refresh) {
-        const cached = await cachedState(database, resource.type, resource.id);
-        if (cached) return cached;
-      }
-      await checkBudget(database, paths);
-      const runId = await database.beginRun('strava', new Date().toISOString().slice(0, 10));
-      log.info('Starting Strava read operation', { runId, operation, resource: resource.id });
-      const directory = path.join(paths.staging, 'strava');
-      const stagingPath = path.join(directory, `${runId}.jsonl`);
-      const resultPath = path.join(directory, `${runId}.result.json`);
-      let result: WorkerResult;
-      try {
-        result = await invokeWorker(paths, ['--mode', operation, '--run-id', runId, '--output', stagingPath, ...extraArgs], resultPath);
-        if (existsSync(stagingPath)) await importJsonl(database, runId, stagingPath, log);
-        await storeRateState(database, result);
-        await writeState(database, resource.type, resource.id, result);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        log.error('Strava read operation failed', { runId, operation, resource: resource.id, error: message, stack: error instanceof Error ? error.stack : undefined });
-        await database.addError(runId, 'strava', operation, resource.id, message, true);
-        throw error;
-      } finally {
-        await database.finishRun(runId);
-        const [run] = await database.rows<{ status: string; error_count: number }>(
-          'SELECT status, error_count FROM sync_runs WHERE run_id = $runId',
-          { runId },
-        );
-        log.info('Strava read operation finished', { runId, operation, status: run?.status ?? 'unknown', errorCount: run?.error_count ?? 0 });
-      }
-      if (result.status === 'error') throw new StravaEnrichmentError(result.message ?? 'Strava did not complete the requested enrichment.');
-      return result;
-    } finally {
-      await database.close();
+    if (!refresh) {
+      const cached = await cachedState(database, resource.type, resource.id);
+      if (cached) return cached;
     }
+    await checkBudget(database, paths);
+    const runId = await database.beginRun('strava', new Date().toISOString().slice(0, 10));
+    log.info('Starting Strava read operation', { runId, operation, resource: resource.id });
+    const directory = path.join(paths.staging, 'strava');
+    const stagingPath = path.join(directory, `${runId}.jsonl`);
+    const resultPath = path.join(directory, `${runId}.result.json`);
+    let result: WorkerResult;
+    try {
+      result = await invokeWorker(paths, ['--mode', operation, '--run-id', runId, '--output', stagingPath, ...extraArgs], resultPath);
+      if (existsSync(stagingPath)) await importJsonl(database, runId, stagingPath, log);
+      await storeRateState(database, result);
+      await writeState(database, resource.type, resource.id, result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log.error('Strava read operation failed', { runId, operation, resource: resource.id, error: message, stack: error instanceof Error ? error.stack : undefined });
+      await database.addError(runId, 'strava', operation, resource.id, message, true);
+      throw error;
+    } finally {
+      await database.finishRun(runId);
+      const [run] = await database.rows<{ status: string; error_count: number }>(
+        'SELECT status, error_count FROM sync_runs WHERE run_id = $runId',
+        { runId },
+      );
+      log.info('Strava read operation finished', { runId, operation, status: run?.status ?? 'unknown', errorCount: run?.error_count ?? 0 });
+    }
+    if (result.status === 'error') throw new StravaEnrichmentError(result.message ?? 'Strava did not complete the requested enrichment.');
+    return result;
   });
 }
 
-export async function syncStravaGear(paths: CatencePaths, refresh = true): Promise<WorkerResult | Record<string, unknown>> {
-  return runReadOperation(paths, 'gear', [], { type: 'gear', id: 'authenticated_athlete' }, refresh);
+export async function syncStravaGear(paths: CatencePaths, refresh = true, options: StravaWriteOptions = {}): Promise<WorkerResult | Record<string, unknown>> {
+  return runReadOperation(paths, 'gear', [], { type: 'gear', id: 'authenticated_athlete' }, refresh, options);
 }
 
 /** Remote ids of every route staged in a manifest, used as the mirror-sync keep list. */
@@ -214,48 +236,43 @@ async function stagedRouteIds(stagedManifestPath: string): Promise<string[]> {
  * are not rewritten), routes missing from it are deleted. Each route's
  * Strava segments are hydrated with it.
  */
-export async function syncStravaRoutes(paths: CatencePaths): Promise<WorkerResult | Record<string, unknown>> {
-  return withDataWriteLock(paths, async () => {
+export async function syncStravaRoutes(paths: CatencePaths, options: StravaWriteOptions = {}): Promise<WorkerResult | Record<string, unknown>> {
+  return withWriteDatabase(paths, options, async (database) => {
     await ensurePaths(paths);
     const log = createSyncLogger(paths);
-    const database = await CatenceDatabase.open(paths);
+    await checkBudget(database, paths);
+    const runId = await database.beginRun('strava', new Date().toISOString().slice(0, 10));
+    log.info('Starting Strava route sync', { runId });
+    const directory = path.join(paths.staging, 'strava');
+    const stagingPath = path.join(directory, `${runId}.routes.jsonl`);
+    const resultPath = path.join(directory, `${runId}.routes.result.json`);
+    let result: WorkerResult;
     try {
-      await checkBudget(database, paths);
-      const runId = await database.beginRun('strava', new Date().toISOString().slice(0, 10));
-      log.info('Starting Strava route sync', { runId });
-      const directory = path.join(paths.staging, 'strava');
-      const stagingPath = path.join(directory, `${runId}.routes.jsonl`);
-      const resultPath = path.join(directory, `${runId}.routes.result.json`);
-      let result: WorkerResult;
-      try {
-        result = await invokeWorker(paths, ['--mode', 'routes', '--run-id', runId, '--output', stagingPath], resultPath);
-        if (result.status === 'completed') {
-          if (!existsSync(stagingPath)) throw new StravaEnrichmentError('Strava route worker completed without writing its staging manifest.');
-          const keep = await stagedRouteIds(stagingPath);
-          if (typeof result.routeCount === 'number' && keep.length !== result.routeCount) {
-            throw new StravaEnrichmentError(`Strava route staging manifest contains ${keep.length} routes but the worker reported ${result.routeCount}.`);
-          }
-          await importJsonl(database, runId, stagingPath, log);
-          const reconciled = await reconcileRouteSources(database, 'strava', keep);
-          log.info('Strava route mirror reconciliation finished', { runId, ...reconciled });
-        } else {
-          log.warn('Skipping Strava route import and mirror reconciliation because the route listing did not complete', { runId, status: result.status, message: result.message });
+      result = await invokeWorker(paths, ['--mode', 'routes', '--run-id', runId, '--output', stagingPath], resultPath);
+      if (result.status === 'completed') {
+        if (!existsSync(stagingPath)) throw new StravaEnrichmentError('Strava route worker completed without writing its staging manifest.');
+        const keep = await stagedRouteIds(stagingPath);
+        if (typeof result.routeCount === 'number' && keep.length !== result.routeCount) {
+          throw new StravaEnrichmentError(`Strava route staging manifest contains ${keep.length} routes but the worker reported ${result.routeCount}.`);
         }
-        await storeRateState(database, result);
-        await writeState(database, 'routes', 'authenticated_athlete', result);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        log.error('Strava route sync failed', { runId, error: message });
-        await database.addError(runId, 'strava', 'routes', null, message, true);
-        throw error;
-      } finally {
-        await database.finishRun(runId);
+        await importJsonl(database, runId, stagingPath, log);
+        const reconciled = await reconcileRouteSources(database, 'strava', keep);
+        log.info('Strava route mirror reconciliation finished', { runId, ...reconciled });
+      } else {
+        log.warn('Skipping Strava route import and mirror reconciliation because the route listing did not complete', { runId, status: result.status, message: result.message });
       }
-      if (result.status === 'error') throw new StravaEnrichmentError(result.message ?? 'Strava route sync failed.');
-      return result;
+      await storeRateState(database, result);
+      await writeState(database, 'routes', 'authenticated_athlete', result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log.error('Strava route sync failed', { runId, error: message });
+      await database.addError(runId, 'strava', 'routes', null, message, true);
+      throw error;
     } finally {
-      await database.close();
+      await database.finishRun(runId);
     }
+    if (result.status === 'error') throw new StravaEnrichmentError(result.message ?? 'Strava route sync failed.');
+    return result;
   });
 }
 
@@ -327,7 +344,7 @@ export async function multisportChildActivitySourceIds(paths: CatencePaths, acti
   }
 }
 
-export async function hydrateStravaActivity(paths: CatencePaths, activityId: string, refresh = false): Promise<WorkerResult | Record<string, unknown>> {
+export async function hydrateStravaActivity(paths: CatencePaths, activityId: string, refresh = false, options: StravaWriteOptions = {}): Promise<WorkerResult | Record<string, unknown>> {
   const multisportChildren = await multisportChildActivitySourceIds(paths, activityId);
   if (multisportChildren) {
     if (!multisportChildren.length) {
@@ -335,7 +352,7 @@ export async function hydrateStravaActivity(paths: CatencePaths, activityId: str
     }
     const childOutcomes: Array<{ activityId: string; status: string; result: WorkerResult | Record<string, unknown> }> = [];
     for (const childActivityId of multisportChildren) {
-      const result = await hydrateStravaActivity(paths, childActivityId, refresh);
+      const result = await hydrateStravaActivity(paths, childActivityId, refresh, options);
       const status = typeof result.status === 'string' ? result.status : 'completed';
       childOutcomes.push({ activityId: childActivityId, status, result });
     }
@@ -345,10 +362,9 @@ export async function hydrateStravaActivity(paths: CatencePaths, activityId: str
       childOutcomes,
     };
   }
-  return withDataWriteLock(paths, async () => {
+  return withWriteDatabase(paths, options, async (database) => {
     await ensurePaths(paths);
-    const database = await CatenceDatabase.open(paths);
-    try {
+    {
       const matches = await database.rows<ActivityMatch>(`
         SELECT source.activity_source_id, source.activity_id, source.provider, source.remote_activity_id, source.external_id, raw.payload_json AS source_payload, activity.started_at_utc, activity.sport, summary.distance_m, summary.elapsed_s
         FROM activity_sources source JOIN activities activity USING (activity_id)
@@ -404,17 +420,14 @@ export async function hydrateStravaActivity(paths: CatencePaths, activityId: str
       }
       if (result.status === 'error') throw new StravaEnrichmentError(result.message ?? 'Strava activity hydration failed.');
       return result;
-    } finally {
-      await database.close();
     }
   });
 }
 
-export async function hydrateStravaSegmentHistory(paths: CatencePaths, segmentId: string, refresh = false): Promise<WorkerResult | Record<string, unknown>> {
-  return withDataWriteLock(paths, async () => {
+export async function hydrateStravaSegmentHistory(paths: CatencePaths, segmentId: string, refresh = false, options: StravaWriteOptions = {}): Promise<WorkerResult | Record<string, unknown>> {
+  return withWriteDatabase(paths, options, async (database) => {
     await ensurePaths(paths);
-    const database = await CatenceDatabase.open(paths);
-    try {
+    {
       const found = await database.rows<{ segment_id: string }>('SELECT segment_id FROM strava_segments WHERE segment_id = $segmentId', { segmentId });
       if (!found[0]) throw new StravaEnrichmentError(`Strava segment ${segmentId} is not persisted. Hydrate an activity containing it first.`);
       const resource = { type: 'segment_history', id: segmentId };
@@ -442,8 +455,6 @@ export async function hydrateStravaSegmentHistory(paths: CatencePaths, segmentId
       }
       if (result.status === 'error') throw new StravaEnrichmentError(result.message ?? 'Strava segment history hydration failed.');
       return result;
-    } finally {
-      await database.close();
     }
   });
 }

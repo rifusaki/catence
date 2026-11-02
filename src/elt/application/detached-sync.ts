@@ -74,7 +74,7 @@ function cliInvocation(): { command: string; entry: string } {
   return { command: tsxBinary, entry: sourceEntry };
 }
 
-function assertValidRequest(request: DetachedSyncRequest): void {
+export function assertValidRequest(request: DetachedSyncRequest): void {
   if (!request.athleteId || !/^[a-z][a-z0-9-]{0,62}$/.test(request.athleteId)) {
     throw new Error('athleteId is required and must be a lowercase athlete identifier.');
   }

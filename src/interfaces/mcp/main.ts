@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { existsSync } from 'node:fs';
-import { addAthlete, athleteStorePaths, CatenceDatabase, createDemoStore, defaultCatalogHome, initializeCatalog, loadCatalog, resolveCatalogPaths, startAutoSyncScheduler } from '../../runtime/index.js';
+import { addAthlete, athleteStorePaths, CatenceDatabase, CatenceStoreRegistry, createDemoStore, defaultCatalogHome, initializeCatalog, loadCatalog, resolveCatalogPaths, startAutoSyncScheduler } from '../../runtime/index.js';
 import { defaultBearerTokenPath, defaultMcpKeysPath, defaultOauthSettingsPath, oauthStatusFromSettings, parseServeCliOptions, SERVE_USAGE } from '../http/cli-options.js';
 import { createCatenceHttpServer } from '../http/server.js';
 import { MCP_USAGE, parseMcpCliOptions } from './cli-options.js';
@@ -48,8 +48,10 @@ async function run(): Promise<void> {
     const catalogPaths = resolveCatalogPaths(options.home);
     const mcpKeysFile = options.mcpKeysFile ?? defaultMcpKeysPath(catalogPaths.root);
     const oauthSettingsFile = options.oauthSettingsFile ?? defaultOauthSettingsPath(catalogPaths.root);
+    const stores = new CatenceStoreRegistry();
     const httpServer = createCatenceHttpServer({
       catalogPaths,
+      stores,
       allowedOrigins: options.allowedOrigins,
       // The token file's presence switches authentication on; enable it with
       // `catence-data mcp enable` (or the Console Settings / exposure API).
@@ -81,15 +83,16 @@ async function run(): Promise<void> {
     } else {
       console.error('OAuth 2.1 authorization server is disabled; enable it from the Console (Settings, MCP exposure tab) or with CATENCE_OAUTH_ENABLED=1 and CATENCE_PUBLIC_URL.');
     }
-    // Auto-sync runs while the server is up: each athlete's autosync.json
-    // (default: enabled, every 2 hours) triggers a detached sync. The
-    // detached child and the single-writer DuckDB lock stay the only
-    // executors, so concurrent ticks are no-ops by design.
-    const scheduler = startAutoSyncScheduler({ catalogPaths });
+    // Auto-sync runs in-process through the same DuckDB owner as agent tools.
+    // Agent reads/hydration keep their own connections while a sync writes, so
+    // the server never waits for a detached child to release the file lock.
+    const scheduler = startAutoSyncScheduler({ catalogPaths, startSync: (request) => stores.startSync(request) });
     console.error('Auto-sync scheduler started (default: enabled, every 2 hours per athlete; configure with auto-sync enable --interval or Console Settings).');
     const close = () => {
       scheduler.stop();
-      httpServer.close(() => process.exit(0));
+      httpServer.close(() => {
+        void stores.closeAll().finally(() => process.exit(0));
+      });
     };
     process.once('SIGINT', close);
     process.once('SIGTERM', close);

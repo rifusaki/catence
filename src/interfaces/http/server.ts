@@ -10,6 +10,7 @@ import {
   AthleteFileConflictError,
   AthleteFileTooLargeError,
   AthleteFileValidationError,
+  CatenceStoreRegistry,
   catenceRuntimeHealth,
   countActiveMcpKeys,
   DashboardSnapshotService,
@@ -113,6 +114,8 @@ export type CatenceHttpServerOptions = {
    * startup option at runtime; a malformed one fails closed to disabled.
    */
   oauthSettingsFile?: string;
+  /** Process-wide DuckDB owner; server writes run in-process while it is set. */
+  stores?: CatenceStoreRegistry;
   /** Internal compatibility hook for tests: override the detached sync spawner. */
   startSync?: typeof startDetachedSync;
   /** Internal compatibility hook for tests: passed into the default startDetachedSync. */
@@ -920,7 +923,7 @@ function installModernFraming(response: ServerResponse, method: string | undefin
   }) as typeof response.end;
 }
 
-async function handleMcpRequest(request: IncomingMessage, response: ServerResponse, paths: CatencePaths | CatalogPaths, principal: CatencePrincipal): Promise<void> {
+async function handleMcpRequest(request: IncomingMessage, response: ServerResponse, paths: CatencePaths | CatalogPaths, principal: CatencePrincipal, stores?: CatenceStoreRegistry): Promise<void> {
   if (request.method !== 'POST') {
     methodNotAllowed(response);
     return;
@@ -972,7 +975,7 @@ async function handleMcpRequest(request: IncomingMessage, response: ServerRespon
 
   // The HTTP gate has already authenticated this request; the MCP server
   // re-enforces the principal's athlete scope on every tool and roster.
-  const server = createCatenceMcpServer(paths, {}, { scope: { athleteIds: principal.athleteIds } });
+  const server = createCatenceMcpServer(paths, {}, { scope: { athleteIds: principal.athleteIds }, stores });
   // JSON responses mirror OpenAI's own reference implementation: a single
   // request/response has no need for a stream, and a JSON body survives
   // validators (and intermediaries) that would mishandle an SSE frame. The
@@ -1017,7 +1020,7 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
   // accounts that live next to the catalog.
   const accountPaths = catalogPaths ?? resolveCatalogPaths();
   const allowedOrigins = options.allowedOrigins ?? [];
-  const startSync = options.startSync ?? startDetachedSync;
+  const startSync = options.startSync ?? (options.stores ? (request: Parameters<typeof startDetachedSync>[0]) => options.stores!.startSync(request) : startDetachedSync);
   const mergeModels = options.mergeModels ?? mergeOpenCodeGoConsoleProfiles;
 
   // OAuth 2.1 is configured by a Console-managed settings file
@@ -1648,7 +1651,7 @@ export function createCatenceHttpServer(options: CatenceHttpServerOptions = {}):
       // served exactly like /mcp; the protected-resource metadata still
       // advertises /mcp, so issued tokens keep their /mcp audience.
       if (pathname === '/mcp' || pathname === '/') {
-        await handleMcpRequest(request, response, catalogPaths ?? staticPaths ?? resolveCatalogPaths(), principal);
+        await handleMcpRequest(request, response, catalogPaths ?? staticPaths ?? resolveCatalogPaths(), principal, options.stores);
         return;
       }
 

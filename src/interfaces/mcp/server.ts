@@ -7,6 +7,7 @@ import {
   AthleteFileConflictError,
   AthleteFileTooLargeError,
   AthleteFileValidationError,
+  CatenceStoreRegistry,
   loadCatalog,
   type CatalogPaths,
   configuredMcpRateLimit,
@@ -36,6 +37,7 @@ import {
   searchContext,
   SlidingWindowLimiter,
   startDetachedSync,
+  syncProgress,
   StravaEnrichmentError,
   StravaRateLimitError,
   SwimmingService,
@@ -68,9 +70,11 @@ const seriesInput = {
 
 type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean };
 type StravaActivityHydrator = typeof hydrateStravaActivity;
+type StravaSegmentHydrator = typeof hydrateStravaSegmentHistory;
 
 type McpDependencies = {
   hydrateStravaActivity?: StravaActivityHydrator;
+  hydrateStravaSegmentHistory?: StravaSegmentHydrator;
   startDetachedSync?: typeof startDetachedSync;
 };
 
@@ -211,12 +215,20 @@ export type CatenceMcpServerOptions = {
    * athlete.
    */
   scope?: { athleteIds: string[] | 'all' };
+  /** Server-owned DuckDB registry. Omit for CLI/stdio fallback. */
+  stores?: CatenceStoreRegistry;
 };
 
 export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = resolveCatalogPaths(), dependencies: McpDependencies = {}, options: CatenceMcpServerOptions = {}): McpServer {
   const server = new McpServer({ ...CATENCE_MCP_SERVER_INFO }, { instructions: MCP_INSTRUCTIONS });
-  const hydrateActivity = dependencies.hydrateStravaActivity ?? hydrateStravaActivity;
-  const startSync = dependencies.startDetachedSync ?? startDetachedSync;
+  const stores = options.stores;
+  const hydrateActivity = dependencies.hydrateStravaActivity ?? (stores
+    ? (activityPaths: CatencePaths, activityId: string, refresh = false) => stores.withStore(activityPaths, (store) => store.withHydration(() => hydrateStravaActivity(activityPaths, activityId, refresh, { store })))
+    : hydrateStravaActivity);
+  const hydrateSegmentHistory = dependencies.hydrateStravaSegmentHistory ?? (stores
+    ? (segmentPaths: CatencePaths, segmentId: string, refresh = false) => stores.withStore(segmentPaths, (store) => store.withHydration(() => hydrateStravaSegmentHistory(segmentPaths, segmentId, refresh, { store })))
+    : hydrateStravaSegmentHistory);
+  const startSync = dependencies.startDetachedSync ?? (stores ? (request: Parameters<typeof startDetachedSync>[0]) => stores.startSync(request) : startDetachedSync);
   const catalogPaths = isCatalogPaths(paths) ? paths : null;
   const staticPaths: CatencePaths | null = isCatalogPaths(paths) ? null : paths;
   const athleteScope = options.scope?.athleteIds;
@@ -384,15 +396,15 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
   registerTool('catence_sync_progress', {
     title: 'Catence sync progress',
     description: 'Read live progress heartbeats for active sync runs, plus the most recent completed or interrupted runs. Read-only.',
-  }, tool('catence_sync_progress', async () => useRepository(activePaths(), async (repository) => ({
-    data: await repository.progress(),
-    provenance: { database: 'read-only DuckDB snapshot' }, query: {}, caveats: [],
-  }))));
+  }, tool('catence_sync_progress', async () => ({
+    data: await syncProgress(activePaths()),
+    provenance: { database: 'progress sidecars plus best-effort read-only DuckDB snapshot' }, query: {}, caveats: [],
+  })));
 
   registerTool('start_detached_sync', {
-    title: 'Start a detached data sync',
+    title: 'Start a data sync',
     description:
-      'Write-only sync trigger, named like the other explicit lock-guarded write tools. Spawns one detached catence-data sync process for this athlete and returns immediately with the run handle and log file; it refuses while another sync run is active. Track the run with catence_sync_progress; this tool never waits for completion. Pass backfill with a from date to extend history backwards without advancing the incremental cursors (from is required when backfill is set).',
+      'Write-only sync trigger. Starts one background sync for this athlete and returns immediately with the run handle and log file; it refuses while another sync run is active. In server mode the sync shares the server-owned database, so reads and agent hydration continue while it writes. Track the run with catence_sync_progress; this tool never waits for completion. Pass backfill with a from date to extend history backwards without advancing the incremental cursors (from is required when backfill is set).',
     inputSchema: {
       provider: z.enum(['intervals', 'garmin', 'strava', 'trainingpeaks', 'all']).optional(),
       from: z.string().date().optional(),
@@ -409,17 +421,16 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
       from: input.from,
       refresh: input.refresh,
       backfill: input.backfill,
-      // The child resolves the athlete within the catalog, not within the
-      // athlete store this tool resolved for locks and logs: passing the
-      // store itself trips the legacy-store guard in catalog deployments.
+      // In-process starts ignore cliHome; detached fallback uses it to resolve
+      // the athlete from the catalog rather than a legacy athlete store.
       ...(catalogPaths ? { cliHome: catalogPaths.root } : {}),
     });
     return {
       data: { ...handle, progressTool: 'catence_sync_progress' },
-      provenance: { operation: 'detached_sync_spawn' },
+      provenance: { operation: 'sync_start' },
       query: { ...input },
       caveats: [
-        'The sync runs in its own process and keeps running if this session ends; its log file records the full worker output.',
+        'Server-managed syncs run in the background against the shared database owner; detached fallback runs keep going if the launching process exits. The log file records full worker output.',
         'Only one sync run may be active per athlete store.',
       ],
     };
@@ -810,7 +821,7 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
         continue;
       }
       try {
-        const result = await hydrateStravaActivity(activePaths(), activityId, (input.refresh as boolean | undefined) ?? false);
+        const result = await hydrateActivity(activePaths(), activityId, (input.refresh as boolean | undefined) ?? false);
         const status = typeof result.status === 'string' ? result.status : 'completed';
         outcomes.push({ activityId, status, result });
       } catch (error) {
@@ -876,7 +887,7 @@ export function createCatenceMcpServer(paths: CatencePaths | CatalogPaths = reso
     description: 'Write-only targeted enrichment. Fetches a persisted Strava segment and the authenticated athlete’s paged historic efforts; interrupted or throttled work is resumable.',
     inputSchema: { segmentId: z.string().min(1), refresh: z.boolean().optional() },
   }, tool('hydrate_strava_segment_history', async (input) => {
-    const data = await hydrateStravaSegmentHistory(activePaths(), input.segmentId, input.refresh ?? false);
+    const data = await hydrateSegmentHistory(activePaths(), input.segmentId, input.refresh ?? false);
     return { data, coverage: await useRepository(activePaths(), (repository) => repository.coverage()), provenance: { provider: 'strava', operation: 'segment_effort_history', archivedBeforeNormalization: true }, caveats: ['Only the authenticated athlete’s historic segment efforts are requested.'] };
   }));
 
